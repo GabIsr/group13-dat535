@@ -77,10 +77,10 @@ $ ~/stop-spark.sh
 
 ```bash
 # Clone the course repository to your computer
-git clone https://github.com/jayachanders/dat535-new.git
+git clone https://github.com/jayachanders/dat535.git
 
 # Move inside the downloaded directory
-cd dat535-new
+cd dat535
 
 # Rename the original source remote link to 'upstream'
 git remote rename origin upstream
@@ -95,29 +95,11 @@ git push -u origin main
 
 ---
 
-## Part D: First PySpark Test
-
-Open `dat535/lab1/lab1_3_medallion_intro.ipynb` in VSCode and run the first cell:
-
-```python
-from pyspark.sql import SparkSession
-
-spark = SparkSession.builder \
-    .appName("DAT535-Test") \
-    .getOrCreate()
-
-print(f"Spark {spark.version} running!")
-spark.stop()
-```
-
----
-
 ## Checklist
 
-- [ ] Python 3.10+ installed
-- [ ] Java 11 installed (`java -version`)
+- [ ] Python 3.11+ installed
+- [ ] Java 8 installed (`java -version`)
 - [ ] `pyspark` installed and importable
 - [ ] VSCode extensions installed
 - [ ] Connected to cluster via Remote-SSH
 - [ ] Repository cloned
-- [ ] First notebook cell runs without error

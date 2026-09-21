@@ -9,6 +9,27 @@
 
 ---
 
+## What Do "Dev" and "Prod" Mean?
+
+If you haven't worked on a team software project before, these terms might be new:
+
+- **Dev (development)**: a "sandbox" environment where you try out changes. Code here is
+  expected to be unfinished or break sometimes — that's fine, it's isolated from anything
+  anyone else relies on. In this repo, the `dev` branch and the `dat535-dev.yml` workflow
+  write to a separate scratch folder (`/tmp/spark-lab-data/dev/`) so a bad run never
+  touches real data.
+- **Prod (production)**: the environment that represents the "real," trusted version of
+  the project — the one other people or systems depend on. Changes only reach prod after
+  they've been reviewed and merged, which is why it's protected by a manual approval step
+  before it runs. Here, that's the `main` branch and the `dat535-prod.yml` workflow, writing
+  to `/tmp/spark-lab-data/prod/`.
+
+The general idea, common in industry: **experiment in dev, get changes reviewed, then
+promote them to prod.** GitHub Actions lets us automate and enforce this with separate
+workflows per branch and "Environments" that can require human approval before a job runs.
+
+---
+
 ## The Dev/Prod Model
 
 1. Work on `dev` branch locally or on the cluster

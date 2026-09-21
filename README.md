@@ -4,11 +4,12 @@
 
 Spark pipelines for learning distributed data processing.
 
-### Lab Structure
+### Repo Structure
 
 ```text
 .
 ├── README.md                    # This file
+├── project_cicd_guide.md        # Dev/Prod CI/CD hands-on guide (GitHub Environments, branch strategy, exercise)
 ├── run_pipeline.py              # Pipeline orchestrator (lab2 -> lab3)
 ├── lab2_pipeline.py             # Lab 2: Fundamentals + MapReduce + Medallion Architecture
 ├── lab3_pipeline.py             # Lab 3: Window functions, joins, UDFs, streaming, production patterns
@@ -117,64 +118,6 @@ patterns. Run Lab 2 before Lab 3 (or use `python run_pipeline.py all`).
     └── multi_partition/
 ```
 
-### E-Commerce Dataset
-
-Both labs use **one consistent e-commerce clickstream dataset**, generated once in Lab 2 (fixed
-random seed) with ~3% intentionally malformed records to give the Medallion pipeline real data-quality
-issues to catch:
-
-| Field        | Type             | Description               |
-| ------------ | ---------------- | ------------------------- |
-| event_id     | String           | Unique event identifier   |
-| timestamp    | String/Timestamp | Event time                |
-| user_id      | Integer          | User identifier           |
-| event_type   | String           | page_view, purchase, etc. |
-| device       | String           | mobile, desktop, tablet   |
-| country      | String           | Country code              |
-| product_id   | String           | Product identifier        |
-| category     | String           | Product category          |
-| price        | Double           | Product price             |
-| quantity     | Integer          | Purchase quantity         |
-| total_amount | Double           | Total purchase amount     |
-
-**Dataset scale:** 6,000 raw events, generated once in Lab 2 and reused (via the shared Silver layer)
-in Lab 3.
-
-### Running on a Cluster
-
-For running on a Spark cluster (e.g., YARN, Kubernetes):
-
-```bash
-spark-submit \
-    --master yarn \
-    --deploy-mode client \
-    --executor-memory 4g \
-    --num-executors 4 \
-    run_pipeline.py all
-```
-
-### Spark Troubleshooting
-
-#### Common Issues
-
-1. **Java not found**
-
-   ```bash
-   export JAVA_HOME=/usr/lib/jvm/java-8-openjdk-amd64
-   ```
-
-2. **Spark not found**
-
-   ```bash
-   export SPARK_HOME=/opt/spark
-   ```
-
-3. **Out of memory**
-
-   ```python
-   .config("spark.driver.memory", "4g")
-   .config("spark.executor.memory", "4g")
-   ```
 
 ## GitHub Actions CI/CD Guide
 
@@ -222,7 +165,7 @@ To execute these pipelines on your own infrastructure (e.g., your VM), follow th
 
 1. Go to your repository on GitHub.
 2. Navigate to **Settings** > **Actions** > **Runners** > **New self-hosted runner**.
-3. Select the operating system and architecture matching your runner host.
+3. Select the operating system (linux) and architecture matching (x64) your runner host.
 4. Execute the configuration commands provided by GitHub on the VM:
 
 ```bash
@@ -230,10 +173,10 @@ To execute these pipelines on your own infrastructure (e.g., your VM), follow th
 mkdir actions-runner && cd actions-runner
 
 # Download the runner package (Get the specific link for your OS from GitHub UI > Settings > Actions > Runners)
-curl -o actions-runner-osx-x64-2.331.0.tar.gz -L https://github.com/actions/runner/releases/download/v2.331.0/actions-runner-osx-x64-2.331.0.tar.gz
+curl -o actions-runner-osx-x64-2.337.0.tar.gz -L https://github.com/actions/runner/releases/download/v2.337.0/actions-runner-osx-x64-2.337.0.tar.gz
 
 # Extract
-tar xzf ./actions-runner-osx-x64-2.331.0.tar.gz
+tar xzf ./actions-runner-osx-x64-2.337.0.tar.gz
 
 # Configure (You will need the token from the GitHub UI)
 ./config.sh --url https://github.com/OWNER/REPO --token YOUR_TOKEN
@@ -252,6 +195,14 @@ You can test a pipeline without waiting for the schedule:
 2. Select a workflow (e.g., "Pipeline") from the left sidebar.
 3. Click the **Run workflow** dropdown button on the right.
 4. Click **Run workflow**.
+
+## GitHub Actions CI/CD Guide
+
+The repo contains the automated workflows for the DAT535 project. These workflows use GitHub Actions to schedule data pipelines, execute Spark jobs, and deploy code updates.
+
+**Important**: These pipelines are designed to execute on **self-hosted runners** configured with Apache Spark and Java.
+
+**For the full dev/prod concepts, GitHub Environments setup, and hands-on exercise, see [project_cicd_guide.md](project_cicd_guide.md).**
 
 ### CI/CD Troubleshooting
 

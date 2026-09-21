@@ -189,9 +189,9 @@ We have configured the following automated processes:
 #### Pipeline ([pipeline.yml](.github/workflows/pipeline.yml))
 
 - **Triggers**:
-  - Push to the main branch.
-  - Scheduled cron job (every 6 hours: `0 */6 * * *`).
+  - Scheduled cron job (monthly, 1st of the month at 00:00 UTC: `0 0 1 * *` which can be changed).
   - Manual dispatch (workflow_dispatch).
+  - Push to `main` is defined in the file but currently commented out.
 
 - **Key Tasks**:
   - Checks out the repository code.

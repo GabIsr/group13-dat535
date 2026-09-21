@@ -118,12 +118,13 @@ patterns. Run Lab 2 before Lab 3 (or use `python run_pipeline.py all`).
     └── multi_partition/
 ```
 
-
 ## GitHub Actions CI/CD Guide
 
 The repo contains the automated workflows for the DAT535 project. These workflows use GitHub Actions to schedule data pipelines, execute Spark jobs, and deploy code updates.
 
 **Important**: These pipelines are designed to execute on **self-hosted runners** configured with Apache Spark and Java.
+
+**For the full dev/prod concepts, GitHub Environments setup, and hands-on exercise, see [project_cicd_guide.md](project_cicd_guide.md).**
 
 ### Available Workflows
 
@@ -195,14 +196,6 @@ You can test a pipeline without waiting for the schedule:
 2. Select a workflow (e.g., "Pipeline") from the left sidebar.
 3. Click the **Run workflow** dropdown button on the right.
 4. Click **Run workflow**.
-
-## GitHub Actions CI/CD Guide
-
-The repo contains the automated workflows for the DAT535 project. These workflows use GitHub Actions to schedule data pipelines, execute Spark jobs, and deploy code updates.
-
-**Important**: These pipelines are designed to execute on **self-hosted runners** configured with Apache Spark and Java.
-
-**For the full dev/prod concepts, GitHub Environments setup, and hands-on exercise, see [project_cicd_guide.md](project_cicd_guide.md).**
 
 ### CI/CD Troubleshooting
 

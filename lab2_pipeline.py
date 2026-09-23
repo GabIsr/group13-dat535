@@ -550,6 +550,6 @@ def main():
 
     return 0 if results['status'] == 'success' else 1
 
-
+# TEST: Small change (according to hands-on exercise) to verify CI/CD pipeline is working
 if __name__ == "__main__":
     sys.exit(main())

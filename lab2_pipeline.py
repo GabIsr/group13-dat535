@@ -530,7 +530,7 @@ class Lab2Pipeline:
                 self.spark.stop()
                 logger.info("Spark session stopped")
 
-
+# DAT535 Assignment 3 CI/CD test
 def main():
     """Main entry point."""
     pipeline = Lab2Pipeline()

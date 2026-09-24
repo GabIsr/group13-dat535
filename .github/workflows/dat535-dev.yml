@@ -14,7 +14,6 @@ jobs:
     environment: dev
     env:
       DAT535_ENV: dev
-      DAT535_OUTPUT_DIR: /tmp/spark-lab-data/dev
       SPARK_HOME: /opt/spark
       JAVA_HOME: /usr/lib/jvm/java-8-openjdk-amd64
 
@@ -22,9 +21,17 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
+      - name: Resolve output directory
+        id: output-dir
+        # Persistent, non-tmp path: survives runner reboots/tmpfiles cleanup, unlike /tmp
+        run: echo "dir=$HOME/spark-lab-data/dev" >> "$GITHUB_OUTPUT"
+
       - name: Run Lab 2 & Lab 3 Pipelines
+        env:
+          DAT535_OUTPUT_DIR: ${{ steps.output-dir.outputs.dir }}
         run: |
           source ~/spark-env/bin/activate
+          mkdir -p "$DAT535_OUTPUT_DIR"
           
           echo "=== Running Dev Pipeline ==="
           python $GITHUB_WORKSPACE/run_pipeline.py all
@@ -33,6 +40,6 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: dev-outputs-${{ github.run_number }}
-          path: /tmp/spark-lab-data/dev/
+          path: ${{ steps.output-dir.outputs.dir }}/
           retention-days: 7
           if-no-files-found: ignore

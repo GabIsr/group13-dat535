@@ -82,8 +82,10 @@ class Lab3Pipeline:
 
     def __init__(self, base_dir: str = None, shared_dir: str = None):
         """Initialize the pipeline."""
-        self.base_dir = base_dir or os.path.expanduser("~/spark-lab-data/lab3")
-        self.shared_dir = shared_dir or os.path.expanduser("~/spark-lab-data/shared")
+        # DAT535_OUTPUT_DIR lets CI (dev/prod) redirect output to an environment-specific root
+        env_root = os.environ.get("DAT535_OUTPUT_DIR")
+        self.base_dir = base_dir or (f"{env_root}/lab3" if env_root else os.path.expanduser("/home/ubuntu/spark-lab-data/lab3"))
+        self.shared_dir = shared_dir or (f"{env_root}/shared" if env_root else os.path.expanduser("/home/ubuntu/spark-lab-data/shared"))
         self.silver_path = f"{self.shared_dir}/silver/events"
         self.spark = None
         self.events_df = None

@@ -532,7 +532,7 @@ class Lab2Pipeline:
                 self.spark.stop()
                 logger.info("Spark session stopped")
 
-
+# DAT535 Assignment 3 CI/CD test
 def main():
     """Main entry point."""
     pipeline = Lab2Pipeline()
@@ -552,6 +552,6 @@ def main():
 
     return 0 if results['status'] == 'success' else 1
 
-
+# TEST: Small change (according to hands-on exercise) to verify CI/CD pipeline is working
 if __name__ == "__main__":
     sys.exit(main())

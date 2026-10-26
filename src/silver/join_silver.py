@@ -95,6 +95,14 @@ def join_silver_datasets(
         how="left",
     )
 
+    # 4b. Hard Data Quality Gate: Prevent 1-to-Many Cartesian Join Multiplication
+    if len(df_joined) != total_311:
+        raise ValueError(
+            f"Cartesian join explosion detected! "
+            f"Input 311 rows ({total_311:,}) != Joined rows ({len(df_joined):,}). "
+            f"Weather dimension contains duplicate (grid_id, timestamp_utc) keys."
+        )
+
     # Ensure nullable integer types are preserved on merged fact table
     for int16_col in ["weather_code", "relative_humidity_2m", "wind_direction_10m"]:
         if int16_col in df_joined.columns:

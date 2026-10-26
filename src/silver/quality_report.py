@@ -80,6 +80,7 @@ def generate_quality_reconciliation_report(
     # Weather Reconciliation
     print("\n" + "-" * 90)
     w_in = clean_weather_metrics.get("input_rows", 0)
+    w_dup = clean_weather_metrics.get("duplicate_rows_dropped", 0)
     w_unkeyed = clean_weather_metrics.get("dropped_unkeyed_rows", 0)
     w_masked = clean_weather_metrics.get("corrupted_fields_masked", 0)
     w_valid = clean_weather_metrics.get("valid_rows", 0)
@@ -88,6 +89,8 @@ def generate_quality_reconciliation_report(
 
     print(f"{'STAGE 2: ERA5-LAND METEOROLOGICAL REANALYSIS':<45} | Count / Metrics")
     print(f"  * Raw Bronze Weather Observations         : {w_in:,}")
+    if w_dup > 0:
+        print(f"  * Exact Duplicates Removed (grid_id, ts)  : -{w_dup:,}")
     print(f"  * Unkeyed Observations Dropped            : -{w_unkeyed:,}")
     print(f"  * Corrupt Fields Masked (Row Preserved)   : {w_masked:,}")
     print(f"  * Valid Observations in Silver            : = {w_valid:,}")

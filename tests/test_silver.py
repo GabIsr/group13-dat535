@@ -353,5 +353,109 @@ class TestSilverLayerPipeline(unittest.TestCase):
             self.assertEqual(df_quar.iloc[0]["quarantine_reason"], "INVALID_OR_NON_NUMERIC_UNIQUE_KEY")
 
 
+
+
+    def test_weather_deduplication(self):
+        """Verify that duplicate (grid_id, timestamp_utc) records in Bronze weather are deduplicated, keeping latest ingestion."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            mock_records = [
+                # Older duplicate ingestion
+                {
+                    "grid_id": "GRID_40.7_-74.0",
+                    "time": "2026-10-18T10:00",
+                    "temperature_2m": 12.0,
+                    "precipitation": 0.0,
+                    "surface_pressure": 1013.0,
+                    "wind_speed_10m": 5.0,
+                    "wind_gusts_10m": 10.0,
+                    "_ingested_at_utc": "2026-10-18T10:00:00Z",
+                },
+                # Newer duplicate ingestion (should overwrite/be kept)
+                {
+                    "grid_id": "GRID_40.7_-74.0",
+                    "time": "2026-10-18T10:00",
+                    "temperature_2m": 18.0,
+                    "precipitation": 1.0,
+                    "surface_pressure": 1013.0,
+                    "wind_speed_10m": 5.0,
+                    "wind_gusts_10m": 12.0,
+                    "_ingested_at_utc": "2026-10-18T12:00:00Z",
+                },
+                # Distinct hour
+                {
+                    "grid_id": "GRID_40.7_-74.0",
+                    "time": "2026-10-18T11:00",
+                    "temperature_2m": 19.0,
+                    "precipitation": 2.0,
+                    "surface_pressure": 1013.0,
+                    "wind_speed_10m": 6.0,
+                    "wind_gusts_10m": 15.0,
+                    "_ingested_at_utc": "2026-10-18T12:00:00Z",
+                },
+            ]
+            bronze_in = tmp_path / "bronze_weather"
+            bronze_in.mkdir()
+            pd.DataFrame(mock_records).to_parquet(bronze_in / "part_0000.parquet", index=False)
+
+            silver_out = tmp_path / "silver_weather"
+            res = clean_and_validate_weather(bronze_in, silver_out)
+
+            self.assertEqual(res["input_rows"], 3)
+            self.assertEqual(res["duplicate_rows_dropped"], 1)
+            self.assertEqual(res["valid_rows"], 2)
+
+            clean_files = list(silver_out.glob("**/*.parquet"))
+            df_w = pd.concat([pd.read_parquet(f) for f in clean_files]).sort_values("timestamp_utc").reset_index(drop=True)
+            self.assertEqual(len(df_w), 2)
+            # Verify latest ingestion kept (temperature_2m == 18.0)
+            row_10 = df_w[df_w["timestamp_utc"] == pd.Timestamp("2026-10-18 10:00:00", tz="UTC")].iloc[0]
+            self.assertEqual(row_10["temperature_2m"], 18.0)
+            self.assertEqual(row_10["precip_past_3h_mm"], 1.0)
+            row_11 = df_w[df_w["timestamp_utc"] == pd.Timestamp("2026-10-18 11:00:00", tz="UTC")].iloc[0]
+            self.assertEqual(row_11["precip_past_3h_mm"], 3.0)
+
+    def test_cartesian_join_explosion_prevention(self):
+        """Verify that join_silver_datasets detects and rejects 1-to-many Cartesian multiplication."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            s_311 = tmp_path / "silver_311"
+            s_weather = tmp_path / "silver_weather"
+            s_joined = tmp_path / "silver_joined"
+            s_311.mkdir()
+            s_weather.mkdir()
+
+            mock_311 = [
+                {
+                    "unique_key": 99001,
+                    "created_at_utc": pd.Timestamp("2026-10-18 10:15:00", tz="UTC"),
+                    "weather_join_hour_utc": pd.Timestamp("2026-10-18 10:00:00", tz="UTC"),
+                    "grid_id": "GRID_40.7_-74.0",
+                    "complaint_type": "Noise",
+                }
+            ]
+            pd.DataFrame(mock_311).to_parquet(s_311 / "part_0000.parquet", index=False)
+
+            # Intentionally duplicate weather dimension row
+            mock_weather = [
+                {
+                    "grid_id": "GRID_40.7_-74.0",
+                    "timestamp_utc": pd.Timestamp("2026-10-18 10:00:00", tz="UTC"),
+                    "temperature_2m": 15.0,
+                },
+                {
+                    "grid_id": "GRID_40.7_-74.0",
+                    "timestamp_utc": pd.Timestamp("2026-10-18 10:00:00", tz="UTC"),
+                    "temperature_2m": 15.0,
+                },
+            ]
+            pd.DataFrame(mock_weather).to_parquet(s_weather / "part_0000.parquet", index=False)
+
+            with self.assertRaises(ValueError) as ctx:
+                join_silver_datasets(s_311, s_weather, s_joined)
+
+            self.assertIn("Cartesian join explosion detected", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

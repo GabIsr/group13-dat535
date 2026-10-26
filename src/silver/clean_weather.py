@@ -49,10 +49,27 @@ def clean_and_validate_weather(
     input_rows = len(df_raw)
     logger.info(f"Loaded {input_rows:,} raw weather observations from Bronze.")
 
-    # 1. Row-level Primary Key Check (Only drop if primary keys are null)
+    # 1. Row-level Primary Key Check & Temporal Standardization
     valid_keys_mask = df_raw["time"].notna() & df_raw["grid_id"].notna()
     dropped_unkeyed_rows = int((~valid_keys_mask).sum())
     df_clean = df_raw[valid_keys_mask].copy()
+
+    df_clean["timestamp_utc"] = pd.to_datetime(df_clean["time"], utc=True, errors="coerce")
+    valid_ts_mask = df_clean["timestamp_utc"].notna()
+    dropped_invalid_ts = int((~valid_ts_mask).sum())
+    df_clean = df_clean[valid_ts_mask].copy()
+
+    # Deduplicate: if multiple batches contain the same (grid_id, timestamp_utc), keep latest ingestion
+    before_dedup_count = len(df_clean)
+    if "_ingested_at_utc" in df_clean.columns:
+        df_clean = df_clean.sort_values("_ingested_at_utc", ascending=False)
+    df_clean = df_clean.drop_duplicates(subset=["grid_id", "timestamp_utc"], keep="first").copy()
+    duplicate_rows_dropped = int(before_dedup_count - len(df_clean))
+    if duplicate_rows_dropped > 0:
+        logger.info(
+            f"Deduplicated Bronze weather records: dropped {duplicate_rows_dropped:,} "
+            f"duplicate observations on (grid_id, timestamp_utc)."
+        )
 
     # 2. Column-Level Nullification (NEVER drop the whole row for a single sensor glitch)
     # Check physical bounds on each individual measurement:
@@ -81,14 +98,19 @@ def clean_and_validate_weather(
     cond_cold = df_clean["temperature_2m"] < WEATHER_EXTREME_THRESHOLDS["temp_extreme_cold"]
     cond_heat = df_clean["temperature_2m"] > WEATHER_EXTREME_THRESHOLDS["temp_extreme_heat"]
     cond_torrential = df_clean["precipitation"] >= WEATHER_EXTREME_THRESHOLDS["precip_torrential_hr"]
-    cond_severe_wind = df_clean["wind_gusts_10m"] >= WEATHER_EXTREME_THRESHOLDS["wind_gust_severe"]
+    cond_severe_wind = (
+        df_clean["wind_gusts_10m"] >= WEATHER_EXTREME_THRESHOLDS["wind_gust_severe"]
+        if "wind_gusts_10m" in df_clean.columns
+        else pd.Series(False, index=df_clean.index)
+    )
 
     df_clean["is_extreme_weather"] = (cond_cold | cond_heat | cond_torrential | cond_severe_wind).fillna(False)
     extreme_rows_count = int(df_clean["is_extreme_weather"].sum())
     logger.info(f"Tagged {extreme_rows_count:,} observations as extreme weather events (preserved intact).")
 
     # 4. Standardization and Derived Row Attributes (Pure Metric: Celsius and m/s)
-    df_clean["timestamp_utc"] = pd.to_datetime(df_clean["time"], utc=True)
+    if "timestamp_utc" not in df_clean.columns:
+        df_clean["timestamp_utc"] = pd.to_datetime(df_clean["time"], utc=True)
     df_clean["is_freezing"] = df_clean["temperature_2m"] <= 0.0
     df_clean["is_raining"] = df_clean["precipitation"] > 0.0
 
@@ -157,7 +179,8 @@ def clean_and_validate_weather(
         "dataset": "silver_weather",
         "input_rows": input_rows,
         "valid_rows": len(df_clean),
-        "dropped_unkeyed_rows": dropped_unkeyed_rows,
+        "dropped_unkeyed_rows": dropped_unkeyed_rows + dropped_invalid_ts,
+        "duplicate_rows_dropped": duplicate_rows_dropped,
         "corrupted_fields_masked": corrupted_fields_rows,
         "extreme_weather_tagged_rows": extreme_rows_count,
         "distinct_grid_cells": df_clean["grid_id"].nunique(),

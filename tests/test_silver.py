@@ -20,7 +20,7 @@ from src.silver.config import (
     WEATHER_EXTREME_THRESHOLDS,
     WEATHER_HARD_LIMITS,
 )
-from src.silver.clean_311 import clean_and_validate_311, to_utc_datetime
+from src.silver.clean_311 import clean_and_validate_311, to_utc_datetime, standardize_string_series
 from src.silver.clean_weather import clean_and_validate_weather
 from src.silver.join_silver import join_silver_datasets
 
@@ -284,6 +284,25 @@ class TestSilverLayerPipeline(unittest.TestCase):
             self.assertEqual(df_w.loc[2, "precip_past_3h_mm"], 6.0)
             # Hour 5: max gust in past 6 hours should be 10 + 5 = 15.0
             self.assertEqual(df_w.loc[5, "max_wind_gust_past_6h_ms"], 15.0)
+
+
+    def test_string_standardization_null_handling(self):
+        """Verify that nulls, empty strings, and stringified null artifacts do not become literal 'NAN'/'NONE'."""
+        test_inputs = pd.Series([None, np.nan, "", "   ", "nan", "None", "brooklyn", "Noise - residential"])
+
+        res_upper = standardize_string_series(test_inputs, "UNSPECIFIED", case="upper")
+        self.assertEqual(res_upper.iloc[0], "UNSPECIFIED")
+        self.assertEqual(res_upper.iloc[1], "UNSPECIFIED")
+        self.assertEqual(res_upper.iloc[2], "UNSPECIFIED")
+        self.assertEqual(res_upper.iloc[3], "UNSPECIFIED")
+        self.assertEqual(res_upper.iloc[4], "UNSPECIFIED")
+        self.assertEqual(res_upper.iloc[5], "UNSPECIFIED")
+        self.assertEqual(res_upper.iloc[6], "BROOKLYN")
+
+        res_title = standardize_string_series(test_inputs, "Unknown", case="title")
+        self.assertEqual(res_title.iloc[0], "Unknown")
+        self.assertEqual(res_title.iloc[4], "Unknown")
+        self.assertEqual(res_title.iloc[7], "Noise - Residential")
 
 
 if __name__ == "__main__":

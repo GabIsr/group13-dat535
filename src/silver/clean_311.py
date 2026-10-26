@@ -57,6 +57,28 @@ def to_utc_datetime(series: pd.Series, local_tz: str = "America/New_York") -> pd
     return dt.dt.tz_convert("UTC")
 
 
+def standardize_string_series(
+    series: pd.Series,
+    default_val: str,
+    case: str = "upper",
+) -> pd.Series:
+    """
+    Standardize text columns safely by:
+    1. Detecting nulls, empty strings, whitespace, and literal stringified nulls ('nan', 'none', 'null').
+    2. Imputing with default_val BEFORE or without converting missing values into literal 'NAN'/'None' strings.
+    3. Applying string case formatting ('upper', 'title', 'preserve').
+    """
+    s = series.astype(object)
+    s_str = s.astype(str).str.strip()
+    mask_null = s.isna() | s_str.isin(["", "nan", "NaN", "None", "NONE", "NAN", "null", "NULL", "<NA>"])
+    clean_s = s_str.where(~mask_null, default_val)
+    if case == "upper":
+        return clean_s.str.upper()
+    elif case == "title":
+        return clean_s.str.title()
+    return clean_s
+
+
 def clean_and_validate_311(
     bronze_311_dir: Path = BRONZE_DIR / "nyc311",
     silver_311_dir: Path = SILVER_DIR / "nyc311",
@@ -211,15 +233,15 @@ def clean_and_validate_311(
 
     # 4. String Standardizations
     if "borough" in df_valid.columns:
-        df_valid["borough"] = df_valid["borough"].astype(str).str.strip().str.upper().fillna("UNSPECIFIED")
+        df_valid["borough"] = standardize_string_series(df_valid["borough"], "UNSPECIFIED", case="upper")
     if "complaint_type" in df_valid.columns:
-        df_valid["complaint_type"] = df_valid["complaint_type"].astype(str).str.strip().str.title().fillna("Unknown")
+        df_valid["complaint_type"] = standardize_string_series(df_valid["complaint_type"], "Unknown", case="title")
     if "descriptor" in df_valid.columns:
-        df_valid["descriptor"] = df_valid["descriptor"].astype(str).str.strip().fillna("Not Stated")
+        df_valid["descriptor"] = standardize_string_series(df_valid["descriptor"], "Not Stated", case="preserve")
     if "status" in df_valid.columns:
-        df_valid["status"] = df_valid["status"].astype(str).str.strip().str.upper().fillna("UNKNOWN")
+        df_valid["status"] = standardize_string_series(df_valid["status"], "UNKNOWN", case="upper")
     if "agency" in df_valid.columns:
-        df_valid["agency"] = df_valid["agency"].astype(str).str.strip().str.upper().fillna("UNKNOWN")
+        df_valid["agency"] = standardize_string_series(df_valid["agency"], "UNKNOWN", case="upper")
 
     # Silver Audit Metadata
     df_valid["_silver_processed_at_utc"] = processed_at_utc

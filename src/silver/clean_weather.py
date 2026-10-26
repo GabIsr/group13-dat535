@@ -92,6 +92,11 @@ def clean_and_validate_weather(
     df_clean["is_freezing"] = df_clean["temperature_2m"] <= 0.0
     df_clean["is_raining"] = df_clean["precipitation"] > 0.0
 
+    # Cast discrete integer weather features to nullable Int16 (prevents silent float64 upcasting in left joins)
+    for int16_col in ["weather_code", "relative_humidity_2m", "wind_direction_10m"]:
+        if int16_col in df_clean.columns:
+            df_clean[int16_col] = pd.to_numeric(df_clean[int16_col], errors="coerce").astype("Int16")
+
     # 5. Cumulative & Lagged Weather Features (Chronological Rolling Windows per Grid Cell)
     # Sort chronologically by grid_id and timestamp_utc to guarantee window integrity
     df_clean = df_clean.sort_values(["grid_id", "timestamp_utc"]).reset_index(drop=True)

@@ -150,25 +150,43 @@ def clean_and_validate_311(
     # Check for invalid records:
     # 1. Missing created_at timestamp
     # 2. Negative duration for closed tickets (closed before created)
+    # 3. Missing or non-numeric unique_key primary key
+    parsed_keys = pd.to_numeric(df_dedup["unique_key"], errors="coerce")
     cond_missing_created = df_dedup["created_at_utc"].isna()
     cond_negative_duration = df_dedup["is_ticket_closed"] & (df_dedup["resolution_duration_hours"] < 0.0)
+    cond_invalid_key = parsed_keys.isna()
 
-    quarantine_mask = cond_missing_created | cond_negative_duration
+    quarantine_mask = cond_missing_created | cond_negative_duration | cond_invalid_key
     df_quarantined = df_dedup[quarantine_mask].copy()
 
     if len(df_quarantined) > 0:
         df_quarantined["quarantine_reason"] = np.where(
             df_quarantined["created_at_utc"].isna(),
             "MISSING_CREATED_TIMESTAMP",
-            "NEGATIVE_RESOLUTION_DURATION",
+            np.where(
+                pd.to_numeric(df_quarantined["unique_key"], errors="coerce").isna(),
+                "INVALID_OR_NON_NUMERIC_UNIQUE_KEY",
+                "NEGATIVE_RESOLUTION_DURATION",
+            ),
         )
         quarantine_dir.mkdir(parents=True, exist_ok=True)
         q_path = quarantine_dir / "quarantined_311.parquet"
         pq.write_table(pa.Table.from_pandas(df_quarantined, preserve_index=False), q_path, compression="snappy")
         logger.warning(f"Quarantined {len(df_quarantined):,} invalid records to {q_path}")
 
-    # Retain only valid records for clean Silver
+    # Retain only valid records for clean Silver and enforce Int64 primary key
     df_valid = df_dedup[~quarantine_mask].copy()
+    df_valid["unique_key"] = parsed_keys[~quarantine_mask].astype("Int64")
+
+    # Standardize clean_incident_zip as a persistent 5-digit zero-padded string (never integer!)
+    if "incident_zip" in df_valid.columns:
+        extracted_zips = df_valid["incident_zip"].astype(str).str.extract(r"(\d{5})")[0]
+        df_valid["clean_incident_zip"] = extracted_zips.where(
+            extracted_zips.notna() & ~extracted_zips.isin(["nan", "None", "00000_invalid"]),
+            None,
+        )
+    else:
+        df_valid["clean_incident_zip"] = None
 
     # 3. Hierarchical Spatial Imputation (3 Levels)
     # Parse coordinates to numeric
@@ -195,24 +213,23 @@ def clean_and_validate_311(
     df_valid.loc[mask_level1, "grid_id"] = "GRID_" + grid_lat_1 + "_" + grid_lon_1
     df_valid.loc[mask_level1, "spatial_resolution_level"] = "EXACT_COORDINATES"
 
-    # Level 2: ZIP Code Centroid Fallback
+    # Level 2: ZIP Code Centroid Fallback (directly uses standardized clean_incident_zip)
     mask_need_level2 = ~mask_level1
     zip_ref = load_zip_reference()
 
-    if not zip_ref.empty and "incident_zip" in df_valid.columns:
-        # Extract 5-digit ZIP
-        zip_series = df_valid.loc[mask_need_level2, "incident_zip"].astype(str).str.extract(r"(\d{5})")[0]
+    if not zip_ref.empty and "clean_incident_zip" in df_valid.columns:
         zip_map_lat = zip_ref.set_index("zip5")["centroid_lat"].to_dict()
         zip_map_lon = zip_ref.set_index("zip5")["centroid_lon"].to_dict()
         zip_map_grid = zip_ref.set_index("zip5")["grid_id"].to_dict()
 
-        level2_lats = zip_series.map(zip_map_lat)
+        level2_zips = df_valid.loc[mask_need_level2, "clean_incident_zip"]
+        level2_lats = level2_zips.map(zip_map_lat)
         mask_level2_matched = level2_lats.notna()
 
         matched_indices = level2_lats[mask_level2_matched].index
         df_valid.loc[matched_indices, "clean_latitude"] = level2_lats[mask_level2_matched]
-        df_valid.loc[matched_indices, "clean_longitude"] = zip_series[mask_level2_matched].map(zip_map_lon)
-        df_valid.loc[matched_indices, "grid_id"] = zip_series[mask_level2_matched].map(zip_map_grid)
+        df_valid.loc[matched_indices, "clean_longitude"] = level2_zips[mask_level2_matched].map(zip_map_lon)
+        df_valid.loc[matched_indices, "grid_id"] = level2_zips[mask_level2_matched].map(zip_map_grid)
         df_valid.loc[matched_indices, "spatial_resolution_level"] = "ZIP_APPROXIMATION"
 
     # Level 3: Borough Centroid Fallback
@@ -242,6 +259,20 @@ def clean_and_validate_311(
         df_valid["status"] = standardize_string_series(df_valid["status"], "UNKNOWN", case="upper")
     if "agency" in df_valid.columns:
         df_valid["agency"] = standardize_string_series(df_valid["agency"], "UNKNOWN", case="upper")
+
+    # 5. Type Enforcement on Raw & Secondary Columns
+    df_valid["latitude"] = raw_lats
+    df_valid["longitude"] = raw_lons
+    if "x_coordinate_state_plane" in df_valid.columns:
+        df_valid["x_coordinate_state_plane"] = pd.to_numeric(df_valid["x_coordinate_state_plane"], errors="coerce")
+    if "y_coordinate_state_plane" in df_valid.columns:
+        df_valid["y_coordinate_state_plane"] = pd.to_numeric(df_valid["y_coordinate_state_plane"], errors="coerce")
+    if "council_district" in df_valid.columns:
+        df_valid["council_district"] = pd.to_numeric(df_valid["council_district"], errors="coerce").astype("Int16")
+    if "due_date" in df_valid.columns:
+        df_valid["due_date_utc"] = to_utc_datetime(df_valid["due_date"])
+    if "resolution_action_updated_date" in df_valid.columns:
+        df_valid["resolution_action_updated_date_utc"] = to_utc_datetime(df_valid["resolution_action_updated_date"])
 
     # Silver Audit Metadata
     df_valid["_silver_processed_at_utc"] = processed_at_utc

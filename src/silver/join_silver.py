@@ -67,6 +67,8 @@ def join_silver_datasets(
         "snowfall",
         "snow_depth",
         "weather_code",
+        "relative_humidity_2m",
+        "wind_direction_10m",
         "surface_pressure",
         "wind_speed_10m",
         "wind_gusts_10m",
@@ -92,6 +94,11 @@ def join_silver_datasets(
         right_on=["grid_id", "timestamp_utc"],
         how="left",
     )
+
+    # Ensure nullable integer types are preserved on merged fact table
+    for int16_col in ["weather_code", "relative_humidity_2m", "wind_direction_10m"]:
+        if int16_col in df_joined.columns:
+            df_joined[int16_col] = df_joined[int16_col].astype("Int16")
 
     # Audit match status
     df_joined["is_weather_matched"] = df_joined["temperature_2m"].notna()

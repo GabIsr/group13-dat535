@@ -172,17 +172,25 @@ class TestSilverLayerPipeline(unittest.TestCase):
             self.assertTrue(len(clean_files) > 0)
             df_clean = pd.concat([pd.read_parquet(f) for f in clean_files])
 
-            row1 = df_clean[df_clean["unique_key"] == "1001"].iloc[0]
+            row1 = df_clean[df_clean["unique_key"] == 1001].iloc[0]
             self.assertEqual(row1["spatial_resolution_level"], "EXACT_COORDINATES")
             self.assertEqual(row1["grid_id"], "GRID_40.8_-74.0")
+            self.assertEqual(row1["clean_incident_zip"], "10001")
 
-            row2 = df_clean[df_clean["unique_key"] == "1002"].iloc[0]
+            row2 = df_clean[df_clean["unique_key"] == 1002].iloc[0]
             self.assertEqual(row2["spatial_resolution_level"], "ZIP_APPROXIMATION")
             self.assertTrue(row2["grid_id"].startswith("GRID_"))
+            self.assertEqual(row2["clean_incident_zip"], "10001")
 
-            row3 = df_clean[df_clean["unique_key"] == "1003"].iloc[0]
+            row3 = df_clean[df_clean["unique_key"] == 1003].iloc[0]
             self.assertEqual(row3["spatial_resolution_level"], "BOROUGH_APPROXIMATION")
             self.assertEqual(row3["grid_id"], BOROUGH_CENTROIDS["BROOKLYN"][2])
+            self.assertEqual(row3["clean_incident_zip"], "00000")
+
+            # Verify schema types
+            self.assertEqual(str(df_clean["unique_key"].dtype), "Int64")
+            self.assertTrue(pd.api.types.is_float_dtype(df_clean["latitude"]))
+            self.assertTrue(pd.api.types.is_float_dtype(df_clean["longitude"]))
 
     def test_timezone_localization_eastern_to_utc(self):
         """Verify proper 4-hour (EDT) and 5-hour (EST) conversion to UTC."""
@@ -239,13 +247,13 @@ class TestSilverLayerPipeline(unittest.TestCase):
             clean_files = list(silver_out.glob("**/*.parquet"))
             df_res = pd.concat([pd.read_parquet(f) for f in clean_files])
 
-            row_closed = df_res[df_res["unique_key"] == "2001"].iloc[0]
+            row_closed = df_res[df_res["unique_key"] == 2001].iloc[0]
             self.assertTrue(row_closed["is_ticket_closed"])
             self.assertEqual(row_closed["ticket_status_category"], "CLOSED")
             self.assertEqual(row_closed["resolution_duration_hours"], 1.5)
             self.assertTrue(pd.isna(row_closed["open_ticket_age_days"]))
 
-            row_open = df_res[df_res["unique_key"] == "2002"].iloc[0]
+            row_open = df_res[df_res["unique_key"] == 2002].iloc[0]
             self.assertFalse(row_open["is_ticket_closed"])
             self.assertEqual(row_open["ticket_status_category"], "OPEN")
             self.assertTrue(pd.isna(row_open["resolution_duration_hours"]))
@@ -303,6 +311,46 @@ class TestSilverLayerPipeline(unittest.TestCase):
         self.assertEqual(res_title.iloc[0], "Unknown")
         self.assertEqual(res_title.iloc[4], "Unknown")
         self.assertEqual(res_title.iloc[7], "Noise - Residential")
+
+
+    def test_invalid_unique_key_quarantine(self):
+        """Verify that non-numeric or missing unique_keys are safely routed to quarantine without crashing."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            mock_records = [
+                {
+                    "unique_key": "INVALID_TEXT_KEY",
+                    "created_date": "2026-10-18T10:00:00.000",
+                    "closed_date": "2026-10-18T11:30:00.000",
+                    "complaint_type": "Noise",
+                    "borough": "MANHATTAN",
+                    "latitude": "40.7500",
+                    "longitude": "-73.9900",
+                },
+                {
+                    "unique_key": "99999",
+                    "created_date": "2026-10-18T10:00:00.000",
+                    "closed_date": "2026-10-18T11:30:00.000",
+                    "complaint_type": "Noise",
+                    "borough": "MANHATTAN",
+                    "latitude": "40.7500",
+                    "longitude": "-73.9900",
+                },
+            ]
+            bronze_in = tmp_path / "bronze"
+            bronze_in.mkdir()
+            pd.DataFrame(mock_records).to_parquet(bronze_in / "part_0000.parquet", index=False)
+
+            silver_out = tmp_path / "silver"
+            quar_out = tmp_path / "quarantine"
+
+            res = clean_and_validate_311(bronze_in, silver_out, quar_out)
+            self.assertEqual(res["input_rows"], 2)
+            self.assertEqual(res["quarantined_rows"], 1)
+            self.assertEqual(res["valid_rows_accepted"], 1)
+
+            df_quar = pd.read_parquet(quar_out / "quarantined_311.parquet")
+            self.assertEqual(df_quar.iloc[0]["quarantine_reason"], "INVALID_OR_NON_NUMERIC_UNIQUE_KEY")
 
 
 if __name__ == "__main__":

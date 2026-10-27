@@ -1,5 +1,5 @@
 """
-Silver Layer: Data Quality Evidence and Reconciliation Ledger.
+Silver Layer: Data Quality Evidence, Observability Tags, and Sensor Anomaly Reconciliation Ledger.
 Implements the before-and-after reconciliation required by Section 4 & 6 of the DAT535 Project Guide.
 Author: Group 13
 """
@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
-from src.silver.config import QUALITY_DIR
+from src.silver.config import QUALITY_DIR, SENSOR_ANOMALY_LEDGER_PATH
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("quality_report")
@@ -38,6 +38,9 @@ def generate_quality_reconciliation_report(
             "weather_cleaning": clean_weather_metrics,
             "unified_join": join_metrics,
         },
+        "artifacts": {
+            "sensor_anomaly_ledger": str(SENSOR_ANOMALY_LEDGER_PATH),
+        },
     }
 
     report_file = output_dir / f"{report_id}.json"
@@ -58,6 +61,8 @@ def generate_quality_reconciliation_report(
     b_311_valid = clean_311_metrics.get("valid_rows_accepted", 0)
     b_311_closed = clean_311_metrics.get("closed_tickets_count", 0)
     b_311_open = clean_311_metrics.get("open_tickets_count", 0)
+    b_311_conflicts = clean_311_metrics.get("status_conflict_count", 0)
+    b_311_instant = clean_311_metrics.get("instant_closure_count", 0)
 
     print(f"{'STAGE 1: NYC 311 SERVICE REQUESTS':<45} | Count / Metrics")
     print(f"  * Raw Bronze Input Records                : {b_311_in:,}")
@@ -69,6 +74,8 @@ def generate_quality_reconciliation_report(
         pct_open = (b_311_open / b_311_valid) * 100.0
         print(f"    - Closed Tickets (Duration Calculated)   : {b_311_closed:,} ({pct_closed:.1f}%)")
         print(f"    - Open/Active Tickets (Age Tracked)     : {b_311_open:,} ({pct_open:.1f}%)")
+        print(f"    - Status Conflicts Tagged (Open w/ Date): {b_311_conflicts:,}")
+        print(f"    - Instant Closures Tagged (0.0s SLA)    : {b_311_instant:,}")
 
     # Spatial Resolution Breakdown
     spatial = clean_311_metrics.get("spatial_resolution_breakdown", {})
@@ -83,6 +90,7 @@ def generate_quality_reconciliation_report(
     w_dup = clean_weather_metrics.get("duplicate_rows_dropped", 0)
     w_unkeyed = clean_weather_metrics.get("dropped_unkeyed_rows", 0)
     w_masked = clean_weather_metrics.get("corrupted_fields_masked", 0)
+    w_anomalies = clean_weather_metrics.get("sensor_anomalies_logged", 0)
     w_valid = clean_weather_metrics.get("valid_rows", 0)
     w_extreme = clean_weather_metrics.get("extreme_weather_tagged_rows", 0)
     w_cells = clean_weather_metrics.get("distinct_grid_cells", 0)
@@ -93,6 +101,7 @@ def generate_quality_reconciliation_report(
         print(f"  * Exact Duplicates Removed (grid_id, ts)  : -{w_dup:,}")
     print(f"  * Unkeyed Observations Dropped            : -{w_unkeyed:,}")
     print(f"  * Corrupt Fields Masked (Row Preserved)   : {w_masked:,}")
+    print(f"  * Forensic Sensor Anomalies Ledgered      : {w_anomalies:,} (saved to {SENSOR_ANOMALY_LEDGER_PATH.name})")
     print(f"  * Valid Observations in Silver            : = {w_valid:,}")
     print(f"  * Active Native NYC Grid Cells Covered    : {w_cells} of 19 cells")
     print(f"  * Extreme Weather Outliers Tagged (Kept)  : {w_extreme:,}")

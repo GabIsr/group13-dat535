@@ -1,7 +1,8 @@
 """
-Silver Layer: Open-Meteo ERA5-Land Weather Cleaning and Quality Tagging.
+Silver Layer: Open-Meteo ERA5-Land Weather Cleaning, Physical Bound Validation,
+Atmospheric Law Verification, and Sensor Anomaly Ledgering.
 Filters corrupt/sentinel records, applies physical sanity bounds, tags extreme weather events,
-and standardizes timestamps and units.
+masks corrupted fields to NaN without row loss, and maintains a complete forensic Audit Ledger.
 Author: Group 13
 """
 
@@ -19,7 +20,9 @@ import pyarrow.parquet as pq
 from src.silver.config import (
     BRONZE_DIR,
     PROJECT_ROOT,
+    SENSOR_ANOMALY_LEDGER_PATH,
     SILVER_DIR,
+    VALID_WMO_WEATHER_CODES,
     WEATHER_EXTREME_THRESHOLDS,
     WEATHER_HARD_LIMITS,
 )
@@ -31,10 +34,12 @@ logger = logging.getLogger("clean_weather")
 def clean_and_validate_weather(
     bronze_weather_dir: Path = BRONZE_DIR / "weather",
     silver_weather_dir: Path = SILVER_DIR / "weather",
+    anomaly_ledger_path: Path = SENSOR_ANOMALY_LEDGER_PATH,
 ) -> Dict[str, Any]:
     """
-    Load Bronze weather records, apply physical bounds checking, tag extreme weather,
-    derive standardized units (Fahrenheit, freezing/rain flags), and write to Silver Parquet.
+    Load Bronze weather records, apply physical bounds checking and atmospheric consistency laws,
+    mask corrupted sensors to NaN (avoiding row loss), record detailed forensic anomaly logs,
+    and save partitioned Silver Parquet tables alongside the Sensor Anomaly Ledger.
     """
     start_time = time.time()
     processed_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -71,28 +76,218 @@ def clean_and_validate_weather(
             f"duplicate observations on (grid_id, timestamp_utc)."
         )
 
-    # 2. Column-Level Nullification (NEVER drop the whole row for a single sensor glitch)
-    # Check physical bounds on each individual measurement:
-    corrupt_temp_mask = ~df_clean["temperature_2m"].between(
-        WEATHER_HARD_LIMITS["temp_min"], WEATHER_HARD_LIMITS["temp_max"]
-    )
-    corrupt_precip_mask = df_clean["precipitation"] < WEATHER_HARD_LIMITS["precip_min"]
-    corrupt_wind_mask = df_clean["wind_speed_10m"] < WEATHER_HARD_LIMITS["wind_min"]
-    corrupt_pressure_mask = ~df_clean["surface_pressure"].between(
-        WEATHER_HARD_LIMITS["pressure_min"], WEATHER_HARD_LIMITS["pressure_max"]
-    )
+    # 2. Comprehensive Sensor Physical Laws & Bounds Validation
+    # We maintain a forensic anomaly log of every single masked field.
+    anomaly_records: List[Dict[str, Any]] = []
+    audit_notes_map: Dict[int, List[str]] = {idx: [] for idx in df_clean.index}
 
-    # Nullify only the affected column, preserving all other valid readings
-    df_clean.loc[corrupt_temp_mask, "temperature_2m"] = None
-    df_clean.loc[corrupt_precip_mask, "precipitation"] = None
-    df_clean.loc[corrupt_wind_mask, "wind_speed_10m"] = None
-    df_clean.loc[corrupt_pressure_mask, "surface_pressure"] = None
+    def evaluate_sensor_rule(
+        mask_condition: pd.Series,
+        col_name: str,
+        rule_name: str,
+        reason_template: str,
+        deviation_calc=None,
+    ):
+        """Helper to record forensic anomalies, mask corrupt values to NaN, and build audit notes."""
+        violating_indices = df_clean[mask_condition].index
+        if len(violating_indices) == 0:
+            return
 
-    # Track if row had any corrupted sensor field
-    df_clean["has_corrupted_sensor_fields"] = (
-        corrupt_temp_mask | corrupt_precip_mask | corrupt_wind_mask | corrupt_pressure_mask
-    )
+        for idx in violating_indices:
+            raw_val = df_clean.at[idx, col_name]
+            r_ts = df_clean.at[idx, "timestamp_utc"]
+            r_grid = df_clean.at[idx, "grid_id"]
+            
+            dev_str = str(deviation_calc(df_clean.loc[idx])) if deviation_calc else "OUT_OF_BOUNDS"
+            reason_str = reason_template.format(val=raw_val, dev=dev_str)
+
+            anomaly_records.append({
+                "timestamp_utc": r_ts,
+                "grid_id": r_grid,
+                "field_name": col_name,
+                "raw_value": float(raw_val) if pd.notna(raw_val) and isinstance(raw_val, (int, float, np.number)) else str(raw_val),
+                "rule_violated": rule_name,
+                "reason": reason_str,
+                "action_taken": "MASKED_TO_NAN",
+                "masked_at_utc": processed_at_utc,
+            })
+            audit_notes_map[idx].append(f"MASKED {col_name}={raw_val} ({rule_name})")
+
+        # Mask corrupted values to None (NaN)
+        df_clean.loc[mask_condition, col_name] = None
+
+    # A. Temperature Physical Bounds [-35°C, 45°C] (NOAA Central Park all-time records)
+    if "temperature_2m" in df_clean.columns:
+        corrupt_temp = df_clean["temperature_2m"].notna() & ~df_clean["temperature_2m"].between(
+            WEATHER_HARD_LIMITS["temp_min"], WEATHER_HARD_LIMITS["temp_max"]
+        )
+        evaluate_sensor_rule(
+            corrupt_temp,
+            "temperature_2m",
+            "TEMPERATURE_OUT_OF_BOUNDS",
+            "Value {val}°C exceeds NYC physical climate range [-35°C, 45°C]",
+        )
+
+    # B. Apparent Temperature Bounds [-45°C, 55°C]
+    if "apparent_temperature" in df_clean.columns:
+        corrupt_app_temp = df_clean["apparent_temperature"].notna() & ~df_clean["apparent_temperature"].between(
+            WEATHER_HARD_LIMITS["apparent_temp_min"], WEATHER_HARD_LIMITS["apparent_temp_max"]
+        )
+        evaluate_sensor_rule(
+            corrupt_app_temp,
+            "apparent_temperature",
+            "APPARENT_TEMPERATURE_OUT_OF_BOUNDS",
+            "Value {val}°C exceeds heat index / wind chill range [-45°C, 55°C]",
+        )
+
+    # C. Atmospheric Thermodynamic Law: Dew Point <= Temperature
+    # (In the physical atmosphere, dew point can never exceed dry-bulb temperature; RH <= 100%)
+    if "dew_point_2m" in df_clean.columns and "temperature_2m" in df_clean.columns:
+        corrupt_dew = (
+            df_clean["dew_point_2m"].notna() &
+            df_clean["temperature_2m"].notna() &
+            (df_clean["dew_point_2m"] > (df_clean["temperature_2m"] + 0.1))
+        )
+        evaluate_sensor_rule(
+            corrupt_dew,
+            "dew_point_2m",
+            "DEW_POINT_EXCEEDS_TEMPERATURE",
+            "Dew point {val}°C physically exceeds ambient temperature ({dev})",
+            deviation_calc=lambda row: f"temp={row['temperature_2m']}°C",
+        )
+
+    # D. Relative Humidity Bounds [0%, 100%]
+    if "relative_humidity_2m" in df_clean.columns:
+        corrupt_rh = df_clean["relative_humidity_2m"].notna() & ~df_clean["relative_humidity_2m"].between(
+            WEATHER_HARD_LIMITS["humidity_min"], WEATHER_HARD_LIMITS["humidity_max"]
+        )
+        evaluate_sensor_rule(
+            corrupt_rh,
+            "relative_humidity_2m",
+            "RELATIVE_HUMIDITY_OUT_OF_BOUNDS",
+            "Humidity {val}% must strictly be between 0% and 100%",
+        )
+
+    # E. Precipitation Bounds [0.0, 150.0 mm/hr]
+    if "precipitation" in df_clean.columns:
+        corrupt_precip = df_clean["precipitation"].notna() & (
+            (df_clean["precipitation"] < WEATHER_HARD_LIMITS["precip_min"]) |
+            (df_clean["precipitation"] > WEATHER_HARD_LIMITS["precip_max"])
+        )
+        evaluate_sensor_rule(
+            corrupt_precip,
+            "precipitation",
+            "PRECIPITATION_OUT_OF_BOUNDS",
+            "Precipitation {val} mm/hr outside realistic physical limits [0, 150]",
+        )
+
+    # F. Rain Bounds (rain >= 0 and rain <= precipitation)
+    if "rain" in df_clean.columns and "precipitation" in df_clean.columns:
+        corrupt_rain = df_clean["rain"].notna() & (
+            (df_clean["rain"] < 0.0) |
+            (df_clean["precipitation"].notna() & (df_clean["rain"] > (df_clean["precipitation"] + 0.05)))
+        )
+        evaluate_sensor_rule(
+            corrupt_rain,
+            "rain",
+            "RAIN_EXCEEDS_TOTAL_PRECIP",
+            "Rain component {val} mm exceeds total precipitation ({dev})",
+            deviation_calc=lambda row: f"precip={row['precipitation']} mm",
+        )
+
+    # G. Snowfall and Snow Depth (must be non-negative)
+    if "snowfall" in df_clean.columns:
+        corrupt_snow = df_clean["snowfall"].notna() & (df_clean["snowfall"] < 0.0)
+        evaluate_sensor_rule(corrupt_snow, "snowfall", "NEGATIVE_SNOWFALL", "Snowfall {val} cm cannot be negative")
+
+    if "snow_depth" in df_clean.columns:
+        corrupt_snowdepth = df_clean["snow_depth"].notna() & (df_clean["snow_depth"] < 0.0)
+        evaluate_sensor_rule(corrupt_snowdepth, "snow_depth", "NEGATIVE_SNOW_DEPTH", "Snow depth {val} m cannot be negative")
+
+    # H. Sustained Wind Speed [0.0, 65.0 m/s]
+    if "wind_speed_10m" in df_clean.columns:
+        corrupt_wind = df_clean["wind_speed_10m"].notna() & ~df_clean["wind_speed_10m"].between(
+            WEATHER_HARD_LIMITS["wind_speed_min"], WEATHER_HARD_LIMITS["wind_speed_max"]
+        )
+        evaluate_sensor_rule(
+            corrupt_wind,
+            "wind_speed_10m",
+            "WIND_SPEED_OUT_OF_BOUNDS",
+            "Sustained wind speed {val} m/s outside physical sanity bounds [0, 65]",
+        )
+
+    # I. Aerodynamic Law: Wind Gust >= Sustained Wind Speed
+    # (By definition, maximum instantaneous 3-second gust must be >= sustained average hourly wind)
+    if "wind_gusts_10m" in df_clean.columns and "wind_speed_10m" in df_clean.columns:
+        corrupt_gust = (
+            df_clean["wind_gusts_10m"].notna() &
+            df_clean["wind_speed_10m"].notna() &
+            (df_clean["wind_gusts_10m"] < (df_clean["wind_speed_10m"] - 0.01))
+        )
+        evaluate_sensor_rule(
+            corrupt_gust,
+            "wind_gusts_10m",
+            "GUST_LESS_THAN_SUSTAINED_SPEED",
+            "Peak gust {val} m/s physically cannot be slower than sustained speed ({dev})",
+            deviation_calc=lambda row: f"sustained={row['wind_speed_10m']} m/s",
+        )
+
+    # J. Wind Direction [0°, 360°]
+    if "wind_direction_10m" in df_clean.columns:
+        corrupt_wind_dir = df_clean["wind_direction_10m"].notna() & ~df_clean["wind_direction_10m"].between(
+            WEATHER_HARD_LIMITS["wind_dir_min"], WEATHER_HARD_LIMITS["wind_dir_max"]
+        )
+        evaluate_sensor_rule(
+            corrupt_wind_dir,
+            "wind_direction_10m",
+            "WIND_DIRECTION_OUT_OF_BOUNDS",
+            "Compass wind direction {val}° outside [0, 360]",
+        )
+
+    # K. Surface Barometric Pressure [870, 1085 hPa]
+    if "surface_pressure" in df_clean.columns:
+        corrupt_pressure = df_clean["surface_pressure"].notna() & ~df_clean["surface_pressure"].between(
+            WEATHER_HARD_LIMITS["pressure_min"], WEATHER_HARD_LIMITS["pressure_max"]
+        )
+        evaluate_sensor_rule(
+            corrupt_pressure,
+            "surface_pressure",
+            "SURFACE_PRESSURE_OUT_OF_BOUNDS",
+            "Surface pressure {val} hPa outside terrestrial extremes [870, 1085]",
+        )
+
+    # L. World Meteorological Organization (WMO) Code Table 4677 Validity
+    if "weather_code" in df_clean.columns:
+        corrupt_wmo = df_clean["weather_code"].notna() & ~df_clean["weather_code"].isin(VALID_WMO_WEATHER_CODES)
+        evaluate_sensor_rule(
+            corrupt_wmo,
+            "weather_code",
+            "INVALID_WMO_WEATHER_CODE",
+            "Weather code {val} not found in WMO Code Table 4677 standard",
+        )
+
+    # Attach Row-Level Observability Metadata
+    df_clean["quality_audit_notes"] = [
+        "; ".join(audit_notes_map[idx]) if audit_notes_map[idx] else None
+        for idx in df_clean.index
+    ]
+    df_clean["has_corrupted_sensor_fields"] = df_clean["quality_audit_notes"].notna()
     corrupted_fields_rows = int(df_clean["has_corrupted_sensor_fields"].sum())
+
+    # Write Sensor Anomaly Audit Ledger Parquet
+    anomaly_ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    if anomaly_records:
+        df_ledger = pd.DataFrame(anomaly_records)
+        logger.warning(
+            f"Sensor Anomaly Audit: Logged {len(anomaly_records):,} corrupt sensor readings "
+            f"across {corrupted_fields_rows:,} rows to {anomaly_ledger_path}"
+        )
+    else:
+        df_ledger = pd.DataFrame(
+            columns=["timestamp_utc", "grid_id", "field_name", "raw_value", "rule_violated", "reason", "action_taken", "masked_at_utc"]
+        )
+    
+    pq.write_table(pa.Table.from_pandas(df_ledger, preserve_index=False), anomaly_ledger_path, compression="snappy")
 
     # 3. Soft Quality Tagging (Extreme Weather Flags - NEVER DISCARD REAL EXTREMES)
     cond_cold = df_clean["temperature_2m"] < WEATHER_EXTREME_THRESHOLDS["temp_extreme_cold"]
@@ -109,8 +304,6 @@ def clean_and_validate_weather(
     logger.info(f"Tagged {extreme_rows_count:,} observations as extreme weather events (preserved intact).")
 
     # 4. Standardization and Derived Row Attributes (Pure Metric: Celsius and m/s)
-    if "timestamp_utc" not in df_clean.columns:
-        df_clean["timestamp_utc"] = pd.to_datetime(df_clean["time"], utc=True)
     df_clean["is_freezing"] = df_clean["temperature_2m"] <= 0.0
     df_clean["is_raining"] = df_clean["precipitation"] > 0.0
 
@@ -120,7 +313,6 @@ def clean_and_validate_weather(
             df_clean[int16_col] = pd.to_numeric(df_clean[int16_col], errors="coerce").astype("Int16")
 
     # 5. Cumulative & Lagged Weather Features (Chronological Rolling Windows per Grid Cell)
-    # Sort chronologically by grid_id and timestamp_utc to guarantee window integrity
     df_clean = df_clean.sort_values(["grid_id", "timestamp_utc"]).reset_index(drop=True)
 
     # Rolling precipitation accumulations: 3-hour, 6-hour, and 24-hour windows
@@ -134,7 +326,7 @@ def clean_and_validate_weather(
         lambda s: s.rolling(window=24, min_periods=1).sum().round(2)
     )
 
-    # Rolling peak wind gusts: 6-hour window (captures storm severity causing tree & power line damage)
+    # Rolling peak wind gusts: 6-hour window
     if "wind_gusts_10m" in df_clean.columns:
         df_clean["max_wind_gust_past_6h_ms"] = df_clean.groupby("grid_id")["wind_gusts_10m"].transform(
             lambda s: s.rolling(window=6, min_periods=1).max().round(2)
@@ -142,7 +334,7 @@ def clean_and_validate_weather(
     else:
         df_clean["max_wind_gust_past_6h_ms"] = np.nan
 
-    # Rolling temperature extremes: 24-hour minimum (freezing pipe risk) and maximum (heat wave risk)
+    # Rolling temperature extremes: 24-hour minimum and maximum
     df_clean["min_temp_past_24h_c"] = df_clean.groupby("grid_id")["temperature_2m"].transform(
         lambda s: s.rolling(window=24, min_periods=1).min().round(2)
     )
@@ -153,7 +345,7 @@ def clean_and_validate_weather(
     # Silver Audit Metadata
     df_clean["_silver_processed_at_utc"] = processed_at_utc
 
-    # 4. Write Partitioned Parquet: grid_id=GRID_XX_YY / year=YYYY / part_XXXX.parquet
+    # 6. Write Partitioned Parquet: grid_id=GRID_XX_YY / year=YYYY / clean_weather.parquet
     silver_weather_dir.mkdir(parents=True, exist_ok=True)
     df_clean["_partition_year"] = df_clean["timestamp_utc"].dt.strftime("%Y")
 
@@ -172,7 +364,7 @@ def clean_and_validate_weather(
     elapsed = time.time() - start_time
     logger.info(
         f"Completed Silver Weather processing: {len(df_clean):,} valid rows | "
-        f"{written_files} partition files written | {elapsed:.2f}s"
+        f"{written_files} partition files written | {len(anomaly_records)} sensor anomalies ledgered | {elapsed:.2f}s"
     )
 
     return {
@@ -182,6 +374,7 @@ def clean_and_validate_weather(
         "dropped_unkeyed_rows": dropped_unkeyed_rows + dropped_invalid_ts,
         "duplicate_rows_dropped": duplicate_rows_dropped,
         "corrupted_fields_masked": corrupted_fields_rows,
+        "sensor_anomalies_logged": len(anomaly_records),
         "extreme_weather_tagged_rows": extreme_rows_count,
         "distinct_grid_cells": df_clean["grid_id"].nunique(),
         "partitions_written": written_files,

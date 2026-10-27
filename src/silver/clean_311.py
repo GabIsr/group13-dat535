@@ -2,7 +2,7 @@
 Silver Layer: NYC 311 Service Requests Cleaning, Deduplication, and Spatial Imputation.
 Applies deduplication, UTC timestamp normalization, temporal duration validation,
 3-level hierarchical spatial imputation (Coordinates -> ZIP Centroid -> Borough Centroid),
-and routes invalid rows to quarantine.
+comprehensive institutional & spatial consistency checks, and routes invalid rows to quarantine.
 Author: Group 13
 """
 
@@ -21,10 +21,16 @@ import pyarrow.parquet as pq
 from src.silver.config import (
     BOROUGH_CENTROIDS,
     BRONZE_DIR,
-    NYC_LAT_MIN,
+    KNOWN_NYC_AGENCIES,
+    NYC_311_LAUNCH_DATE,
+    NYC_COUNCIL_DISTRICT_MAX,
+    NYC_COUNCIL_DISTRICT_MIN,
     NYC_LAT_MAX,
-    NYC_LON_MIN,
+    NYC_LAT_MIN,
     NYC_LON_MAX,
+    NYC_LON_MIN,
+    NYC_METRO_ZIP_PREFIXES,
+    NYC_STATE_PLANE_BOUNDS,
     PROJECT_ROOT,
     QUARANTINE_DIR,
     SILVER_DIR,
@@ -147,28 +153,47 @@ def clean_and_validate_311(
     df_dedup["is_weekend"] = df_dedup["day_of_week"].isin([5, 6])
     df_dedup["month_of_year"] = created_local.dt.month
 
-    # Check for invalid records:
+    # -------------------------------------------------------------------------
+    # Hard Quarantine Boundary Validation
     # 1. Missing created_at timestamp
     # 2. Negative duration for closed tickets (closed before created)
-    # 3. Missing or non-numeric unique_key primary key
+    # 3. Missing or non-positive unique_key primary key (supports 7, 8, 9 digit keys > 0)
+    # 4. Pre-311 launch date (earlier than March 2003 indicates epoch/default artifact)
+    # 5. Future created timestamp (time travel beyond current UTC time + 2h clock drift allowance)
+    # -------------------------------------------------------------------------
     parsed_keys = pd.to_numeric(df_dedup["unique_key"], errors="coerce")
+    launch_date_utc = pd.Timestamp(NYC_311_LAUNCH_DATE)
+    future_grace_utc = now_utc + pd.Timedelta(hours=2)
+
     cond_missing_created = df_dedup["created_at_utc"].isna()
     cond_negative_duration = df_dedup["is_ticket_closed"] & (df_dedup["resolution_duration_hours"] < 0.0)
-    cond_invalid_key = parsed_keys.isna()
+    cond_invalid_key = parsed_keys.isna() | (parsed_keys <= 0)
+    cond_pre_epoch = df_dedup["created_at_utc"].notna() & (df_dedup["created_at_utc"] < launch_date_utc)
+    cond_future_created = df_dedup["created_at_utc"].notna() & (df_dedup["created_at_utc"] > future_grace_utc)
 
-    quarantine_mask = cond_missing_created | cond_negative_duration | cond_invalid_key
+    quarantine_mask = cond_missing_created | cond_negative_duration | cond_invalid_key | cond_pre_epoch | cond_future_created
     df_quarantined = df_dedup[quarantine_mask].copy()
 
     if len(df_quarantined) > 0:
-        df_quarantined["quarantine_reason"] = np.where(
+        # Determine specific quarantine reason in order of precedence
+        reasons = np.where(
             df_quarantined["created_at_utc"].isna(),
             "MISSING_CREATED_TIMESTAMP",
             np.where(
-                pd.to_numeric(df_quarantined["unique_key"], errors="coerce").isna(),
+                pd.to_numeric(df_quarantined["unique_key"], errors="coerce").isna() | (pd.to_numeric(df_quarantined["unique_key"], errors="coerce") <= 0),
                 "INVALID_OR_NON_NUMERIC_UNIQUE_KEY",
-                "NEGATIVE_RESOLUTION_DURATION",
+                np.where(
+                    df_quarantined["created_at_utc"] < launch_date_utc,
+                    "PRE_311_EPOCH_DATE",
+                    np.where(
+                        df_quarantined["created_at_utc"] > future_grace_utc,
+                        "FUTURE_CREATED_DATE",
+                        "NEGATIVE_RESOLUTION_DURATION",
+                    ),
+                ),
             ),
         )
+        df_quarantined["quarantine_reason"] = reasons
         quarantine_dir.mkdir(parents=True, exist_ok=True)
         q_path = quarantine_dir / "quarantined_311.parquet"
         pq.write_table(pa.Table.from_pandas(df_quarantined, preserve_index=False), q_path, compression="snappy")
@@ -188,10 +213,16 @@ def clean_and_validate_311(
     else:
         df_valid["clean_incident_zip"] = None
 
+    # Tag Out-of-State / Non-Metro ZIP Codes
+    df_valid["is_out_of_state_zip"] = (
+        df_valid["clean_incident_zip"].notna() &
+        ~df_valid["clean_incident_zip"].str[:3].isin(NYC_METRO_ZIP_PREFIXES)
+    )
+
     # 3. Hierarchical Spatial Imputation (3 Levels)
     # Parse coordinates to numeric
-    raw_lats = pd.to_numeric(df_valid["latitude"], errors="coerce")
-    raw_lons = pd.to_numeric(df_valid["longitude"], errors="coerce")
+    raw_lats = pd.to_numeric(df_valid["latitude"], errors="coerce") if "latitude" in df_valid.columns else pd.Series(np.nan, index=df_valid.index)
+    raw_lons = pd.to_numeric(df_valid["longitude"], errors="coerce") if "longitude" in df_valid.columns else pd.Series(np.nan, index=df_valid.index)
 
     # Mask for Level 1: Valid Native GPS Coordinates within NYC bounds
     mask_level1 = (
@@ -260,24 +291,88 @@ def clean_and_validate_311(
     if "agency" in df_valid.columns:
         df_valid["agency"] = standardize_string_series(df_valid["agency"], "UNKNOWN", case="upper")
 
-    # 5. Type Enforcement on Raw & Secondary Columns
+    # 5. Type Enforcement & Consistency Validations
     df_valid["latitude"] = raw_lats
     df_valid["longitude"] = raw_lons
+
+    # NY State Plane Coordinates (Sanity Bounds [900000..1075000, 110000..285000])
     if "x_coordinate_state_plane" in df_valid.columns:
-        df_valid["x_coordinate_state_plane"] = pd.to_numeric(df_valid["x_coordinate_state_plane"], errors="coerce")
+        x_num = pd.to_numeric(df_valid["x_coordinate_state_plane"], errors="coerce")
+        df_valid["x_coordinate_state_plane"] = np.where(
+            x_num.between(NYC_STATE_PLANE_BOUNDS["x_min"], NYC_STATE_PLANE_BOUNDS["x_max"]),
+            x_num,
+            np.nan,
+        )
     if "y_coordinate_state_plane" in df_valid.columns:
-        df_valid["y_coordinate_state_plane"] = pd.to_numeric(df_valid["y_coordinate_state_plane"], errors="coerce")
+        y_num = pd.to_numeric(df_valid["y_coordinate_state_plane"], errors="coerce")
+        df_valid["y_coordinate_state_plane"] = np.where(
+            y_num.between(NYC_STATE_PLANE_BOUNDS["y_min"], NYC_STATE_PLANE_BOUNDS["y_max"]),
+            y_num,
+            np.nan,
+        )
+
+    # Council District: NYC Charter Chapter 2, Section 22 defines exactly 51 Council Districts (1-51)
     if "council_district" in df_valid.columns:
-        df_valid["council_district"] = pd.to_numeric(df_valid["council_district"], errors="coerce").astype("Int16")
+        c_num = pd.to_numeric(df_valid["council_district"], errors="coerce")
+        c_valid = c_num.where(c_num.between(NYC_COUNCIL_DISTRICT_MIN, NYC_COUNCIL_DISTRICT_MAX))
+        df_valid["council_district"] = c_valid.astype("Int16")
+
+    # Police Precinct: NYC has 77 NYPD precincts (ranging 1-123)
+    if "police_precinct" in df_valid.columns:
+        precinct_extracted = df_valid["police_precinct"].astype(str).str.extract(r"(\d+)")[0]
+        precinct_num = pd.to_numeric(precinct_extracted, errors="coerce")
+        p_valid = precinct_num.where(precinct_num.between(1, 123))
+        df_valid["clean_police_precinct"] = p_valid.astype("Int16")
+
+    # Secondary Timestamps: Parse to UTC
     if "due_date" in df_valid.columns:
         df_valid["due_date_utc"] = to_utc_datetime(df_valid["due_date"])
     if "resolution_action_updated_date" in df_valid.columns:
         df_valid["resolution_action_updated_date_utc"] = to_utc_datetime(df_valid["resolution_action_updated_date"])
 
+    # 6. Quality Tagging & Observability Audit Notes
+    # Instant Closures (Closed at creation: 0.0 duration)
+    df_valid["is_instant_closure"] = df_valid["is_ticket_closed"] & (df_valid["resolution_duration_hours"] == 0.0)
+
+    # Status vs. Closed Date Contradiction (Agency says OPEN/IN PROGRESS, but closed_date is filled)
+    open_statuses = {"OPEN", "IN PROGRESS", "PENDING", "ASSIGNED", "STARTED"}
+    if "status" in df_valid.columns:
+        df_valid["is_status_conflict"] = df_valid["is_ticket_closed"] & df_valid["status"].isin(open_statuses)
+    else:
+        df_valid["is_status_conflict"] = False
+
+    # Extreme Outlier Durations (> 2 years / 17,520 hours)
+    df_valid["is_extreme_duration"] = df_valid["is_ticket_closed"] & (df_valid["resolution_duration_hours"] > 17520.0)
+
+    # Agency Registry Check
+    if "agency" in df_valid.columns:
+        df_valid["is_known_agency"] = df_valid["agency"].isin(KNOWN_NYC_AGENCIES)
+    else:
+        df_valid["is_known_agency"] = True
+
+    # Build Observability Audit String per Row
+    def build_row_audit_notes(row):
+        notes = []
+        if row.get("is_instant_closure"):
+            notes.append("INSTANT_CLOSURE_0SEC")
+        if row.get("is_status_conflict"):
+            st = row.get("status", "UNKNOWN")
+            notes.append(f"STATUS_CONFLICT(status={st}_with_closed_date)")
+        if row.get("is_extreme_duration"):
+            notes.append(f"EXTREME_DURATION({row['resolution_duration_hours']}h)")
+        if row.get("is_out_of_state_zip"):
+            notes.append(f"OUT_OF_STATE_ZIP({row.get('clean_incident_zip')})")
+        if not row.get("is_known_agency", True):
+            ag = row.get("agency", "UNKNOWN")
+            notes.append(f"UNRECOGNIZED_AGENCY({ag})")
+        return "; ".join(notes) if notes else None
+
+    df_valid["quality_audit_notes"] = [build_row_audit_notes(r) for _, r in df_valid.iterrows()]
+
     # Silver Audit Metadata
     df_valid["_silver_processed_at_utc"] = processed_at_utc
 
-    # 5. Partitioned Parquet Write: year=YYYY / month=MM / clean_311.parquet
+    # 7. Partitioned Parquet Write: year=YYYY / month=MM / clean_311.parquet
     silver_311_dir.mkdir(parents=True, exist_ok=True)
     df_valid["_partition_year"] = df_valid["created_at_utc"].dt.strftime("%Y")
     df_valid["_partition_month"] = df_valid["created_at_utc"].dt.strftime("%m")
@@ -302,6 +397,8 @@ def clean_and_validate_311(
 
     closed_count = int(df_valid["is_ticket_closed"].sum()) if "is_ticket_closed" in df_valid.columns else 0
     open_count = len(df_valid) - closed_count
+    conflict_count = int(df_valid["is_status_conflict"].sum())
+    instant_count = int(df_valid["is_instant_closure"].sum())
 
     return {
         "dataset": "silver_311",
@@ -310,6 +407,8 @@ def clean_and_validate_311(
         "valid_rows_accepted": len(df_valid),
         "closed_tickets_count": closed_count,
         "open_tickets_count": open_count,
+        "status_conflict_count": conflict_count,
+        "instant_closure_count": instant_count,
         "quarantined_rows": len(df_quarantined),
         "spatial_resolution_breakdown": spatial_stats,
         "partitions_written": written_files,

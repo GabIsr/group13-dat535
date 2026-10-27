@@ -457,5 +457,157 @@ class TestSilverLayerPipeline(unittest.TestCase):
             self.assertIn("Cartesian join explosion detected", str(ctx.exception))
 
 
+
+    def test_sensor_anomaly_ledger_logging_and_quality_notes(self):
+        """Verify atmospheric physical law enforcement, masking to NaN, and ledgering in sensor_anomaly_ledger."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            bronze_in = tmp_path / 'bronze_weather'
+            silver_out = tmp_path / 'silver_weather'
+            ledger_file = tmp_path / 'quality' / 'sensor_anomaly_ledger.parquet'
+            bronze_in.mkdir()
+
+            mock_weather = [
+                # Row 1: Dew point physically exceeds ambient temperature (22°C > 18°C)
+                {
+                    'grid_id': 'GRID_40.7_-74.0',
+                    'time': '2026-10-18T10:00',
+                    'temperature_2m': 18.0,
+                    'dew_point_2m': 22.0,  # Physically impossible (supersaturation)
+                    'precipitation': 0.0,
+                    'relative_humidity_2m': 85,
+                    'wind_speed_10m': 5.0,
+                    'wind_gusts_10m': 10.0,
+                    'surface_pressure': 1013.0,
+                    'weather_code': 0,
+                },
+                # Row 2: Wind gust is slower than sustained wind speed (3.0 m/s < 8.0 m/s)
+                {
+                    'grid_id': 'GRID_40.7_-74.0',
+                    'time': '2026-10-18T11:00',
+                    'temperature_2m': 19.0,
+                    'dew_point_2m': 12.0,
+                    'precipitation': 0.0,
+                    'relative_humidity_2m': 115,  # Physically impossible (>100%)
+                    'wind_speed_10m': 8.0,
+                    'wind_gusts_10m': 3.0,  # Aerodynamically impossible
+                    'surface_pressure': 1013.0,
+                    'weather_code': 0,
+                },
+            ]
+            pd.DataFrame(mock_weather).to_parquet(bronze_in / 'part_0000.parquet', index=False)
+
+            res = clean_and_validate_weather(
+                bronze_weather_dir=bronze_in,
+                silver_weather_dir=silver_out,
+                anomaly_ledger_path=ledger_file,
+            )
+
+            self.assertEqual(res['valid_rows'], 2)
+            self.assertEqual(res['sensor_anomalies_logged'], 3)  # dew_point, humidity, wind_gust
+
+            # Verify ledger file exists and contains the 3 anomalies
+            self.assertTrue(ledger_file.exists())
+            df_ledger = pd.read_parquet(ledger_file)
+            self.assertEqual(len(df_ledger), 3)
+            self.assertIn('DEW_POINT_EXCEEDS_TEMPERATURE', df_ledger['rule_violated'].values)
+            self.assertIn('GUST_LESS_THAN_SUSTAINED_SPEED', df_ledger['rule_violated'].values)
+            self.assertIn('RELATIVE_HUMIDITY_OUT_OF_BOUNDS', df_ledger['rule_violated'].values)
+
+            # Verify Silver dataset has corrupt sensors masked to NaN and audit notes attached
+            clean_files = list(silver_out.glob('**/*.parquet'))
+            df_w = pd.concat([pd.read_parquet(f) for f in clean_files]).sort_values('timestamp_utc').reset_index(drop=True)
+
+            # Row 1 check: dew point is masked to NaN
+            self.assertTrue(np.isnan(df_w.loc[0, 'dew_point_2m']))
+            self.assertEqual(df_w.loc[0, 'temperature_2m'], 18.0)
+            self.assertIn('DEW_POINT_EXCEEDS_TEMPERATURE', str(df_w.loc[0, 'quality_audit_notes']))
+
+            # Row 2 check: wind gust and humidity are masked
+            self.assertTrue(np.isnan(df_w.loc[1, 'wind_gusts_10m']))
+            self.assertTrue(pd.isna(df_w.loc[1, 'relative_humidity_2m']))
+            self.assertIn('GUST_LESS_THAN_SUSTAINED_SPEED', str(df_w.loc[1, 'quality_audit_notes']))
+
+    def test_unique_key_positive_integer_and_epoch_quarantine(self):
+        """Verify that unique_key accepts any positive integer (7 or 8 digits) and quarantines <= 0 or pre-2003 dates."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            bronze_in = tmp_path / 'bronze_311'
+            silver_out = tmp_path / 'silver_311'
+            quarantine_out = tmp_path / 'quarantine'
+            bronze_in.mkdir()
+
+            mock_311 = [
+                # Row 1: Valid 7-digit historical key (2004 era)
+                {
+                    'unique_key': '4705298',
+                    'created_date': '2026-10-18T10:00:00.000',
+                    'closed_date': '2026-10-18T12:00:00.000',
+                    'agency': 'NYPD',
+                    'complaint_type': 'Noise',
+                    'borough': 'MANHATTAN',
+                    'incident_zip': '10001',
+                    'status': 'CLOSED',
+                },
+                # Row 2: Valid 8-digit modern key
+                {
+                    'unique_key': '70880898',
+                    'created_date': '2026-10-18T11:00:00.000',
+                    'closed_date': '2026-10-18T11:00:00.000',  # Instant closure (0s)
+                    'agency': 'DSNY',
+                    'complaint_type': 'Sanitation',
+                    'borough': 'BROOKLYN',
+                    'incident_zip': '11201',
+                    'status': 'CLOSED',
+                },
+                # Row 3: Invalid non-positive unique_key (0) -> should quarantine
+                {
+                    'unique_key': '0',
+                    'created_date': '2026-10-18T12:00:00.000',
+                    'agency': 'DOT',
+                    'complaint_type': 'Street Condition',
+                    'borough': 'QUEENS',
+                    'status': 'OPEN',
+                },
+                # Row 4: Pre-2003 date (1999 Unix artifact) -> should quarantine
+                {
+                    'unique_key': '10000001',
+                    'created_date': '1999-05-12T08:00:00.000',
+                    'agency': 'DOT',
+                    'complaint_type': 'Street Condition',
+                    'borough': 'QUEENS',
+                    'status': 'OPEN',
+                },
+            ]
+            pd.DataFrame(mock_311).to_parquet(bronze_in / 'part_0000.parquet', index=False)
+
+            res = clean_and_validate_311(
+                bronze_311_dir=bronze_in,
+                silver_311_dir=silver_out,
+                quarantine_dir=quarantine_out,
+            )
+
+            self.assertEqual(res['valid_rows_accepted'], 2)
+            self.assertEqual(res['quarantined_rows'], 2)
+            self.assertEqual(res['instant_closure_count'], 1)
+
+            # Check quarantine file reasons
+            q_file = quarantine_out / 'quarantined_311.parquet'
+            self.assertTrue(q_file.exists())
+            df_q = pd.read_parquet(q_file)
+            reasons = df_q['quarantine_reason'].tolist()
+            self.assertIn('INVALID_OR_NON_NUMERIC_UNIQUE_KEY', reasons)
+            self.assertIn('PRE_311_EPOCH_DATE', reasons)
+
+            # Check clean Silver records
+            clean_files = list(silver_out.glob('**/*.parquet'))
+            df_clean = pd.concat([pd.read_parquet(f) for f in clean_files])
+            self.assertIn(4705298, df_clean['unique_key'].tolist())
+            self.assertIn(70880898, df_clean['unique_key'].tolist())
+            row_instant = df_clean[df_clean['unique_key'] == 70880898].iloc[0]
+            self.assertTrue(row_instant['is_instant_closure'])
+            self.assertIn('INSTANT_CLOSURE_0SEC', str(row_instant['quality_audit_notes']))
+
+
 if __name__ == "__main__":
     unittest.main()

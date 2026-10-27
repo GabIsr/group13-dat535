@@ -60,6 +60,16 @@ def run_silver(env: str = "dev"):
     return res.returncode == 0
 
 
+def run_gold(env: str = "dev"):
+    """Execute Gold Business Marts Generation."""
+    logger.info("=" * 70)
+    logger.info("EXECUTING GOLD LAYER (BUSINESS ANALYTICAL MARTS)")
+    logger.info("=" * 70)
+    cmd = [sys.executable, "run_gold.py", "--env", env]
+    res = subprocess.run(cmd)
+    return res.returncode == 0
+
+
 def run_compaction(target_dir: str = "data/bronze", target_mb: int = 64):
     """Execute partition compaction to resolve the Small Files Problem."""
     logger.info("=" * 70)
@@ -77,7 +87,7 @@ def main():
     )
     parser.add_argument(
         "action",
-        choices=["all", "test", "bronze", "silver", "compact"],
+        choices=["all", "test", "bronze", "silver", "gold", "compact"],
         default="all",
         nargs="?",
         help="Pipeline layer or action to run (default: all)",
@@ -116,6 +126,11 @@ def main():
     if args.action in ["all", "silver"]:
         if not run_silver(env=args.env):
             logger.error("Silver layer failed. Halting pipeline.")
+            sys.exit(1)
+
+    if args.action in ["all", "gold"]:
+        if not run_gold(env=args.env):
+            logger.error("Gold layer failed. Halting pipeline.")
             sys.exit(1)
 
     if args.action == "all":

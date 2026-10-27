@@ -67,9 +67,9 @@ def build_agency_resolution_performance_mart(
     df_closed_subset = df_311[df_311["is_ticket_closed"] & df_311["closed_date_only"].notna()]
     df_closed = df_closed_subset.groupby(["closed_date_only", "borough", "agency"]).agg(
         tickets_closed_today=("unique_key", "count"),
-        median_resolution_duration_hours=("resolution_duration_hours", lambda s: s.median().round(2)),
-        p90_resolution_duration_hours=("resolution_duration_hours", lambda s: s.quantile(0.90).round(2)),
-        avg_resolution_duration_hours=("resolution_duration_hours", lambda s: s.mean().round(2)),
+        median_resolution_duration_hours=("resolution_duration_hours", lambda s: round(float(s.median()), 2)),
+        p90_resolution_duration_hours=("resolution_duration_hours", lambda s: round(float(s.quantile(0.90)), 2)),
+        avg_resolution_duration_hours=("resolution_duration_hours", lambda s: round(float(s.mean()), 2)),
     ).reset_index().rename(columns={"closed_date_only": "reporting_date"})
 
     # Merge Creation and Closure cohorts
@@ -130,9 +130,9 @@ def build_agency_resolution_performance_mart(
         df_weather["borough_clean"] = df_weather["borough_hint"].astype(str).str.strip().str.upper()
 
         borough_weather = df_weather.groupby(["date", "borough_clean"]).agg(
-            borough_daily_precip_mm=("precipitation", lambda s: s.sum().round(2)),
-            borough_max_wind_gust_ms=("wind_gusts_10m", lambda s: s.max().round(2) if s.notna().any() else np.nan),
-            borough_avg_temp_c=("temperature_2m", lambda s: s.mean().round(2) if s.notna().any() else np.nan),
+            borough_daily_precip_mm=("precipitation", lambda s: round(float(s.sum()), 2)),
+            borough_max_wind_gust_ms=("wind_gusts_10m", lambda s: round(float(s.max()), 2) if s.notna().any() else np.nan),
+            borough_avg_temp_c=("temperature_2m", lambda s: round(float(s.mean()), 2) if s.notna().any() else np.nan),
             is_extreme_weather_event=("is_extreme_weather", lambda s: bool(s.any())),
         ).reset_index().rename(columns={"date": "reporting_date", "borough_clean": "borough"})
 
@@ -148,7 +148,7 @@ def build_agency_resolution_performance_mart(
         df_perf["borough_avg_temp_c"] = np.nan
         df_perf["is_storm_day"] = False
 
-    df_perf["is_storm_day"] = df_perf["is_storm_day"].fillna(False)
+    df_perf["is_storm_day"] = df_perf["is_storm_day"].astype("boolean").fillna(False).astype(bool)
 
     # 6. Calendar Context
     dt_series = pd.to_datetime(df_perf["reporting_date"])

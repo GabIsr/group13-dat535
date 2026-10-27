@@ -55,12 +55,12 @@ def build_daily_service_demand_mart(
     # 3. Aggregate Weather to Daily Grain (date × grid_id)
     df_weather["date"] = pd.to_datetime(df_weather["timestamp_utc"], utc=True).dt.date
     daily_weather = df_weather.groupby(["date", "grid_id"]).agg(
-        total_precipitation_mm=("precipitation", lambda s: s.sum().round(2)),
+        total_precipitation_mm=("precipitation", lambda s: round(float(s.sum()), 2)),
         hours_of_precipitation=("precipitation", lambda s: int((s > 0.0).sum())),
-        max_wind_gust_ms=("wind_gusts_10m", lambda s: s.max().round(2) if s.notna().any() else np.nan),
-        avg_temperature_c=("temperature_2m", lambda s: s.mean().round(2) if s.notna().any() else np.nan),
-        min_temperature_c=("temperature_2m", lambda s: s.min().round(2) if s.notna().any() else np.nan),
-        max_temperature_c=("temperature_2m", lambda s: s.max().round(2) if s.notna().any() else np.nan),
+        max_wind_gust_ms=("wind_gusts_10m", lambda s: round(float(s.max()), 2) if s.notna().any() else np.nan),
+        avg_temperature_c=("temperature_2m", lambda s: round(float(s.mean()), 2) if s.notna().any() else np.nan),
+        min_temperature_c=("temperature_2m", lambda s: round(float(s.min()), 2) if s.notna().any() else np.nan),
+        max_temperature_c=("temperature_2m", lambda s: round(float(s.max()), 2) if s.notna().any() else np.nan),
         is_extreme_weather_day=("is_extreme_weather", lambda s: bool(s.any())),
         valid_weather_obs_count=("temperature_2m", lambda s: int(s.notna().sum())),
     ).reset_index()
@@ -91,7 +91,7 @@ def build_daily_service_demand_mart(
 
     # Impute missing weather flags for unlocated or unobserved grid cells
     mart_df["weather_data_coverage_pct"] = mart_df["weather_data_coverage_pct"].fillna(0.0)
-    mart_df["is_extreme_weather_day"] = mart_df["is_extreme_weather_day"].fillna(False)
+    mart_df["is_extreme_weather_day"] = mart_df["is_extreme_weather_day"].astype("boolean").fillna(False).astype(bool)
 
     # 6. Add Calendar and Temporal Context Attributes
     dt_series = pd.to_datetime(mart_df["date"])

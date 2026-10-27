@@ -55,6 +55,17 @@ BOROUGH_CENTROIDS: Dict[str, Tuple[float, float, str]] = {
 # Any complaint timestamp prior to March 2003 represents a corrupted epoch/default artifact.
 NYC_311_LAUNCH_DATE = "2003-03-01T00:00:00Z"
 
+# NYC 5 Boroughs (Legal administrative divisions of the City of New York)
+# Source: NYC Charter Title 1, Chapter 1 §2; 2025 NYC 311 Data Dictionary
+VALID_NYC_BOROUGHS: Set[str] = {
+    "MANHATTAN",
+    "BRONX",
+    "BROOKLYN",
+    "QUEENS",
+    "STATEN ISLAND",
+    "UNSPECIFIED",
+}
+
 # NYC Council Districts: Established by New York City Charter, Chapter 2, Section 22
 # "There shall be a council which shall consist of the public advocate and fifty-one council members."
 # Range is strictly 1 to 51 (1-10: Manhattan, 11-18: Bronx, 19-32: Queens, 33-48: Brooklyn, 49-51: Staten Island).
@@ -62,30 +73,68 @@ NYC_COUNCIL_DISTRICT_MIN = 1
 NYC_COUNCIL_DISTRICT_MAX = 51
 
 # Official Municipal Agencies handling NYC 311 Service Requests
-# Sources: NYC Charter Title 14-25, NYC Open Data 311 Data Dictionary (erm2-nwe9)
+# Sources: NYC Charter Title 14-25, NYC Open Data 311 Data Dictionary (Updated 2025, erm2-nwe9)
 KNOWN_NYC_AGENCIES: Set[str] = {
-    "NYPD",   # Police Department
-    "HPD",    # Department of Housing Preservation and Development
-    "DSNY",   # Department of Sanitation
-    "DOT",    # Department of Transportation
-    "DEP",    # Department of Environmental Protection
-    "DOB",    # Department of Buildings
-    "DPR",    # Department of Parks and Recreation
-    "DOHMH",  # Department of Health and Mental Hygiene
-    "DHS",    # Department of Homeless Services
-    "TLC",    # Taxi and Limousine Commission
+    "311",    # NYC 311 Customer Service Center
+    "3-1-1",  # NYC 311 Customer Service Center Alternative Notation
+    "ACS",    # Administration for Children's Services
+    "AJC",    # Administrative Justice Coordinator
+    "CHALL",  # City Hall
+    "DCA",    # Department of Consumer Affairs (Historical)
     "DCWP",   # Department of Consumer and Worker Protection (formerly DCA)
-    "DCA",    # Historical predecessor to DCWP
-    "FDNY",   # Fire Department of New York
-    "EDC",    # Economic Development Corporation
-    "OTI",    # Office of Technology and Innovation (formerly DOITT)
-    "DOITT",  # Historical predecessor to OTI
-    "DOE",    # Department of Education
+    "DCP",    # Department of City Planning
+    "DEP",    # Department of Environmental Protection
     "DFTA",   # Department for the Aging
+    "DHS",    # Department of Homeless Services
+    "DOB",    # Department of Buildings
+    "DOE",    # Department of Education
+    "DOF",    # Department of Finance
+    "DOHMH",  # Department of Health and Mental Hygiene
+    "DOITT",  # Department of Information Technology & Telecommunications (Historical)
+    "OTI",    # Office of Technology and Innovation (formerly DOITT)
+    "DOP",    # Department of Probation
+    "DOT",    # Department of Transportation
+    "DPR",    # Department of Parks and Recreation
+    "DSNY",   # Department of Sanitation
+    "DYCD",   # Department of Youth and Community Development
+    "EDC",    # Economic Development Corporation
+    "FDNY",   # Fire Department of New York
+    "HPD",    # Department of Housing Preservation and Development
+    "HRA",    # Human Resources Administration
+    "MOIA",   # Mayor's Office of Immigrant Affairs
+    "NYCEM",  # NYC Emergency Management
+    "OEM",    # Office of Emergency Management (Predecessor to NYCEM)
+    "NYCHA",  # New York City Housing Authority
+    "NYPD",   # Police Department
+    "OATH",   # Office of Administrative Trials and Hearings
+    "OPS",    # Mayor's Office of Operations
+    "TLC",    # Taxi and Limousine Commission
     "DCAS",   # Department of Citywide Administrative Services
-    "OEM",    # Office of Emergency Management / NYC Emergency Management
-    "3-1-1",  # NYC 311 Customer Service Center Internal
     "OOS",    # Out of Scope / External Multi-Jurisdiction
+}
+
+# NYC 311 Submission Channels
+# Source: 2025 NYC 311 Data Dictionary & NYC Open Data Socrata API specifications
+VALID_OPEN_DATA_CHANNELS: Set[str] = {
+    "PHONE",
+    "ONLINE",
+    "MOBILE",
+    "OTHER",
+    "UNKNOWN",
+}
+
+# Known 311 Ticket Statuses
+# Source: 2025 NYC 311 Data Dictionary (Assigned, Canceled, Closed, Pending, Started, Open)
+KNOWN_311_STATUSES: Set[str] = {
+    "ASSIGNED",
+    "CANCELED",
+    "CLOSED",
+    "IN PROGRESS",
+    "OPEN",
+    "PENDING",
+    "STARTED",
+    "UNSPECIFIED",
+    "UNKNOWN",
 }
 
 # NYC Metropolitan 3-digit ZIP prefixes
@@ -136,7 +185,7 @@ WEATHER_EXTREME_THRESHOLDS = {
     "temp_extreme_cold": -25.0,  # NYC all-time record low is -26.1°C
     "temp_extreme_heat": 40.0,   # NYC all-time record high is 41.1°C
     "precip_torrential_hr": 25.0,# 25 mm/hr (1 inch/hr flash flood rate)
-    "wind_gust_severe": 22.0,    # 22 m/s (~80 km/h severe storm threshold)
+    "wind_gust_severe": 22.2,    # 22.2 m/s (80 km/h severe storm threshold)
 }
 
 # Standard Reference Table Path

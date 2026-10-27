@@ -21,6 +21,7 @@ import pyarrow.parquet as pq
 from src.silver.config import (
     BOROUGH_CENTROIDS,
     BRONZE_DIR,
+    KNOWN_311_STATUSES,
     KNOWN_NYC_AGENCIES,
     NYC_311_LAUNCH_DATE,
     NYC_COUNCIL_DISTRICT_MAX,
@@ -34,6 +35,8 @@ from src.silver.config import (
     PROJECT_ROOT,
     QUARANTINE_DIR,
     SILVER_DIR,
+    VALID_NYC_BOROUGHS,
+    VALID_OPEN_DATA_CHANNELS,
     ZIP_CENTROIDS_PATH,
 )
 
@@ -151,7 +154,10 @@ def clean_and_validate_311(
 
     # 2. Timestamp Normalization (America/New_York -> UTC) & Temporal Validation
     df_dedup["created_at_utc"] = to_utc_datetime(df_dedup["created_date"])
-    df_dedup["closed_at_utc"] = to_utc_datetime(df_dedup.get("closed_date")) if "closed_date" in df_dedup.columns else pd.NaT
+    if "closed_date" in df_dedup.columns:
+        df_dedup["closed_at_utc"] = to_utc_datetime(df_dedup["closed_date"])
+    else:
+        df_dedup["closed_at_utc"] = pd.Series(pd.NaT, index=df_dedup.index, dtype="datetime64[us, UTC]")
 
     # Open vs. Closed Ticket Semantics
     df_dedup["is_ticket_closed"] = df_dedup["closed_at_utc"].notna()
@@ -192,6 +198,7 @@ def clean_and_validate_311(
     # 3. Missing or non-positive unique_key primary key (supports 7, 8, 9 digit keys > 0)
     # 4. Pre-311 launch date (earlier than March 2003 indicates epoch/default artifact)
     # 5. Future created or closed timestamp (beyond current UTC time + 2h clock drift allowance)
+    # 6. Corrupted ingestion lineage metadata (_batch_id missing or empty)
     # -------------------------------------------------------------------------
     parsed_keys = pd.to_numeric(df_dedup["unique_key"], errors="coerce")
     launch_date_utc = pd.Timestamp(NYC_311_LAUNCH_DATE)
@@ -203,6 +210,11 @@ def clean_and_validate_311(
     cond_pre_epoch = df_dedup["created_at_utc"].notna() & (df_dedup["created_at_utc"] < launch_date_utc)
     cond_future_created = df_dedup["created_at_utc"].notna() & (df_dedup["created_at_utc"] > future_grace_utc)
     cond_future_closed = df_dedup["closed_at_utc"].notna() & (df_dedup["closed_at_utc"] > future_grace_utc)
+    cond_corrupt_lineage = (
+        (df_dedup["_batch_id"].isna() | df_dedup["_batch_id"].astype(str).str.strip().isin(["", "nan", "None", "<NA>"]))
+        if "_batch_id" in df_dedup.columns
+        else pd.Series(False, index=df_dedup.index)
+    )
 
     quarantine_mask = (
         cond_missing_created
@@ -211,6 +223,7 @@ def clean_and_validate_311(
         | cond_pre_epoch
         | cond_future_created
         | cond_future_closed
+        | cond_corrupt_lineage
     )
     df_quarantined = df_dedup[quarantine_mask].copy()
 
@@ -224,6 +237,7 @@ def clean_and_validate_311(
             (cond_future_created.loc[q_idx], "FUTURE_CREATED_DATE"),
             (cond_future_closed.loc[q_idx], "FUTURE_CLOSED_DATE"),
             (cond_negative_duration.loc[q_idx], "NEGATIVE_RESOLUTION_DURATION"),
+            (cond_corrupt_lineage.loc[q_idx], "CORRUPTED_INGESTION_METADATA"),
         ]
         df_quarantined["quarantine_reason"] = [
             "; ".join(label for mask, label in rule_checks if mask.at[idx])
@@ -299,8 +313,20 @@ def clean_and_validate_311(
         df_valid.loc[matched_indices, "spatial_resolution_level"] = "ZIP_APPROXIMATION"
 
     # Level 3: Borough Centroid Fallback
+    # First, validate and normalize NYC Boroughs (5 Legal Boroughs + UNSPECIFIED)
+    if "borough" in df_valid.columns:
+        b_clean = standardize_string_series(df_valid["borough"], "UNSPECIFIED", case="upper")
+        is_unrec_b = ~b_clean.isin(VALID_NYC_BOROUGHS)
+        df_valid["is_valid_borough"] = ~is_unrec_b
+        df_valid["unrecognized_borough_val"] = np.where(is_unrec_b, b_clean, "")
+        df_valid["borough"] = b_clean.where(~is_unrec_b, "UNSPECIFIED")
+    else:
+        df_valid["borough"] = "UNSPECIFIED"
+        df_valid["is_valid_borough"] = True
+        df_valid["unrecognized_borough_val"] = ""
+
     mask_need_level3 = df_valid["spatial_resolution_level"] == "UNLOCATED"
-    borough_series = df_valid.loc[mask_need_level3, "borough"].astype(str).str.strip().str.upper()
+    borough_series = df_valid.loc[mask_need_level3, "borough"]
 
     for borough_name, (b_lat, b_lon, b_grid) in BOROUGH_CENTROIDS.items():
         b_mask = borough_series == borough_name
@@ -327,19 +353,50 @@ def clean_and_validate_311(
     spatial_stats = df_valid["spatial_resolution_level"].value_counts().to_dict()
     logger.info(f"Spatial imputation summary: {spatial_stats}")
 
-    # 5. String Standardizations
-    if "borough" in df_valid.columns:
-        df_valid["borough"] = standardize_string_series(df_valid["borough"], "UNSPECIFIED", case="upper")
+    # 5. Categorical, Syntactic & Institutional Validations
+    # A. Complaint Type and Descriptor Standardization
     if "complaint_type" in df_valid.columns:
         df_valid["complaint_type"] = standardize_string_series(df_valid["complaint_type"], "Unknown", case="title")
     if "descriptor" in df_valid.columns:
         df_valid["descriptor"] = standardize_string_series(df_valid["descriptor"], "Not Stated", case="preserve")
-    if "status" in df_valid.columns:
-        df_valid["status"] = standardize_string_series(df_valid["status"], "UNKNOWN", case="upper")
-    if "agency" in df_valid.columns:
-        df_valid["agency"] = standardize_string_series(df_valid["agency"], "UNKNOWN", case="upper")
 
-    # 5. Type Enforcement & Consistency Validations
+    # C. Status Standardization & Validation
+    if "status" in df_valid.columns:
+        st_clean = standardize_string_series(df_valid["status"], "UNKNOWN", case="upper")
+        is_unrec_st = ~st_clean.isin(KNOWN_311_STATUSES)
+        df_valid["unrecognized_status_val"] = np.where(is_unrec_st, st_clean, "")
+        df_valid["status"] = st_clean
+    else:
+        df_valid["status"] = "UNKNOWN"
+        df_valid["unrecognized_status_val"] = ""
+
+    # D. Agency Acronym Syntactic Validation
+    # Enforces syntax: cannot be purely numeric (except "311"/"3-1-1"), length 2-10, valid characters
+    if "agency" in df_valid.columns:
+        ag_clean = standardize_string_series(df_valid["agency"], "UNKNOWN", case="upper")
+        cond_numeric = ag_clean.str.match(r"^\d+$") & ~ag_clean.isin(["311", "3-1-1"])
+        cond_bad_len = (ag_clean != "UNKNOWN") & ((ag_clean.str.len() < 2) | (ag_clean.str.len() > 10))
+        cond_bad_chars = (ag_clean != "UNKNOWN") & ~ag_clean.str.match(r"^[A-Z0-9\-]+$")
+        is_malformed_ag = cond_numeric | cond_bad_len | cond_bad_chars
+        df_valid["is_malformed_agency"] = is_malformed_ag
+        df_valid["malformed_agency_val"] = np.where(is_malformed_ag, ag_clean, "")
+        df_valid["agency"] = ag_clean.where(~is_malformed_ag, "UNKNOWN")
+    else:
+        df_valid["agency"] = "UNKNOWN"
+        df_valid["is_malformed_agency"] = False
+        df_valid["malformed_agency_val"] = ""
+
+    # E. Open Data Channel Type Validation
+    if "open_data_channel_type" in df_valid.columns:
+        ch_clean = standardize_string_series(df_valid["open_data_channel_type"], "UNKNOWN", case="upper")
+        is_unrec_ch = ~ch_clean.isin(VALID_OPEN_DATA_CHANNELS)
+        df_valid["unrecognized_channel_val"] = np.where(is_unrec_ch, ch_clean, "")
+        df_valid["open_data_channel_type"] = ch_clean.where(~is_unrec_ch, "UNKNOWN")
+    else:
+        df_valid["open_data_channel_type"] = "UNKNOWN"
+        df_valid["unrecognized_channel_val"] = ""
+
+    # 6. Type Enforcement & Consistency Validations
     df_valid["latitude"] = raw_lats
     df_valid["longitude"] = raw_lons
 
@@ -378,7 +435,7 @@ def clean_and_validate_311(
     if "resolution_action_updated_date" in df_valid.columns:
         df_valid["resolution_action_updated_date_utc"] = to_utc_datetime(df_valid["resolution_action_updated_date"])
 
-    # 6. Quality Tagging & Observability Audit Notes
+    # 7. Quality Tagging & Observability Audit Notes
     # Instant Closures (Closed at creation: 0.0 duration)
     df_valid["is_instant_closure"] = df_valid["is_ticket_closed"] & (df_valid["resolution_duration_hours"] == 0.0)
 
@@ -399,11 +456,8 @@ def clean_and_validate_311(
     # Extreme Outlier Durations (> 2 years / 17,520 hours)
     df_valid["is_extreme_duration"] = df_valid["is_ticket_closed"] & (df_valid["resolution_duration_hours"] > 17520.0)
 
-    # Agency Registry Check
-    if "agency" in df_valid.columns:
-        df_valid["is_known_agency"] = df_valid["agency"].isin(KNOWN_NYC_AGENCIES)
-    else:
-        df_valid["is_known_agency"] = True
+    # Agency Registry Soft Check (Identifies primary municipal agencies vs external / newly added entities)
+    df_valid["is_known_agency"] = df_valid["agency"].isin(KNOWN_NYC_AGENCIES)
 
     # Vectorized Observability Audit String Construction (avoids slow row-by-row .iterrows())
     df_valid["quality_audit_notes"] = None
@@ -412,7 +466,11 @@ def clean_and_validate_311(
         | df_valid["is_status_conflict"]
         | df_valid["is_extreme_duration"]
         | df_valid["is_out_of_state_zip"]
-        | (~df_valid["is_known_agency"])
+        | (~df_valid["is_valid_borough"])
+        | df_valid["is_malformed_agency"]
+        | ((~df_valid["is_known_agency"]) & (df_valid["agency"] != "UNKNOWN"))
+        | (df_valid["unrecognized_channel_val"] != "")
+        | (df_valid["unrecognized_status_val"] != "")
     )
     if any_audit_flag.any():
         sub = df_valid.loc[any_audit_flag]
@@ -434,12 +492,35 @@ def clean_and_validate_311(
         )
         note_parts["n3"] = np.where(sub["is_extreme_duration"], "EXTREME_DURATION(" + dur_vals + "h)", "")
         note_parts["n4"] = np.where(sub["is_out_of_state_zip"], "OUT_OF_STATE_ZIP(" + zip_vals + ")", "")
-        note_parts["n5"] = np.where(~sub["is_known_agency"], "UNRECOGNIZED_AGENCY(" + agency_vals + ")", "")
+        note_parts["n5"] = np.where(~sub["is_valid_borough"], "UNRECOGNIZED_BOROUGH(" + sub["unrecognized_borough_val"] + ")", "")
+        note_parts["n6"] = np.where(
+            sub["is_malformed_agency"],
+            "MALFORMED_AGENCY(" + sub["malformed_agency_val"] + ")",
+            np.where(
+                (~sub["is_known_agency"]) & (sub["agency"] != "UNKNOWN"),
+                "UNREGISTERED_AGENCY(" + agency_vals + ")",
+                "",
+            ),
+        )
+        note_parts["n7"] = np.where(sub["unrecognized_channel_val"] != "", "UNRECOGNIZED_CHANNEL(" + sub["unrecognized_channel_val"] + ")", "")
+        note_parts["n8"] = np.where(sub["unrecognized_status_val"] != "", "UNRECOGNIZED_STATUS(" + sub["unrecognized_status_val"] + ")", "")
 
         df_valid.loc[any_audit_flag, "quality_audit_notes"] = [
             "; ".join(val for val in row if val)
             for row in note_parts.to_numpy()
         ]
+
+    # Clean up temporary string helpers from output schema
+    df_valid.drop(
+        columns=[
+            "unrecognized_borough_val",
+            "is_malformed_agency",
+            "malformed_agency_val",
+            "unrecognized_channel_val",
+            "unrecognized_status_val",
+        ],
+        inplace=True,
+    )
 
     # Silver Audit Metadata
     df_valid["_silver_processed_at_utc"] = processed_at_utc

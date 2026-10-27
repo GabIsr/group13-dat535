@@ -75,8 +75,13 @@ def clean_and_validate_weather(
         else pd.Series(True, index=df_raw.index)
     )
     cond_invalid_ts = (~cond_missing_time) & parsed_ts.isna()
+    cond_corrupt_lineage = (
+        (df_raw["_batch_id"].isna() | df_raw["_batch_id"].astype(str).str.strip().isin(["", "nan", "None", "<NA>"]))
+        if "_batch_id" in df_raw.columns
+        else pd.Series(False, index=df_raw.index)
+    )
 
-    quarantine_mask = cond_missing_grid | cond_missing_time | cond_invalid_ts
+    quarantine_mask = cond_missing_grid | cond_missing_time | cond_invalid_ts | cond_corrupt_lineage
     dropped_unkeyed_rows = int((cond_missing_grid | cond_missing_time).sum())
     dropped_invalid_ts = int(cond_invalid_ts.sum())
     quarantined_weather_rows = int(quarantine_mask.sum())
@@ -88,6 +93,7 @@ def clean_and_validate_weather(
             (cond_missing_grid.loc[q_idx], "MISSING_GRID_ID"),
             (cond_missing_time.loc[q_idx], "MISSING_TIME_KEY"),
             (cond_invalid_ts.loc[q_idx], "INVALID_TIMESTAMP_FORMAT"),
+            (cond_corrupt_lineage.loc[q_idx], "CORRUPTED_INGESTION_METADATA"),
         ]
         df_quarantined["quarantine_reason"] = [
             "; ".join(label for mask, label in w_rules if mask.at[idx])

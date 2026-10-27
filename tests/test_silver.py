@@ -758,6 +758,150 @@ class TestSilverLayerPipeline(unittest.TestCase):
         # Point 3: coordinate with NaN -> distance is NaN
         self.assertTrue(pd.isna(dist.iloc[2]))
 
+    def test_borough_validation(self):
+        """Verify strict 5-borough normalization and soft quarantine/tagging of unstandardized boroughs."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            bronze_in = tmp_path / "bronze"
+            silver_out = tmp_path / "silver"
+            quarantine_out = tmp_path / "quarantine"
+            bronze_in.mkdir()
+
+            raw_data = pd.DataFrame({
+                "unique_key": [1001, 1002, 1003, 1004],
+                "created_date": ["2023-05-01 12:00:00"] * 4,
+                "borough": ["MANHATTAN", "manhattan", "Unspecified", "ATLANTIS"],
+                "latitude": [40.75, 40.75, 40.75, 40.75],
+                "longitude": [-73.98, -73.98, -73.98, -73.98],
+                "_batch_id": ["batch_1"] * 4,
+            })
+            raw_data.to_parquet(bronze_in / "test.parquet")
+
+            clean_and_validate_311(bronze_311_dir=bronze_in, silver_311_dir=silver_out, quarantine_dir=quarantine_out)
+            clean_files = list(silver_out.glob("**/*.parquet"))
+            self.assertTrue(len(clean_files) > 0)
+            df_res = pd.concat([pd.read_parquet(f) for f in clean_files])
+
+            self.assertEqual(df_res.loc[df_res["unique_key"] == 1001, "borough"].iloc[0], "MANHATTAN")
+            self.assertEqual(df_res.loc[df_res["unique_key"] == 1002, "borough"].iloc[0], "MANHATTAN")
+            self.assertEqual(df_res.loc[df_res["unique_key"] == 1003, "borough"].iloc[0], "UNSPECIFIED")
+            self.assertTrue(df_res.loc[df_res["unique_key"] == 1001, "is_valid_borough"].iloc[0])
+            self.assertTrue(df_res.loc[df_res["unique_key"] == 1003, "is_valid_borough"].iloc[0])
+
+            # Atlantis should be standardized to UNSPECIFIED and flagged is_valid_borough = False
+            row4 = df_res.loc[df_res["unique_key"] == 1004].iloc[0]
+            self.assertEqual(row4["borough"], "UNSPECIFIED")
+            self.assertFalse(row4["is_valid_borough"])
+            self.assertIn("UNRECOGNIZED_BOROUGH(ATLANTIS)", row4["quality_audit_notes"])
+
+    def test_agency_syntactic_and_registry_validation(self):
+        """Verify syntactic sanitization and zero-loss registry soft tagging of agency acronyms."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            bronze_in = tmp_path / "bronze"
+            silver_out = tmp_path / "silver"
+            quarantine_out = tmp_path / "quarantine"
+            bronze_in.mkdir()
+
+            raw_data = pd.DataFrame({
+                "unique_key": [2001, 2002, 2003, 2004],
+                "created_date": ["2023-05-01 12:00:00"] * 4,
+                "agency": ["NYPD", "311", "99999", "NEWAGY"],
+                "latitude": [40.75, 40.75, 40.75, 40.75],
+                "longitude": [-73.98, -73.98, -73.98, -73.98],
+                "_batch_id": ["batch_1"] * 4,
+            })
+            raw_data.to_parquet(bronze_in / "test.parquet")
+
+            clean_and_validate_311(bronze_311_dir=bronze_in, silver_311_dir=silver_out, quarantine_dir=quarantine_out)
+            clean_files = list(silver_out.glob("**/*.parquet"))
+            self.assertTrue(len(clean_files) > 0)
+            df_res = pd.concat([pd.read_parquet(f) for f in clean_files])
+
+            # NYPD: known, valid
+            row1 = df_res.loc[df_res["unique_key"] == 2001].iloc[0]
+            self.assertEqual(row1["agency"], "NYPD")
+            self.assertTrue(row1["is_known_agency"])
+
+            # 311: valid numeric exception, known
+            row2 = df_res.loc[df_res["unique_key"] == 2002].iloc[0]
+            self.assertEqual(row2["agency"], "311")
+            self.assertTrue(row2["is_known_agency"])
+
+            # 99999: pure numeric malformed agency -> sanitized to UNKNOWN
+            row3 = df_res.loc[df_res["unique_key"] == 2003].iloc[0]
+            self.assertEqual(row3["agency"], "UNKNOWN")
+            self.assertIn("MALFORMED_AGENCY(99999)", row3["quality_audit_notes"])
+
+            # NEWAGY: syntactically valid but unknown in registry -> kept as NEWAGY, is_known_agency = False
+            row4 = df_res.loc[df_res["unique_key"] == 2004].iloc[0]
+            self.assertEqual(row4["agency"], "NEWAGY")
+            self.assertFalse(row4["is_known_agency"])
+            self.assertIn("UNREGISTERED_AGENCY(NEWAGY)", row4["quality_audit_notes"])
+
+    def test_channel_type_and_status_validation(self):
+        """Verify open_data_channel_type domain constraint and status normalization."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            bronze_in = tmp_path / "bronze"
+            silver_out = tmp_path / "silver"
+            quarantine_out = tmp_path / "quarantine"
+            bronze_in.mkdir()
+
+            raw_data = pd.DataFrame({
+                "unique_key": [3001, 3002],
+                "created_date": ["2023-05-01 12:00:00"] * 2,
+                "open_data_channel_type": ["PHONE", "TELEPATHY"],
+                "status": ["CLOSED", "FLYING"],
+                "closed_date": ["2023-05-01 14:00:00", None],
+                "latitude": [40.75, 40.75],
+                "longitude": [-73.98, -73.98],
+                "_batch_id": ["batch_1"] * 2,
+            })
+            raw_data.to_parquet(bronze_in / "test.parquet")
+
+            clean_and_validate_311(bronze_311_dir=bronze_in, silver_311_dir=silver_out, quarantine_dir=quarantine_out)
+            clean_files = list(silver_out.glob("**/*.parquet"))
+            self.assertTrue(len(clean_files) > 0)
+            df_res = pd.concat([pd.read_parquet(f) for f in clean_files])
+
+            row1 = df_res.loc[df_res["unique_key"] == 3001].iloc[0]
+            self.assertEqual(row1["open_data_channel_type"], "PHONE")
+            self.assertEqual(row1["status"], "CLOSED")
+
+            row2 = df_res.loc[df_res["unique_key"] == 3002].iloc[0]
+            self.assertEqual(row2["open_data_channel_type"], "UNKNOWN")
+            self.assertEqual(row2["status"], "FLYING")
+            self.assertIn("UNRECOGNIZED_CHANNEL(TELEPATHY)", row2["quality_audit_notes"])
+            self.assertIn("UNRECOGNIZED_STATUS(FLYING)", row2["quality_audit_notes"])
+
+    def test_metadata_lineage_quarantine(self):
+        """Verify that Bronze records with corrupted lineage metadata (_batch_id missing/empty) are quarantined."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            bronze_in = tmp_path / "bronze"
+            silver_out = tmp_path / "silver"
+            quarantine_out = tmp_path / "quarantine"
+            bronze_in.mkdir()
+
+            raw_data = pd.DataFrame({
+                "unique_key": [4001, 4002],
+                "created_date": ["2023-05-01 12:00:00"] * 2,
+                "latitude": [40.75, 40.75],
+                "longitude": [-73.98, -73.98],
+                "_batch_id": ["valid_batch", ""],
+            })
+            raw_data.to_parquet(bronze_in / "test.parquet")
+
+            res = clean_and_validate_311(bronze_311_dir=bronze_in, silver_311_dir=silver_out, quarantine_dir=quarantine_out)
+            self.assertEqual(res["quarantined_rows"], 1)
+            self.assertEqual(res["valid_rows_accepted"], 1)
+
+            df_q = pd.read_parquet(quarantine_out / "quarantined_311.parquet")
+            self.assertEqual(len(df_q), 1)
+            self.assertEqual(df_q.iloc[0]["unique_key"], 4002)
+            self.assertIn("CORRUPTED_INGESTION_METADATA", df_q.iloc[0]["quarantine_reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

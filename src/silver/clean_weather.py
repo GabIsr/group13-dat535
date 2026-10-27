@@ -20,6 +20,7 @@ import pyarrow.parquet as pq
 from src.silver.config import (
     BRONZE_DIR,
     PROJECT_ROOT,
+    QUARANTINE_DIR,
     SENSOR_ANOMALY_LEDGER_PATH,
     SILVER_DIR,
     VALID_WMO_WEATHER_CODES,
@@ -35,11 +36,12 @@ def clean_and_validate_weather(
     bronze_weather_dir: Path = BRONZE_DIR / "weather",
     silver_weather_dir: Path = SILVER_DIR / "weather",
     anomaly_ledger_path: Path = SENSOR_ANOMALY_LEDGER_PATH,
+    quarantine_dir: Path = QUARANTINE_DIR / "weather",
 ) -> Dict[str, Any]:
     """
     Load Bronze weather records, apply physical bounds checking and atmospheric consistency laws,
     mask corrupted sensors to NaN (avoiding row loss), record detailed forensic anomaly logs,
-    and save partitioned Silver Parquet tables alongside the Sensor Anomaly Ledger.
+    quarantine unkeyed/unparseable rows, and save partitioned Silver Parquet tables.
     """
     start_time = time.time()
     processed_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -54,15 +56,51 @@ def clean_and_validate_weather(
     input_rows = len(df_raw)
     logger.info(f"Loaded {input_rows:,} raw weather observations from Bronze.")
 
-    # 1. Row-level Primary Key Check & Temporal Standardization
-    valid_keys_mask = df_raw["time"].notna() & df_raw["grid_id"].notna()
-    dropped_unkeyed_rows = int((~valid_keys_mask).sum())
-    df_clean = df_raw[valid_keys_mask].copy()
+    # 1. Row-level Primary Key Check, Temporal Standardization & Unkeyed Quarantine
+    parsed_ts = (
+        pd.to_datetime(df_raw["time"], utc=True, errors="coerce")
+        if "time" in df_raw.columns
+        else pd.Series(pd.NaT, index=df_raw.index)
+    )
+    cond_missing_grid = (
+        df_raw["grid_id"].isna()
+        | df_raw["grid_id"].astype(str).str.strip().isin(["", "nan", "None", "NONE", "NAN", "null", "NULL"])
+        if "grid_id" in df_raw.columns
+        else pd.Series(True, index=df_raw.index)
+    )
+    cond_missing_time = (
+        df_raw["time"].isna()
+        | df_raw["time"].astype(str).str.strip().isin(["", "nan", "None", "NONE", "NAN", "null", "NULL"])
+        if "time" in df_raw.columns
+        else pd.Series(True, index=df_raw.index)
+    )
+    cond_invalid_ts = (~cond_missing_time) & parsed_ts.isna()
 
-    df_clean["timestamp_utc"] = pd.to_datetime(df_clean["time"], utc=True, errors="coerce")
-    valid_ts_mask = df_clean["timestamp_utc"].notna()
-    dropped_invalid_ts = int((~valid_ts_mask).sum())
-    df_clean = df_clean[valid_ts_mask].copy()
+    quarantine_mask = cond_missing_grid | cond_missing_time | cond_invalid_ts
+    dropped_unkeyed_rows = int((cond_missing_grid | cond_missing_time).sum())
+    dropped_invalid_ts = int(cond_invalid_ts.sum())
+    quarantined_weather_rows = int(quarantine_mask.sum())
+
+    if quarantined_weather_rows > 0:
+        df_quarantined = df_raw[quarantine_mask].copy()
+        q_idx = df_quarantined.index
+        w_rules = [
+            (cond_missing_grid.loc[q_idx], "MISSING_GRID_ID"),
+            (cond_missing_time.loc[q_idx], "MISSING_TIME_KEY"),
+            (cond_invalid_ts.loc[q_idx], "INVALID_TIMESTAMP_FORMAT"),
+        ]
+        df_quarantined["quarantine_reason"] = [
+            "; ".join(label for mask, label in w_rules if mask.at[idx])
+            for idx in q_idx
+        ]
+        df_quarantined["_quarantined_at_utc"] = processed_at_utc
+        quarantine_dir.mkdir(parents=True, exist_ok=True)
+        q_path = quarantine_dir / "quarantined_weather.parquet"
+        pq.write_table(pa.Table.from_pandas(df_quarantined, preserve_index=False), q_path, compression="snappy")
+        logger.warning(f"Quarantined {quarantined_weather_rows:,} unkeyed/unparseable weather rows to {q_path}")
+
+    df_clean = df_raw[~quarantine_mask].copy()
+    df_clean["timestamp_utc"] = parsed_ts[~quarantine_mask]
 
     # Deduplicate: if multiple batches contain the same (grid_id, timestamp_utc), keep latest ingestion
     before_dedup_count = len(df_clean)
@@ -371,7 +409,8 @@ def clean_and_validate_weather(
         "dataset": "silver_weather",
         "input_rows": input_rows,
         "valid_rows": len(df_clean),
-        "dropped_unkeyed_rows": dropped_unkeyed_rows + dropped_invalid_ts,
+        "dropped_unkeyed_rows": quarantined_weather_rows,
+        "quarantined_rows": quarantined_weather_rows,
         "duplicate_rows_dropped": duplicate_rows_dropped,
         "corrupted_fields_masked": corrupted_fields_rows,
         "sensor_anomalies_logged": len(anomaly_records),

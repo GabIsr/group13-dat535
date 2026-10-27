@@ -609,5 +609,132 @@ class TestSilverLayerPipeline(unittest.TestCase):
             self.assertIn('INSTANT_CLOSURE_0SEC', str(row_instant['quality_audit_notes']))
 
 
+
+    def test_future_closed_date_and_multi_reason_quarantine_and_reverse_status_conflict(self):
+        """Verify future closed_date quarantine, multi-reason quarantine string, and reverse status conflict tagging."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            bronze_in = tmp_path / "bronze_311"
+            silver_out = tmp_path / "silver_311"
+            quarantine_out = tmp_path / "quarantine"
+            bronze_in.mkdir()
+
+            mock_311 = [
+                # Row 1: Valid ticket with reverse status conflict (status == CLOSED, but closed_date is None)
+                {
+                    "unique_key": "50001",
+                    "created_date": "2026-10-18T10:00:00.000",
+                    "closed_date": None,
+                    "agency": "NYPD",
+                    "complaint_type": "Noise",
+                    "borough": "MANHATTAN",
+                    "incident_zip": "10001",
+                    "status": "CLOSED",
+                },
+                # Row 2: Future closed_date (year 2099) -> should quarantine as FUTURE_CLOSED_DATE
+                {
+                    "unique_key": "50002",
+                    "created_date": "2026-10-18T10:00:00.000",
+                    "closed_date": "2099-01-01T10:00:00.000",
+                    "agency": "DOT",
+                    "complaint_type": "Pothole",
+                    "borough": "QUEENS",
+                    "incident_zip": "11101",
+                    "status": "CLOSED",
+                },
+                # Row 3: Multiple quarantine violations (invalid key <= 0 AND pre-2003 epoch date)
+                {
+                    "unique_key": "-5",
+                    "created_date": "1995-01-01T00:00:00.000",
+                    "closed_date": None,
+                    "agency": "DSNY",
+                    "complaint_type": "Sanitation",
+                    "borough": "BROOKLYN",
+                    "incident_zip": "11201",
+                    "status": "OPEN",
+                },
+            ]
+            pd.DataFrame(mock_311).to_parquet(bronze_in / "part_0000.parquet", index=False)
+
+            res = clean_and_validate_311(bronze_in, silver_out, quarantine_out)
+            self.assertEqual(res["valid_rows_accepted"], 1)
+            self.assertEqual(res["quarantined_rows"], 2)
+            self.assertEqual(res["status_conflict_count"], 1)
+
+            # Verify reverse status conflict in Silver
+            clean_files = list(silver_out.glob("**/*.parquet"))
+            df_clean = pd.concat([pd.read_parquet(f) for f in clean_files])
+            row_valid = df_clean.iloc[0]
+            self.assertTrue(row_valid["is_status_conflict"])
+            self.assertIn("STATUS_CONFLICT(status=CLOSED_without_closed_date)", str(row_valid["quality_audit_notes"]))
+
+            # Verify quarantine reasons (including multi-reason string)
+            df_q = pd.read_parquet(quarantine_out / "quarantined_311.parquet")
+            q_reasons = df_q["quarantine_reason"].tolist()
+            self.assertIn("FUTURE_CLOSED_DATE", q_reasons)
+            self.assertIn("INVALID_OR_NON_NUMERIC_UNIQUE_KEY; PRE_311_EPOCH_DATE", q_reasons)
+
+    def test_unkeyed_weather_quarantine(self):
+        """Verify that weather rows with missing grid_id/time or invalid timestamp are routed to weather quarantine."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            bronze_in = tmp_path / "bronze_weather"
+            silver_out = tmp_path / "silver_weather"
+            ledger_file = tmp_path / "quality" / "sensor_anomaly_ledger.parquet"
+            quarantine_out = tmp_path / "quarantine_weather"
+            bronze_in.mkdir()
+
+            mock_weather = [
+                # Valid row
+                {
+                    "grid_id": "GRID_40.7_-74.0",
+                    "time": "2026-10-18T10:00",
+                    "temperature_2m": 15.0,
+                    "precipitation": 0.0,
+                    "wind_speed_10m": 4.0,
+                    "wind_gusts_10m": 7.0,
+                    "surface_pressure": 1013.0,
+                },
+                # Missing grid_id
+                {
+                    "grid_id": None,
+                    "time": "2026-10-18T11:00",
+                    "temperature_2m": 16.0,
+                    "precipitation": 0.0,
+                    "wind_speed_10m": 4.0,
+                    "wind_gusts_10m": 7.0,
+                    "surface_pressure": 1013.0,
+                },
+                # Unparseable timestamp
+                {
+                    "grid_id": "GRID_40.7_-74.0",
+                    "time": "NOT_A_TIMESTAMP",
+                    "temperature_2m": 17.0,
+                    "precipitation": 0.0,
+                    "wind_speed_10m": 4.0,
+                    "wind_gusts_10m": 7.0,
+                    "surface_pressure": 1013.0,
+                },
+            ]
+            pd.DataFrame(mock_weather).to_parquet(bronze_in / "part_0000.parquet", index=False)
+
+            res = clean_and_validate_weather(
+                bronze_weather_dir=bronze_in,
+                silver_weather_dir=silver_out,
+                anomaly_ledger_path=ledger_file,
+                quarantine_dir=quarantine_out,
+            )
+
+            self.assertEqual(res["valid_rows"], 1)
+            self.assertEqual(res["quarantined_rows"], 2)
+
+            q_file = quarantine_out / "quarantined_weather.parquet"
+            self.assertTrue(q_file.exists())
+            df_q = pd.read_parquet(q_file)
+            self.assertEqual(len(df_q), 2)
+            self.assertIn("MISSING_GRID_ID", df_q["quarantine_reason"].tolist())
+            self.assertIn("INVALID_TIMESTAMP_FORMAT", df_q["quarantine_reason"].tolist())
+
+
 if __name__ == "__main__":
     unittest.main()

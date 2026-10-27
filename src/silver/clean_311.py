@@ -159,7 +159,7 @@ def clean_and_validate_311(
     # 2. Negative duration for closed tickets (closed before created)
     # 3. Missing or non-positive unique_key primary key (supports 7, 8, 9 digit keys > 0)
     # 4. Pre-311 launch date (earlier than March 2003 indicates epoch/default artifact)
-    # 5. Future created timestamp (time travel beyond current UTC time + 2h clock drift allowance)
+    # 5. Future created or closed timestamp (beyond current UTC time + 2h clock drift allowance)
     # -------------------------------------------------------------------------
     parsed_keys = pd.to_numeric(df_dedup["unique_key"], errors="coerce")
     launch_date_utc = pd.Timestamp(NYC_311_LAUNCH_DATE)
@@ -170,30 +170,33 @@ def clean_and_validate_311(
     cond_invalid_key = parsed_keys.isna() | (parsed_keys <= 0)
     cond_pre_epoch = df_dedup["created_at_utc"].notna() & (df_dedup["created_at_utc"] < launch_date_utc)
     cond_future_created = df_dedup["created_at_utc"].notna() & (df_dedup["created_at_utc"] > future_grace_utc)
+    cond_future_closed = df_dedup["closed_at_utc"].notna() & (df_dedup["closed_at_utc"] > future_grace_utc)
 
-    quarantine_mask = cond_missing_created | cond_negative_duration | cond_invalid_key | cond_pre_epoch | cond_future_created
+    quarantine_mask = (
+        cond_missing_created
+        | cond_negative_duration
+        | cond_invalid_key
+        | cond_pre_epoch
+        | cond_future_created
+        | cond_future_closed
+    )
     df_quarantined = df_dedup[quarantine_mask].copy()
 
     if len(df_quarantined) > 0:
-        # Determine specific quarantine reason in order of precedence
-        reasons = np.where(
-            df_quarantined["created_at_utc"].isna(),
-            "MISSING_CREATED_TIMESTAMP",
-            np.where(
-                pd.to_numeric(df_quarantined["unique_key"], errors="coerce").isna() | (pd.to_numeric(df_quarantined["unique_key"], errors="coerce") <= 0),
-                "INVALID_OR_NON_NUMERIC_UNIQUE_KEY",
-                np.where(
-                    df_quarantined["created_at_utc"] < launch_date_utc,
-                    "PRE_311_EPOCH_DATE",
-                    np.where(
-                        df_quarantined["created_at_utc"] > future_grace_utc,
-                        "FUTURE_CREATED_DATE",
-                        "NEGATIVE_RESOLUTION_DURATION",
-                    ),
-                ),
-            ),
-        )
-        df_quarantined["quarantine_reason"] = reasons
+        # Build multi-reason quarantine string recording all violated boundary rules per row
+        q_idx = df_quarantined.index
+        rule_checks = [
+            (cond_missing_created.loc[q_idx], "MISSING_CREATED_TIMESTAMP"),
+            (cond_invalid_key.loc[q_idx], "INVALID_OR_NON_NUMERIC_UNIQUE_KEY"),
+            (cond_pre_epoch.loc[q_idx], "PRE_311_EPOCH_DATE"),
+            (cond_future_created.loc[q_idx], "FUTURE_CREATED_DATE"),
+            (cond_future_closed.loc[q_idx], "FUTURE_CLOSED_DATE"),
+            (cond_negative_duration.loc[q_idx], "NEGATIVE_RESOLUTION_DURATION"),
+        ]
+        df_quarantined["quarantine_reason"] = [
+            "; ".join(label for mask, label in rule_checks if mask.at[idx])
+            for idx in q_idx
+        ]
         quarantine_dir.mkdir(parents=True, exist_ok=True)
         q_path = quarantine_dir / "quarantined_311.parquet"
         pq.write_table(pa.Table.from_pandas(df_quarantined, preserve_index=False), q_path, compression="snappy")
@@ -334,11 +337,18 @@ def clean_and_validate_311(
     # Instant Closures (Closed at creation: 0.0 duration)
     df_valid["is_instant_closure"] = df_valid["is_ticket_closed"] & (df_valid["resolution_duration_hours"] == 0.0)
 
-    # Status vs. Closed Date Contradiction (Agency says OPEN/IN PROGRESS, but closed_date is filled)
+    # Status vs. Closed Date Contradiction:
+    # (a) Agency status is OPEN/IN PROGRESS/PENDING/etc., but closed_date is populated
+    # (b) Agency status is CLOSED, but closed_date is missing (NaT)
     open_statuses = {"OPEN", "IN PROGRESS", "PENDING", "ASSIGNED", "STARTED"}
+    closed_statuses = {"CLOSED"}
     if "status" in df_valid.columns:
-        df_valid["is_status_conflict"] = df_valid["is_ticket_closed"] & df_valid["status"].isin(open_statuses)
+        cond_open_with_closed_date = df_valid["is_ticket_closed"] & df_valid["status"].isin(open_statuses)
+        cond_closed_without_closed_date = (~df_valid["is_ticket_closed"]) & df_valid["status"].isin(closed_statuses)
+        df_valid["is_status_conflict"] = cond_open_with_closed_date | cond_closed_without_closed_date
     else:
+        cond_open_with_closed_date = pd.Series(False, index=df_valid.index)
+        cond_closed_without_closed_date = pd.Series(False, index=df_valid.index)
         df_valid["is_status_conflict"] = False
 
     # Extreme Outlier Durations (> 2 years / 17,520 hours)
@@ -350,24 +360,41 @@ def clean_and_validate_311(
     else:
         df_valid["is_known_agency"] = True
 
-    # Build Observability Audit String per Row
-    def build_row_audit_notes(row):
-        notes = []
-        if row.get("is_instant_closure"):
-            notes.append("INSTANT_CLOSURE_0SEC")
-        if row.get("is_status_conflict"):
-            st = row.get("status", "UNKNOWN")
-            notes.append(f"STATUS_CONFLICT(status={st}_with_closed_date)")
-        if row.get("is_extreme_duration"):
-            notes.append(f"EXTREME_DURATION({row['resolution_duration_hours']}h)")
-        if row.get("is_out_of_state_zip"):
-            notes.append(f"OUT_OF_STATE_ZIP({row.get('clean_incident_zip')})")
-        if not row.get("is_known_agency", True):
-            ag = row.get("agency", "UNKNOWN")
-            notes.append(f"UNRECOGNIZED_AGENCY({ag})")
-        return "; ".join(notes) if notes else None
+    # Vectorized Observability Audit String Construction (avoids slow row-by-row .iterrows())
+    df_valid["quality_audit_notes"] = None
+    any_audit_flag = (
+        df_valid["is_instant_closure"]
+        | df_valid["is_status_conflict"]
+        | df_valid["is_extreme_duration"]
+        | df_valid["is_out_of_state_zip"]
+        | (~df_valid["is_known_agency"])
+    )
+    if any_audit_flag.any():
+        sub = df_valid.loc[any_audit_flag]
+        status_vals = sub["status"].astype(str) if "status" in sub.columns else pd.Series("UNKNOWN", index=sub.index)
+        zip_vals = sub["clean_incident_zip"].astype(str) if "clean_incident_zip" in sub.columns else pd.Series("", index=sub.index)
+        agency_vals = sub["agency"].astype(str) if "agency" in sub.columns else pd.Series("UNKNOWN", index=sub.index)
+        dur_vals = sub["resolution_duration_hours"].astype(str)
 
-    df_valid["quality_audit_notes"] = [build_row_audit_notes(r) for _, r in df_valid.iterrows()]
+        note_parts = pd.DataFrame(index=sub.index)
+        note_parts["n1"] = np.where(sub["is_instant_closure"], "INSTANT_CLOSURE_0SEC", "")
+        note_parts["n2"] = np.where(
+            cond_open_with_closed_date.loc[sub.index],
+            "STATUS_CONFLICT(status=" + status_vals + "_with_closed_date)",
+            np.where(
+                cond_closed_without_closed_date.loc[sub.index],
+                "STATUS_CONFLICT(status=" + status_vals + "_without_closed_date)",
+                "",
+            ),
+        )
+        note_parts["n3"] = np.where(sub["is_extreme_duration"], "EXTREME_DURATION(" + dur_vals + "h)", "")
+        note_parts["n4"] = np.where(sub["is_out_of_state_zip"], "OUT_OF_STATE_ZIP(" + zip_vals + ")", "")
+        note_parts["n5"] = np.where(~sub["is_known_agency"], "UNRECOGNIZED_AGENCY(" + agency_vals + ")", "")
+
+        df_valid.loc[any_audit_flag, "quality_audit_notes"] = [
+            "; ".join(val for val in row if val)
+            for row in note_parts.to_numpy()
+        ]
 
     # Silver Audit Metadata
     df_valid["_silver_processed_at_utc"] = processed_at_utc

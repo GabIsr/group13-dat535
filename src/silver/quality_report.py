@@ -83,6 +83,10 @@ def generate_quality_reconciliation_report(
     for level, count in spatial.items():
         pct = (count / b_311_valid * 100.0) if b_311_valid > 0 else 0.0
         print(f"    - {level:<26}: {count:,} ({pct:.2f}%)")
+    avg_dist = clean_311_metrics.get("avg_grid_distance_km")
+    p95_dist = clean_311_metrics.get("p95_grid_distance_km")
+    if avg_dist is not None:
+        print(f"    - Grid Center Uncertainty Distance: Mean = {avg_dist:.2f} km | P95 = {p95_dist:.2f} km")
 
     # Weather Reconciliation
     print("\n" + "-" * 90)

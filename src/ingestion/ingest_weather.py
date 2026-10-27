@@ -211,6 +211,7 @@ def run_weather_ingestion(
         df_grid["_extraction_mode"] = mode
         df_grid["_schema_version"] = SCHEMA_VERSION
         df_grid["_raw_row_hash"] = row_hashes
+        df_grid["_bronze_status"] = "valid"
 
         # Track schema fingerprint
         for col in df_grid.columns:

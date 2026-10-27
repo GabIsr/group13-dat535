@@ -20,7 +20,7 @@ from src.silver.config import (
     WEATHER_EXTREME_THRESHOLDS,
     WEATHER_HARD_LIMITS,
 )
-from src.silver.clean_311 import clean_and_validate_311, to_utc_datetime, standardize_string_series
+from src.silver.clean_311 import clean_and_validate_311, to_utc_datetime, standardize_string_series, haversine_distance_km
 from src.silver.clean_weather import clean_and_validate_weather
 from src.silver.join_silver import join_silver_datasets
 
@@ -187,10 +187,15 @@ class TestSilverLayerPipeline(unittest.TestCase):
             self.assertEqual(row3["grid_id"], BOROUGH_CENTROIDS["BROOKLYN"][2])
             self.assertEqual(row3["clean_incident_zip"], "00000")
 
-            # Verify schema types
+            # Verify spatial distance metadata and schema types
             self.assertEqual(str(df_clean["unique_key"].dtype), "Int64")
             self.assertTrue(pd.api.types.is_float_dtype(df_clean["latitude"]))
             self.assertTrue(pd.api.types.is_float_dtype(df_clean["longitude"]))
+            self.assertTrue(pd.api.types.is_float_dtype(df_clean["grid_distance_km"]))
+            self.assertTrue(row1["grid_distance_km"] > 0.0)
+            self.assertTrue(row2["grid_distance_km"] > 0.0)
+            self.assertTrue(row3["grid_distance_km"] > 0.0)
+            self.assertTrue(res["avg_grid_distance_km"] > 0.0)
 
     def test_timezone_localization_eastern_to_utc(self):
         """Verify proper 4-hour (EDT) and 5-hour (EST) conversion to UTC."""
@@ -734,6 +739,24 @@ class TestSilverLayerPipeline(unittest.TestCase):
             self.assertEqual(len(df_q), 2)
             self.assertIn("MISSING_GRID_ID", df_q["quarantine_reason"].tolist())
             self.assertIn("INVALID_TIMESTAMP_FORMAT", df_q["quarantine_reason"].tolist())
+
+
+
+    def test_haversine_distance_vectorization(self):
+        """Verify Great-Circle Haversine distance calculations and null handling."""
+        # 1. Identical coordinates -> distance must be 0.0
+        lat1 = pd.Series([40.7500, 40.8000, np.nan])
+        lon1 = pd.Series([-73.9900, -74.0000, -73.9900])
+        lat2 = pd.Series([40.7500, 40.8000, 40.7500])
+        lon2 = pd.Series([-73.9900, -73.9000, np.nan])
+
+        dist = haversine_distance_km(lat1, lon1, lat2, lon2)
+        # Point 1: same coordinates -> 0.0 km
+        self.assertEqual(dist.iloc[0], 0.0)
+        # Point 2: (40.8000, -74.0000) to (40.8000, -73.9000) -> approx 8.44 km
+        self.assertAlmostEqual(dist.iloc[1], 8.44, delta=0.2)
+        # Point 3: coordinate with NaN -> distance is NaN
+        self.assertTrue(pd.isna(dist.iloc[2]))
 
 
 if __name__ == "__main__":

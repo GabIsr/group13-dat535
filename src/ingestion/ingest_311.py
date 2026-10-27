@@ -233,6 +233,7 @@ def run_311_ingestion(
             df_part["_extraction_mode"] = "full_snapshot"
             df_part["_schema_version"] = SCHEMA_VERSION
             df_part["_raw_row_hash"] = row_hashes
+            df_part["_bronze_status"] = "valid"
 
             # Record schema fingerprint info
             for col in df_part.columns:
@@ -341,6 +342,7 @@ def run_311_ingestion(
             df_page["_extraction_mode"] = mode
             df_page["_schema_version"] = SCHEMA_VERSION
             df_page["_raw_row_hash"] = row_hashes
+            df_page["_bronze_status"] = "valid"
 
             # Record column types
             for col in df_page.columns:

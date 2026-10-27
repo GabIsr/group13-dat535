@@ -85,6 +85,38 @@ def standardize_string_series(
     return clean_s
 
 
+def haversine_distance_km(
+    lat1: pd.Series,
+    lon1: pd.Series,
+    lat2: pd.Series,
+    lon2: pd.Series,
+) -> pd.Series:
+    """
+    Compute vectorized Great-Circle Haversine distance in kilometers between two coordinate Series.
+    Mean Earth radius R = 6,371.0 km.
+    Returns NaN for any coordinate pair with missing components.
+    """
+    valid_mask = lat1.notna() & lon1.notna() & lat2.notna() & lon2.notna()
+    dist = pd.Series(np.nan, index=lat1.index, dtype="float64")
+
+    if not valid_mask.any():
+        return dist
+
+    r_lat1 = np.radians(lat1[valid_mask].astype(float))
+    r_lon1 = np.radians(lon1[valid_mask].astype(float))
+    r_lat2 = np.radians(lat2[valid_mask].astype(float))
+    r_lon2 = np.radians(lon2[valid_mask].astype(float))
+
+    dlat = r_lat2 - r_lat1
+    dlon = r_lon2 - r_lon1
+
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(r_lat1) * np.cos(r_lat2) * np.sin(dlon / 2.0) ** 2
+    a = np.clip(a, 0.0, 1.0)
+    c = 2.0 * np.arcsin(np.sqrt(a))
+    dist.loc[valid_mask] = (6371.0 * c).round(2)
+    return dist
+
+
 def clean_and_validate_311(
     bronze_311_dir: Path = BRONZE_DIR / "nyc311",
     silver_311_dir: Path = SILVER_DIR / "nyc311",
@@ -278,11 +310,24 @@ def clean_and_validate_311(
         df_valid.loc[b_indices, "grid_id"] = b_grid
         df_valid.loc[b_indices, "spatial_resolution_level"] = "BOROUGH_APPROXIMATION"
 
+    # 4. Spatial Uncertainty Quantification (Great-Circle Haversine Distance to Assigned ERA5 Grid Center)
+    grid_pattern = r"^GRID_([0-9.-]+)_([0-9.-]+)$"
+    extracted_coords = df_valid["grid_id"].str.extract(grid_pattern)
+    grid_center_lat = pd.to_numeric(extracted_coords[0], errors="coerce")
+    grid_center_lon = pd.to_numeric(extracted_coords[1], errors="coerce")
+
+    df_valid["grid_distance_km"] = haversine_distance_km(
+        df_valid["clean_latitude"],
+        df_valid["clean_longitude"],
+        grid_center_lat,
+        grid_center_lon,
+    )
+
     # Spatial resolution statistics
     spatial_stats = df_valid["spatial_resolution_level"].value_counts().to_dict()
     logger.info(f"Spatial imputation summary: {spatial_stats}")
 
-    # 4. String Standardizations
+    # 5. String Standardizations
     if "borough" in df_valid.columns:
         df_valid["borough"] = standardize_string_series(df_valid["borough"], "UNSPECIFIED", case="upper")
     if "complaint_type" in df_valid.columns:
@@ -427,11 +472,17 @@ def clean_and_validate_311(
     conflict_count = int(df_valid["is_status_conflict"].sum())
     instant_count = int(df_valid["is_instant_closure"].sum())
 
+    valid_dist = df_valid["grid_distance_km"].dropna()
+    avg_grid_dist = round(float(valid_dist.mean()), 2) if len(valid_dist) > 0 else 0.0
+    p95_grid_dist = round(float(valid_dist.quantile(0.95)), 2) if len(valid_dist) > 0 else 0.0
+
     return {
         "dataset": "silver_311",
         "input_rows": input_rows,
         "duplicate_rows_removed": duplicate_rows_removed,
         "valid_rows_accepted": len(df_valid),
+        "avg_grid_distance_km": avg_grid_dist,
+        "p95_grid_distance_km": p95_grid_dist,
         "closed_tickets_count": closed_count,
         "open_tickets_count": open_count,
         "status_conflict_count": conflict_count,

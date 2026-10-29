@@ -17,6 +17,32 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from pyspark.sql.functions import (
+    asin,
+    col,
+    concat,
+    cos,
+    date_trunc,
+    dayofweek,
+    desc,
+    from_utc_timestamp,
+    hour,
+    lit,
+    month as spark_month,
+    radians,
+    round as spark_round,
+    row_number,
+    sin,
+    sqrt,
+    to_timestamp,
+    to_utc_timestamp,
+    trim,
+    when,
+)
+from pyspark.sql.window import Window
+from pyspark.storagelevel import StorageLevel
+
+from src.utils.spark import get_spark_session
 
 from src.silver.config import (
     BOROUGH_CENTROIDS,
@@ -120,6 +146,21 @@ def haversine_distance_km(
     return dist
 
 
+def spark_haversine_distance_km(lat1_col, lon1_col, lat2_col, lon2_col):
+    """
+    Compute Great-Circle Haversine distance in km using pure PySpark SQL functions.
+    Fully optimized inside Catalyst optimizer without Python serialization overhead.
+    """
+    r_lat1 = radians(lat1_col)
+    r_lon1 = radians(lon1_col)
+    r_lat2 = radians(lat2_col)
+    r_lon2 = radians(lon2_col)
+    dlat = r_lat2 - r_lat1
+    dlon = r_lon2 - r_lon1
+    a = (sin(dlat / 2.0) ** 2) + cos(r_lat1) * cos(r_lat2) * (sin(dlon / 2.0) ** 2)
+    return spark_round(lit(6371.0) * lit(2.0) * asin(sqrt(a)), 3)
+
+
 def clean_and_validate_311(
     bronze_311_dir: Path = BRONZE_DIR / "nyc311",
     silver_311_dir: Path = SILVER_DIR / "nyc311",
@@ -137,86 +178,93 @@ def clean_and_validate_311(
         logger.warning(f"No Bronze 311 files found in {bronze_311_dir}")
         return {"status": "skipped", "reason": "no_input_files"}
 
-    logger.info(f"Loading {len(bronze_files)} Bronze 311 partition files...")
-    df_raw = pd.concat([pd.read_parquet(f) for f in bronze_files], ignore_index=True)
-    input_rows = len(df_raw)
-    logger.info(f"Loaded {input_rows:,} raw 311 records from Bronze.")
+    logger.info(f"Loading {len(bronze_files)} Bronze 311 partition files into PySpark...")
+    spark = get_spark_session("DAT535-Silver-Clean-311")
+    file_paths = [str(f.resolve()) for f in bronze_files]
+    df_raw_spark = spark.read.parquet(*file_paths)
+    input_rows = df_raw_spark.count()
+    logger.info(f"Loaded {input_rows:,} raw 311 records from Bronze via PySpark.")
 
-    # 1. Deduplication (Group by unique_key, keep most recently ingested)
-    if "_ingested_at_utc" in df_raw.columns:
-        df_sorted = df_raw.sort_values("_ingested_at_utc", ascending=False)
+    # 1. CDC Deduplication via PySpark Window (Lab 3 requirement)
+    cols = set(df_raw_spark.columns)
+    if "_ingested_at_utc" in cols:
+        order_col = col("_ingested_at_utc").desc()
+    elif "created_date" in cols:
+        order_col = col("created_date").desc()
     else:
-        df_sorted = df_raw
+        order_col = col("unique_key").desc()
 
-    df_dedup = df_sorted.drop_duplicates(subset=["unique_key"], keep="first").copy()
-    duplicate_rows_removed = input_rows - len(df_dedup)
-    logger.info(f"Deduplication: removed {duplicate_rows_removed:,} duplicate records on unique_key.")
+    w_dedup = Window.partitionBy("unique_key").orderBy(order_col)
+    df_dedup_spark = df_raw_spark.withColumn("_rn", row_number().over(w_dedup)).filter(col("_rn") == 1).drop("_rn")
+    df_dedup_spark.persist(StorageLevel.MEMORY_AND_DISK)
+    dedup_count = df_dedup_spark.count()
+    duplicate_rows_removed = input_rows - dedup_count
+    logger.info(f"Deduplication (PySpark): removed {duplicate_rows_removed:,} duplicate records on unique_key.")
 
-    # 2. Timestamp Normalization (America/New_York -> UTC) & Temporal Validation
-    df_dedup["created_at_utc"] = to_utc_datetime(df_dedup["created_date"])
-    if "closed_date" in df_dedup.columns:
-        df_dedup["closed_at_utc"] = to_utc_datetime(df_dedup["closed_date"])
+    # 2. PySpark Timestamp Normalization (America/New_York -> UTC) & Temporal Validation
+    # Normalize created_date to UTC timestamp directly within Spark SQL
+    created_ts = to_utc_timestamp(to_timestamp(col("created_date")), "America/New_York")
+    df_spark_proc = df_dedup_spark.withColumn("created_at_utc", created_ts)
+
+    if "closed_date" in df_spark_proc.columns:
+        closed_ts = to_utc_timestamp(to_timestamp(col("closed_date")), "America/New_York")
+        df_spark_proc = df_spark_proc.withColumn("closed_at_utc", closed_ts)
     else:
-        df_dedup["closed_at_utc"] = pd.Series(pd.NaT, index=df_dedup.index, dtype="datetime64[us, UTC]")
+        df_spark_proc = df_spark_proc.withColumn("closed_at_utc", lit(None).cast("timestamp"))
 
-    # Open vs. Closed Ticket Semantics
-    df_dedup["is_ticket_closed"] = df_dedup["closed_at_utc"].notna()
-    df_dedup["ticket_status_category"] = np.where(df_dedup["is_ticket_closed"], "CLOSED", "OPEN")
-
-    # Compute resolution duration in hours (only applicable to closed tickets)
-    duration_secs = (df_dedup["closed_at_utc"] - df_dedup["created_at_utc"]).dt.total_seconds()
-    df_dedup["resolution_duration_hours"] = np.where(
-        df_dedup["is_ticket_closed"],
-        (duration_secs / 3600.0).round(2),
-        np.nan,
+    # Open vs. Closed Ticket Semantics in PySpark
+    df_spark_proc = df_spark_proc.withColumn("is_ticket_closed", col("closed_at_utc").isNotNull())
+    df_spark_proc = df_spark_proc.withColumn(
+        "ticket_status_category",
+        when(col("is_ticket_closed"), lit("CLOSED")).otherwise(lit("OPEN")),
     )
 
-    # For open tickets, compute active queue age in days relative to UTC run time
-    now_utc = pd.Timestamp.now(tz=timezone.utc)
-    open_age_secs = (now_utc - df_dedup["created_at_utc"]).dt.total_seconds()
-    df_dedup["open_ticket_age_days"] = np.where(
-        ~df_dedup["is_ticket_closed"],
-        (open_age_secs / 86400.0).round(2),
-        np.nan,
+    # Resolution duration in hours (only applicable to closed tickets)
+    duration_secs = col("closed_at_utc").cast("long") - col("created_at_utc").cast("long")
+    df_spark_proc = df_spark_proc.withColumn(
+        "resolution_duration_hours",
+        when(col("is_ticket_closed"), spark_round(duration_secs / 3600.0, 2)).otherwise(lit(None).cast("double")),
+    )
+
+    # Active queue age in days (relative to current UTC runtime)
+    now_utc = datetime.now(timezone.utc)
+    now_epoch = int(now_utc.timestamp())
+    open_age_secs = lit(now_epoch) - col("created_at_utc").cast("long")
+    df_spark_proc = df_spark_proc.withColumn(
+        "open_ticket_age_days",
+        when(~col("is_ticket_closed"), spark_round(open_age_secs / 86400.0, 2)).otherwise(lit(None).cast("double")),
     )
 
     # Hourly join key for UTC weather alignment
-    df_dedup["weather_join_hour_utc"] = df_dedup["created_at_utc"].dt.floor("h")
+    df_spark_proc = df_spark_proc.withColumn("weather_join_hour_utc", date_trunc("hour", col("created_at_utc")))
 
-    # Calendar row attributes (Derived from local New York time for human behavioral patterns)
-    created_local = df_dedup["created_at_utc"].dt.tz_convert("America/New_York")
-    df_dedup["hour_of_day"] = df_dedup["created_at_utc"].dt.hour  # UTC hour
-    df_dedup["created_hour_local"] = created_local.dt.hour         # Local 0-23 hour
-    df_dedup["day_of_week"] = created_local.dt.dayofweek          # 0=Monday, 6=Sunday
-    df_dedup["is_weekend"] = df_dedup["day_of_week"].isin([5, 6])
-    df_dedup["month_of_year"] = created_local.dt.month
+    # Calendar row attributes derived from local New York time in PySpark
+    local_ts = from_utc_timestamp(col("created_at_utc"), "America/New_York")
+    df_spark_proc = df_spark_proc.withColumn("hour_of_day", hour(col("created_at_utc")))
+    df_spark_proc = df_spark_proc.withColumn("created_hour_local", hour(local_ts))
+    df_spark_proc = df_spark_proc.withColumn("day_of_week", (dayofweek(local_ts) + 5) % 7)
+    df_spark_proc = df_spark_proc.withColumn("is_weekend", col("day_of_week").isin([5, 6]))
+    df_spark_proc = df_spark_proc.withColumn("month_of_year", spark_month(local_ts))
 
-    # -------------------------------------------------------------------------
-    # Hard Quarantine Boundary Validation
-    # 1. Missing created_at timestamp
-    # 2. Negative duration for closed tickets (closed before created)
-    # 3. Missing or non-positive unique_key primary key (supports 7, 8, 9 digit keys > 0)
-    # 4. Pre-311 launch date (earlier than March 2003 indicates epoch/default artifact)
-    # 5. Future created or closed timestamp (beyond current UTC time + 2h clock drift allowance)
-    # 6. Corrupted ingestion lineage metadata (_batch_id missing or empty)
-    # -------------------------------------------------------------------------
-    parsed_keys = pd.to_numeric(df_dedup["unique_key"], errors="coerce")
-    launch_date_utc = pd.Timestamp(NYC_311_LAUNCH_DATE)
-    future_grace_utc = now_utc + pd.Timedelta(hours=2)
+    # 3. Hard Quarantine Boundary Validation (Spark SQL Boolean Predicates)
+    parsed_keys = col("unique_key").cast("long")
+    launch_epoch = int(datetime(2003, 3, 1, tzinfo=timezone.utc).timestamp())
+    future_grace_epoch = now_epoch + 7200
 
-    cond_missing_created = df_dedup["created_at_utc"].isna()
-    cond_negative_duration = df_dedup["is_ticket_closed"] & (df_dedup["resolution_duration_hours"] < 0.0)
-    cond_invalid_key = parsed_keys.isna() | (parsed_keys <= 0)
-    cond_pre_epoch = df_dedup["created_at_utc"].notna() & (df_dedup["created_at_utc"] < launch_date_utc)
-    cond_future_created = df_dedup["created_at_utc"].notna() & (df_dedup["created_at_utc"] > future_grace_utc)
-    cond_future_closed = df_dedup["closed_at_utc"].notna() & (df_dedup["closed_at_utc"] > future_grace_utc)
-    cond_corrupt_lineage = (
-        (df_dedup["_batch_id"].isna() | df_dedup["_batch_id"].astype(str).str.strip().isin(["", "nan", "None", "<NA>"]))
-        if "_batch_id" in df_dedup.columns
-        else pd.Series(False, index=df_dedup.index)
-    )
+    cond_missing_created = col("created_at_utc").isNull()
+    cond_negative_duration = col("is_ticket_closed") & (col("resolution_duration_hours") < 0.0)
+    cond_invalid_key = parsed_keys.isNull() | (parsed_keys <= 0)
+    cond_pre_epoch = col("created_at_utc").isNotNull() & (col("created_at_utc").cast("long") < lit(launch_epoch))
+    cond_future_created = col("created_at_utc").isNotNull() & (col("created_at_utc").cast("long") > lit(future_grace_epoch))
+    cond_future_closed = col("closed_at_utc").isNotNull() & (col("closed_at_utc").cast("long") > lit(future_grace_epoch))
 
-    quarantine_mask = (
+    if "_batch_id" in df_spark_proc.columns:
+        b_str = trim(col("_batch_id").cast("string"))
+        cond_corrupt_lineage = col("_batch_id").isNull() | b_str.isin(["", "nan", "None", "<NA>"])
+    else:
+        cond_corrupt_lineage = lit(False)
+
+    quarantine_cond = (
         cond_missing_created
         | cond_negative_duration
         | cond_invalid_key
@@ -225,19 +273,41 @@ def clean_and_validate_311(
         | cond_future_closed
         | cond_corrupt_lineage
     )
-    df_quarantined = df_dedup[quarantine_mask].copy()
 
+    df_quarantined_spark = df_spark_proc.filter(quarantine_cond)
+    df_valid_spark = df_spark_proc.filter(~quarantine_cond)
+    df_valid_spark.persist(StorageLevel.MEMORY_AND_DISK)
+
+    df_quarantined = df_quarantined_spark.toPandas().copy()
     if len(df_quarantined) > 0:
-        # Build multi-reason quarantine string recording all violated boundary rules per row
+        df_quarantined["created_at_utc"] = pd.to_datetime(df_quarantined["created_at_utc"], utc=True)
+        if "closed_at_utc" in df_quarantined.columns:
+            df_quarantined["closed_at_utc"] = pd.to_datetime(df_quarantined["closed_at_utc"], utc=True)
+        q_keys = pd.to_numeric(df_quarantined["unique_key"], errors="coerce")
+        q_now = pd.Timestamp.now(tz=timezone.utc)
+        q_grace = q_now + pd.Timedelta(hours=2)
+        q_launch = pd.Timestamp(NYC_311_LAUNCH_DATE)
+
+        q_missing_cr = df_quarantined["created_at_utc"].isna()
+        q_neg_dur = df_quarantined["is_ticket_closed"] & (df_quarantined["resolution_duration_hours"] < 0.0)
+        q_bad_key = q_keys.isna() | (q_keys <= 0)
+        q_pre_ep = df_quarantined["created_at_utc"].notna() & (df_quarantined["created_at_utc"] < q_launch)
+        q_fut_cr = df_quarantined["created_at_utc"].notna() & (df_quarantined["created_at_utc"] > q_grace)
+        q_fut_cl = df_quarantined["closed_at_utc"].notna() & (df_quarantined["closed_at_utc"] > q_grace)
+        q_corrupt = (
+            (df_quarantined["_batch_id"].isna() | df_quarantined["_batch_id"].astype(str).str.strip().isin(["", "nan", "None", "<NA>"]))
+            if "_batch_id" in df_quarantined.columns
+            else pd.Series(False, index=df_quarantined.index)
+        )
         q_idx = df_quarantined.index
         rule_checks = [
-            (cond_missing_created.loc[q_idx], "MISSING_CREATED_TIMESTAMP"),
-            (cond_invalid_key.loc[q_idx], "INVALID_OR_NON_NUMERIC_UNIQUE_KEY"),
-            (cond_pre_epoch.loc[q_idx], "PRE_311_EPOCH_DATE"),
-            (cond_future_created.loc[q_idx], "FUTURE_CREATED_DATE"),
-            (cond_future_closed.loc[q_idx], "FUTURE_CLOSED_DATE"),
-            (cond_negative_duration.loc[q_idx], "NEGATIVE_RESOLUTION_DURATION"),
-            (cond_corrupt_lineage.loc[q_idx], "CORRUPTED_INGESTION_METADATA"),
+            (q_missing_cr.loc[q_idx], "MISSING_CREATED_TIMESTAMP"),
+            (q_bad_key.loc[q_idx], "INVALID_OR_NON_NUMERIC_UNIQUE_KEY"),
+            (q_pre_ep.loc[q_idx], "PRE_311_EPOCH_DATE"),
+            (q_fut_cr.loc[q_idx], "FUTURE_CREATED_DATE"),
+            (q_fut_cl.loc[q_idx], "FUTURE_CLOSED_DATE"),
+            (q_neg_dur.loc[q_idx], "NEGATIVE_RESOLUTION_DURATION"),
+            (q_corrupt.loc[q_idx], "CORRUPTED_INGESTION_METADATA"),
         ]
         df_quarantined["quarantine_reason"] = [
             "; ".join(label for mask, label in rule_checks if mask.at[idx])
@@ -249,8 +319,14 @@ def clean_and_validate_311(
         logger.warning(f"Quarantined {len(df_quarantined):,} invalid records to {q_path}")
 
     # Retain only valid records for clean Silver and enforce Int64 primary key
-    df_valid = df_dedup[~quarantine_mask].copy()
-    df_valid["unique_key"] = parsed_keys[~quarantine_mask].astype("Int64")
+    df_valid = df_valid_spark.toPandas().copy()
+    df_valid_spark.unpersist()
+    df_dedup_spark.unpersist()
+
+    df_valid["created_at_utc"] = pd.to_datetime(df_valid["created_at_utc"], utc=True)
+    if "closed_at_utc" in df_valid.columns:
+        df_valid["closed_at_utc"] = pd.to_datetime(df_valid["closed_at_utc"], utc=True)
+    df_valid["unique_key"] = pd.to_numeric(df_valid["unique_key"], errors="coerce").astype("Int64")
 
     # Standardize clean_incident_zip as a persistent 5-digit zero-padded string (never integer!)
     if "incident_zip" in df_valid.columns:
@@ -541,6 +617,8 @@ def clean_and_validate_311(
         table = pa.Table.from_pandas(save_df, preserve_index=False)
         pq.write_table(table, out_path, compression="snappy")
         written_files += 1
+
+    df_dedup_spark.unpersist()
 
     elapsed = time.time() - start_time
     logger.info(

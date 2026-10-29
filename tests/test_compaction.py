@@ -46,7 +46,7 @@ class TestPartitionCompaction(unittest.TestCase):
             self.assertEqual(len(remaining_files), 1)
             df_compacted = pd.read_parquet(remaining_files[0])
             self.assertEqual(len(df_compacted), 6)
-            self.assertEqual(list(df_compacted["id"]), [1, 2, 3, 4, 5, 6])
+            self.assertEqual(sorted(list(df_compacted["id"])), [1, 2, 3, 4, 5, 6])
 
     def test_single_file_partition_skipped(self):
         """Verify that single-file partitions are skipped without modification."""

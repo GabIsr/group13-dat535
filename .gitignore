@@ -27,3 +27,7 @@ env/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Windows Hadoop local binaries
+hadoop/
+

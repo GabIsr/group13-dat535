@@ -2,7 +2,7 @@
 Partition Compaction Utility for the Medallion Architecture (Bronze & Silver).
 Resolves the 'Small Files Problem' caused by micro-batch and streaming ingestion.
 Coalesces fragmented parquet files within individual leaf partitions into optimally-sized files (64MB - 128MB target),
-guaranteeing zero data loss through strict row-count and schema invariance verification.
+guaranteeing zero data loss through strict row-count and schema invariance verification using Apache PySpark coalesce(1).
 Author: Group 13
 """
 
@@ -21,8 +21,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import pandas as pd
-import pyarrow as pa
 import pyarrow.parquet as pq
+from src.utils.spark import get_spark_session
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("compaction")
@@ -37,8 +37,8 @@ def find_leaf_partitions(root_dir: Path) -> List[Path]:
 
     leaf_partitions = set()
     for p_file in root_dir.glob("**/*.parquet"):
-        # Ignore temporary files
-        if p_file.name.endswith(".tmp"):
+        # Ignore temporary and internal metadata files
+        if p_file.name.endswith(".tmp") or p_file.name.startswith("_") or "_compaction_tmp" in p_file.parts:
             continue
         leaf_partitions.add(p_file.parent)
 
@@ -51,14 +51,17 @@ def compact_partition(
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     """
-    Compact multiple small Parquet files within a single leaf partition directory.
+    Compact multiple small Parquet files within a single leaf partition directory using PySpark coalesce(1).
     
     Invariance Guarantees:
-    1. Pre-compaction row count == Post-compaction row count
+    1. Pre-compaction row count == Post-compaction row count (verified via Spark count)
     2. Column schema and dtypes are strictly preserved
     3. Old files are only unlinked after successful write and verification of the compacted table.
     """
-    parquet_files = sorted([f for f in partition_dir.glob("*.parquet") if not f.name.endswith(".tmp")])
+    parquet_files = sorted([
+        f for f in partition_dir.glob("*.parquet")
+        if not f.name.endswith(".tmp") and not f.name.startswith("_") and not f.name.startswith(".")
+    ])
     if len(parquet_files) <= 1:
         return {
             "partition": str(partition_dir),
@@ -73,15 +76,16 @@ def compact_partition(
     # Calculate pre-compaction metrics
     bytes_before = sum(f.stat().st_size for f in parquet_files)
     
-    # Read all files in the partition
-    tables = [pq.read_table(f) for f in parquet_files]
-    combined_table = pa.concat_tables(tables, promote_options="default")
-    rows_before = combined_table.num_rows
+    # Read all files in the partition via PySpark
+    spark = get_spark_session("BronzePartitionCompaction")
+    file_paths = [str(f.resolve()) for f in parquet_files]
+    df_spark = spark.read.parquet(*file_paths)
+    rows_before = df_spark.count()
 
     if dry_run:
         logger.info(
             f"[DRY-RUN] Partition {partition_dir.name}: Would merge {len(parquet_files)} files "
-            f"({rows_before:,} rows, {bytes_before / 1024:.1f} KB) into 1 file."
+            f"({rows_before:,} rows, {bytes_before / 1024:.1f} KB) into 1 file via PySpark coalesce(1)."
         )
         return {
             "partition": str(partition_dir),
@@ -95,16 +99,27 @@ def compact_partition(
             "status": "dry_run",
         }
 
-    # Write compacted table to a temporary file
-    tmp_path = partition_dir / "part_compacted_0000.parquet.tmp"
-    pq.write_table(combined_table, tmp_path, compression="snappy")
+    # Coalesce to a single partition using PySpark coalesce(1) to avoid cluster shuffle
+    tmp_dir = partition_dir / "_compaction_tmp"
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    # Verification step: read back and verify row count invariance
-    verified_table = pq.read_table(tmp_path)
-    rows_after = verified_table.num_rows
+    df_spark.coalesce(1).write.mode("overwrite").parquet(str(tmp_dir))
+
+    # Locate the single part file written by PySpark
+    part_files = sorted(list(tmp_dir.glob("part-*.parquet")))
+    if not part_files:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise RuntimeError(f"PySpark coalesce(1) failed to write output part file in {tmp_dir}")
+
+    compacted_file = part_files[0]
+
+    # Verification step: read back via PySpark and verify row count invariance
+    verified_spark = spark.read.parquet(str(compacted_file))
+    rows_after = verified_spark.count()
 
     if rows_after != rows_before:
-        tmp_path.unlink(missing_ok=True)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
         raise ValueError(
             f"Compaction integrity violation in {partition_dir}! "
             f"Rows before ({rows_before}) != rows after ({rows_after}). Compaction aborted."
@@ -112,16 +127,20 @@ def compact_partition(
 
     # Atomic swap: remove old small files and finalize compacted file
     for old_file in parquet_files:
-        old_file.unlink()
+        try:
+            old_file.unlink()
+        except Exception as e:
+            logger.warning(f"Failed to remove old file {old_file}: {e}")
 
     final_path = partition_dir / "part_compacted_0000.parquet"
-    tmp_path.rename(final_path)
+    shutil.move(str(compacted_file), str(final_path))
+    shutil.rmtree(tmp_dir, ignore_errors=True)
 
     bytes_after = final_path.stat().st_size
     bytes_saved = max(0, bytes_before - bytes_after)
 
     logger.info(
-        f"Compacted {partition_dir.name}: {len(parquet_files)} files -> 1 file | "
+        f"Compacted (PySpark) {partition_dir.name}: {len(parquet_files)} files -> 1 file | "
         f"{rows_before:,} rows verified | Saved {bytes_saved / 1024:.1f} KB"
     )
 
@@ -144,7 +163,7 @@ def compact_partitions(
     dry_run: bool = False,
 ) -> Dict[str, Any]:
     """
-    Recursively scan and compact all leaf partitions under base_dir.
+    Recursively scan and compact all leaf partitions under base_dir using PySpark coalesce(1).
     """
     start_time = time.time()
     leaf_dirs = find_leaf_partitions(base_dir)
@@ -174,7 +193,7 @@ def compact_partitions(
     files_eliminated = total_files_before - total_files_after
 
     logger.info(
-        f"Compaction Complete: {total_compacted_partitions} partitions compacted | "
+        f"Compaction Complete (PySpark): {total_compacted_partitions} partitions compacted | "
         f"{files_eliminated} small files eliminated | {total_rows:,} rows preserved | "
         f"{total_bytes_saved / 1024:.1f} KB saved | {elapsed:.2f}s"
     )
@@ -195,7 +214,7 @@ def compact_partitions(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Coalesce fragmented Parquet partitions in Medallion Bronze/Silver.")
+    parser = argparse.ArgumentParser(description="Coalesce fragmented Parquet partitions in Medallion Bronze/Silver using PySpark.")
     parser.add_argument("--path", type=str, default="data/bronze", help="Root directory to scan and compact")
     parser.add_argument("--target-mb", type=int, default=64, help="Target compacted partition file size in MB")
     parser.add_argument("--dry-run", action="store_true", help="Simulate compaction without modifying files")

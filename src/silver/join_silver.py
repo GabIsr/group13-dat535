@@ -14,8 +14,11 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+from pyspark.sql.functions import broadcast, col
+from pyspark.storagelevel import StorageLevel
 
 from src.silver.config import PROJECT_ROOT, SILVER_DIR
+from src.utils.spark import get_spark_session
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("join_silver")
@@ -29,6 +32,7 @@ def join_silver_datasets(
     """
     Join clean 311 service requests with local hourly ERA5-Land meteorological reanalysis.
     Joins on: 311.grid_id == weather.grid_id AND 311.weather_join_hour_utc == weather.timestamp_utc.
+    Uses PySpark BroadcastHashJoin (Lab 3 requirement) to broadcast the weather dimension.
     """
     start_time = time.time()
     joined_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -38,22 +42,24 @@ def join_silver_datasets(
     if not files_311:
         raise FileNotFoundError(f"No Silver 311 files found in {silver_311_dir}")
 
-    logger.info(f"Loading {len(files_311)} Silver 311 partition files...")
-    df_311 = pd.concat([pd.read_parquet(f) for f in files_311], ignore_index=True)
-    total_311 = len(df_311)
-    logger.info(f"Loaded {total_311:,} clean 311 records.")
-
     # 2. Load Silver Weather (The Broadcast Dimension)
     files_weather = sorted(silver_weather_dir.glob("**/*.parquet"))
     if not files_weather:
         raise FileNotFoundError(f"No Silver weather files found in {silver_weather_dir}")
 
-    logger.info(f"Loading {len(files_weather)} Silver weather partition files across grid cells...")
-    df_weather = pd.concat([pd.read_parquet(f) for f in files_weather], ignore_index=True)
-    logger.info(f"Loaded {len(df_weather):,} hourly weather observations across {df_weather['grid_id'].nunique()} grid cells.")
+    logger.info("Initializing PySpark session for Silver Broadcast Join...")
+    spark = get_spark_session("DAT535-Silver-Join")
 
-    # 3. Prepare Join Keys and Columns
-    # Weather select subset to avoid duplicate column collisions (e.g. borough_hint vs borough)
+    file_paths_311 = [str(f.resolve()) for f in files_311]
+    df_311_spark = spark.read.parquet(*file_paths_311)
+    total_311 = df_311_spark.count()
+    logger.info(f"Loaded {total_311:,} clean 311 records into PySpark.")
+
+    file_paths_weather = [str(f.resolve()) for f in files_weather]
+    df_weather_spark = spark.read.parquet(*file_paths_weather)
+    logger.info(f"Loaded {df_weather_spark.count():,} hourly weather observations into PySpark.")
+
+    # 3. Weather Column Selection (Column Pruning early - Lab 3 optimization)
     weather_join_cols = [
         "grid_id",
         "timestamp_utc",
@@ -80,33 +86,41 @@ def join_silver_datasets(
         "is_extreme_weather",
         "model_elevation",
     ]
-    df_w_sub = df_weather[[c for c in weather_join_cols if c in df_weather.columns]].copy()
+    w_cols = [c for c in weather_join_cols if c in df_weather_spark.columns]
+    df_w_sub = df_weather_spark.select(*w_cols)
 
-    # Ensure UTC timezone awareness on join keys
-    df_311["weather_join_hour_utc"] = pd.to_datetime(df_311["weather_join_hour_utc"], utc=True)
-    df_w_sub["timestamp_utc"] = pd.to_datetime(df_w_sub["timestamp_utc"], utc=True)
+    # 4. True PySpark broadcast() Join (Lab 3 requirement)
+    logger.info("Executing PySpark Broadcast Join (311 [Fact] LEFT JOIN broadcast(Weather) [Dimension])...")
+    df_w_alias = broadcast(df_w_sub).alias("w")
+    df_311_alias = df_311_spark.alias("t")
 
-    # 4. Execute Left Join
-    logger.info("Executing Left Join (311 [Fact] LEFT JOIN Weather [Dimension])...")
-    df_joined = df_311.merge(
-        df_w_sub,
-        left_on=["grid_id", "weather_join_hour_utc"],
-        right_on=["grid_id", "timestamp_utc"],
-        how="left",
-    )
+    join_cond = (col("t.grid_id") == col("w.grid_id")) & (col("t.weather_join_hour_utc") == col("w.timestamp_utc"))
+    df_joined_spark = df_311_alias.join(df_w_alias, join_cond, how="left").drop(col("w.grid_id"))
+
+    # Log Catalyst execution plan (Lab 3 optimization verification)
+    logger.info("PySpark Catalyst Plan for Broadcast Join:")
+    df_joined_spark.explain(False)
+
+    df_joined_spark.persist(StorageLevel.MEMORY_AND_DISK)
+    joined_rows = df_joined_spark.count()
 
     # 4b. Hard Data Quality Gate: Prevent 1-to-Many Cartesian Join Multiplication
-    if len(df_joined) != total_311:
+    if joined_rows != total_311:
+        df_joined_spark.unpersist()
         raise ValueError(
             f"Cartesian join explosion detected! "
-            f"Input 311 rows ({total_311:,}) != Joined rows ({len(df_joined):,}). "
+            f"Input 311 rows ({total_311:,}) != Joined rows ({joined_rows:,}). "
             f"Weather dimension contains duplicate (grid_id, timestamp_utc) keys."
         )
+
+    # Convert to Pandas for partitioned Parquet write and audit tracking
+    df_joined = df_joined_spark.toPandas().copy()
+    df_joined_spark.unpersist()
 
     # Ensure nullable integer types are preserved on merged fact table
     for int16_col in ["weather_code", "relative_humidity_2m", "wind_direction_10m"]:
         if int16_col in df_joined.columns:
-            df_joined[int16_col] = df_joined[int16_col].astype("Int16")
+            df_joined[int16_col] = pd.to_numeric(df_joined[int16_col], errors="coerce").astype("Int16")
 
     # Audit match status
     df_joined["is_weather_matched"] = df_joined["temperature_2m"].notna()
@@ -122,8 +136,8 @@ def join_silver_datasets(
 
     # 5. Write Partitioned Fact Table: year=YYYY / month=MM / fact_311_weather.parquet
     output_joined_dir.mkdir(parents=True, exist_ok=True)
-    df_joined["_partition_year"] = df_joined["created_at_utc"].dt.strftime("%Y")
-    df_joined["_partition_month"] = df_joined["created_at_utc"].dt.strftime("%m")
+    df_joined["_partition_year"] = pd.to_datetime(df_joined["created_at_utc"], utc=True).dt.strftime("%Y")
+    df_joined["_partition_month"] = pd.to_datetime(df_joined["created_at_utc"], utc=True).dt.strftime("%m")
 
     written_files = 0
     for (year, month), sub_df in df_joined.groupby(["_partition_year", "_partition_month"]):

@@ -123,6 +123,47 @@ class TestIngestionPipeline(unittest.TestCase):
             b2_id = generate_batch_id("311", date_str="20261023", manifests_dir=tmp_path)
             self.assertTrue(b2_id.endswith("_002"))
 
+    def test_pyspark_landing_to_bronze_conversion_and_idempotency(self):
+        """Verify that PySpark converts landing JSON.GZ to partitioned Bronze Parquet with row-level hashes."""
+        import gzip
+        import json
+        from src.ingestion.ingest_311 import convert_landing_to_bronze_pyspark
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            landing_dir = tmp_path / "landing" / "batch_311_20261029_001"
+            landing_dir.mkdir(parents=True)
+            bronze_dir = tmp_path / "bronze"
+
+            # Create mock compressed landing JSON
+            mock_records = [
+                {"unique_key": "1001", "created_date": "2026-10-18T10:00:00.000", "complaint_type": "Noise", "latitude": "40.71", "longitude": "-74.00"},
+                {"unique_key": "1002", "created_date": "2026-10-19T14:30:00.000", "complaint_type": "Illegal Parking", "latitude": "40.75", "longitude": "-73.98"},
+            ]
+            gz_path = landing_dir / "raw_part_0000.json.gz"
+            with gzip.open(gz_path, "wb") as f:
+                f.write(json.dumps(mock_records).encode("utf-8"))
+
+            written_files = convert_landing_to_bronze_pyspark(
+                landing_batch_dir=landing_dir,
+                base_bronze_dir=bronze_dir,
+                batch_id="311_20261029_001",
+                retrieved_at_utc="2026-10-29T10:00:00Z",
+                extraction_mode="incremental",
+            )
+
+            self.assertTrue(len(written_files) > 0)
+            self.assertEqual(sum(f["rows"] for f in written_files), 2)
+
+            # Verify Parquet file was written to year=2026/month=10
+            parquet_files = list(bronze_dir.glob("**/*.parquet"))
+            self.assertEqual(len(parquet_files), 1)
+            df_bronze = pd.read_parquet(parquet_files[0])
+            self.assertEqual(len(df_bronze), 2)
+            self.assertIn("_raw_row_hash", df_bronze.columns)
+            self.assertIn("_batch_id", df_bronze.columns)
+            self.assertEqual(df_bronze["_batch_id"].iloc[0], "311_20261029_001")
+
 
 if __name__ == "__main__":
     unittest.main()

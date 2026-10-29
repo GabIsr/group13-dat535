@@ -146,6 +146,7 @@ def clean_and_validate_weather(
         col("_ingested_at_utc").desc() if "_ingested_at_utc" in cols else col("timestamp_utc").desc()
     )
     df_clean_spark = df_valid.withColumn("_rn", row_number().over(w_dedup)).filter(col("_rn") == 1).drop("_rn")
+    df_evaluated.unpersist()
 
     # Cumulative & Lagged Weather Features (Chronological Rolling Windows via PySpark Window functions - Lab 3)
     w_grid_3 = Window.partitionBy("grid_id").orderBy("timestamp_utc").rowsBetween(-2, 0)
@@ -193,6 +194,7 @@ def clean_and_validate_weather(
 
     # Convert to Pandas for detailed physical laws auditing & forensic anomaly ledger construction
     df_clean = df_clean_spark.toPandas().copy()
+    df_clean_spark.unpersist()
     df_clean["timestamp_utc"] = pd.to_datetime(df_clean["timestamp_utc"], utc=True)
 
     # 2. Comprehensive Sensor Physical Laws & Bounds Validation

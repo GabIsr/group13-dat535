@@ -148,41 +148,6 @@ def clean_and_validate_weather(
     df_clean_spark = df_valid.withColumn("_rn", row_number().over(w_dedup)).filter(col("_rn") == 1).drop("_rn")
     df_evaluated.unpersist()
 
-    # Cumulative & Lagged Weather Features (Chronological Rolling Windows via PySpark Window functions - Lab 3)
-    w_grid_3 = Window.partitionBy("grid_id").orderBy("timestamp_utc").rowsBetween(-2, 0)
-    w_grid_6 = Window.partitionBy("grid_id").orderBy("timestamp_utc").rowsBetween(-5, 0)
-    w_grid_24 = Window.partitionBy("grid_id").orderBy("timestamp_utc").rowsBetween(-23, 0)
-
-    if "precipitation" in df_clean_spark.columns:
-        df_clean_spark = (
-            df_clean_spark.withColumn("precip_past_3h_mm", spark_round(spark_sum("precipitation").over(w_grid_3), 2))
-            .withColumn("precip_past_6h_mm", spark_round(spark_sum("precipitation").over(w_grid_6), 2))
-            .withColumn("precip_past_24h_mm", spark_round(spark_sum("precipitation").over(w_grid_24), 2))
-        )
-    else:
-        df_clean_spark = (
-            df_clean_spark.withColumn("precip_past_3h_mm", lit(None).cast("double"))
-            .withColumn("precip_past_6h_mm", lit(None).cast("double"))
-            .withColumn("precip_past_24h_mm", lit(None).cast("double"))
-        )
-
-    if "wind_gusts_10m" in df_clean_spark.columns:
-        df_clean_spark = df_clean_spark.withColumn("max_wind_gust_past_6h_ms", spark_round(spark_max("wind_gusts_10m").over(w_grid_6), 2))
-    else:
-        df_clean_spark = df_clean_spark.withColumn("max_wind_gust_past_6h_ms", lit(None).cast("double"))
-
-    if "temperature_2m" in df_clean_spark.columns:
-        df_clean_spark = (
-            df_clean_spark.withColumn("min_temp_past_24h_c", spark_round(spark_min("temperature_2m").over(w_grid_24), 2))
-            .withColumn("max_temp_past_24h_c", spark_round(spark_max("temperature_2m").over(w_grid_24), 2))
-        )
-    else:
-        df_clean_spark = (
-            df_clean_spark.withColumn("min_temp_past_24h_c", lit(None).cast("double"))
-            .withColumn("max_temp_past_24h_c", lit(None).cast("double"))
-        )
-
-    df_clean_spark.persist(StorageLevel.MEMORY_AND_DISK)
     valid_count = df_clean_spark.count()
     duplicate_rows_dropped = before_dedup_count - valid_count
 
@@ -364,7 +329,52 @@ def clean_and_validate_weather(
         )
     pq.write_table(pa.Table.from_pandas(df_ledger, preserve_index=False), anomaly_ledger_path, compression="snappy")
 
-    # 3. Soft Quality Tagging (Extreme Weather Flags - NEVER DISCARD REAL EXTREMES)
+    # 3. Cumulative & Lagged Weather Features (Chronological Rolling Windows via PySpark Window functions - Lab 3)
+    # Computed on MASKED sensor values so corrupted readings do not pollute rolling metrics!
+    # Uses true chronological time windows rangeBetween(-2 * 3600, 0) on epoch seconds.
+    df_window_spark = spark.createDataFrame(df_clean)
+    df_window_spark = df_window_spark.withColumn("_ts_secs", col("timestamp_utc").cast("long"))
+
+    w_grid_3 = Window.partitionBy("grid_id").orderBy("_ts_secs").rangeBetween(-2 * 3600, 0)
+    w_grid_6 = Window.partitionBy("grid_id").orderBy("_ts_secs").rangeBetween(-5 * 3600, 0)
+    w_grid_24 = Window.partitionBy("grid_id").orderBy("_ts_secs").rangeBetween(-23 * 3600, 0)
+
+    if "precipitation" in df_window_spark.columns:
+        df_window_spark = (
+            df_window_spark.withColumn("precip_past_3h_mm", spark_round(spark_sum("precipitation").over(w_grid_3), 2))
+            .withColumn("precip_past_6h_mm", spark_round(spark_sum("precipitation").over(w_grid_6), 2))
+            .withColumn("precip_past_24h_mm", spark_round(spark_sum("precipitation").over(w_grid_24), 2))
+        )
+    else:
+        df_window_spark = (
+            df_window_spark.withColumn("precip_past_3h_mm", lit(None).cast("double"))
+            .withColumn("precip_past_6h_mm", lit(None).cast("double"))
+            .withColumn("precip_past_24h_mm", lit(None).cast("double"))
+        )
+
+    if "wind_gusts_10m" in df_window_spark.columns:
+        df_window_spark = df_window_spark.withColumn(
+            "max_wind_gust_past_6h_ms", spark_round(spark_max("wind_gusts_10m").over(w_grid_6), 2)
+        )
+    else:
+        df_window_spark = df_window_spark.withColumn("max_wind_gust_past_6h_ms", lit(None).cast("double"))
+
+    if "temperature_2m" in df_window_spark.columns:
+        df_window_spark = (
+            df_window_spark.withColumn("min_temp_past_24h_c", spark_round(spark_min("temperature_2m").over(w_grid_24), 2))
+            .withColumn("max_temp_past_24h_c", spark_round(spark_max("temperature_2m").over(w_grid_24), 2))
+        )
+    else:
+        df_window_spark = (
+            df_window_spark.withColumn("min_temp_past_24h_c", lit(None).cast("double"))
+            .withColumn("max_temp_past_24h_c", lit(None).cast("double"))
+        )
+
+    df_window_spark = df_window_spark.drop("_ts_secs")
+    df_clean = df_window_spark.toPandas().copy()
+    df_window_spark.unpersist()
+
+    # 4. Soft Quality Tagging (Extreme Weather Flags - NEVER DISCARD REAL EXTREMES)
     cond_cold = df_clean["temperature_2m"] < WEATHER_EXTREME_THRESHOLDS["temp_extreme_cold"]
     cond_heat = df_clean["temperature_2m"] > WEATHER_EXTREME_THRESHOLDS["temp_extreme_heat"]
     cond_torrential = df_clean["precipitation"] >= WEATHER_EXTREME_THRESHOLDS["precip_torrential_hr"]
@@ -378,7 +388,7 @@ def clean_and_validate_weather(
     extreme_rows_count = int(df_clean["is_extreme_weather"].sum())
     logger.info(f"Tagged {extreme_rows_count:,} observations as extreme weather events (preserved intact).")
 
-    # 4. Standardization and Derived Row Attributes (Pure Metric: Celsius and m/s)
+    # 5. Standardization and Derived Row Attributes (Pure Metric: Celsius and m/s)
     df_clean["is_freezing"] = df_clean["temperature_2m"] <= 0.0
     df_clean["is_raining"] = df_clean["precipitation"] > 0.0
 
@@ -386,13 +396,13 @@ def clean_and_validate_weather(
         if int16_col in df_clean.columns:
             df_clean[int16_col] = pd.to_numeric(df_clean[int16_col], errors="coerce").astype("Int16")
 
-    # 5. Silver Audit Metadata
+    # 6. Silver Audit Metadata
     df_final_pd = df_clean
     df_final_pd["timestamp_utc"] = pd.to_datetime(df_final_pd["timestamp_utc"], utc=True)
     df_final_pd["_silver_processed_at_utc"] = processed_at_utc
     df_final_pd["_partition_year"] = df_final_pd["timestamp_utc"].dt.strftime("%Y")
 
-    # 6. Write Partitioned Parquet: grid_id=GRID_XX_YY / year=YYYY / clean_weather.parquet
+    # 7. Write Partitioned Parquet: grid_id=GRID_XX_YY / year=YYYY / clean_weather.parquet
     silver_weather_dir.mkdir(parents=True, exist_ok=True)
     written_files = 0
     for (grid_id, year), sub_df in df_final_pd.groupby(["grid_id", "_partition_year"]):

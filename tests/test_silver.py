@@ -927,5 +927,144 @@ class TestSilverLayerPipeline(unittest.TestCase):
             self.assertIn("CORRUPTED_INGESTION_METADATA", df_q.iloc[0]["quarantine_reason"])
 
 
+    def test_corrupted_sensor_masking_before_rolling_window_and_time_gaps(self):
+        """
+        Verify that corrupted sensor readings are masked BEFORE rolling window computations,
+        and verify that chronological time-based rangeBetween handles temporal gaps cleanly.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            mock_weather = [
+                # Hour 0: Valid 2.0 mm
+                {
+                    "grid_id": "GRID_40.7_-74.0",
+                    "time": "2026-10-18T10:00",
+                    "temperature_2m": 15.0,
+                    "precipitation": 2.0,
+                    "surface_pressure": 1013.0,
+                    "wind_speed_10m": 5.0,
+                    "wind_gusts_10m": 10.0,
+                },
+                # Hour 1: Corrupted sentinel precipitation (-999.0 mm)
+                {
+                    "grid_id": "GRID_40.7_-74.0",
+                    "time": "2026-10-18T11:00",
+                    "temperature_2m": 15.0,
+                    "precipitation": -999.0,
+                    "surface_pressure": 1013.0,
+                    "wind_speed_10m": 5.0,
+                    "wind_gusts_10m": 10.0,
+                },
+                # Hour 2: Valid 3.0 mm (Window past 3h should sum 2.0 + (masked NaN) + 3.0 = 5.0, NOT 2 - 999 + 3 = -994!)
+                {
+                    "grid_id": "GRID_40.7_-74.0",
+                    "time": "2026-10-18T12:00",
+                    "temperature_2m": 15.0,
+                    "precipitation": 3.0,
+                    "surface_pressure": 1013.0,
+                    "wind_speed_10m": 5.0,
+                    "wind_gusts_10m": 10.0,
+                },
+                # Hour 10: Valid 4.0 mm, but occurs after an 8-hour gap!
+                # Because window is time-based rangeBetween(-2 * 3600, 0), it should ONLY include Hour 10 (4.0 mm),
+                # NOT previous rows across the gap!
+                {
+                    "grid_id": "GRID_40.7_-74.0",
+                    "time": "2026-10-18T20:00",
+                    "temperature_2m": 15.0,
+                    "precipitation": 4.0,
+                    "surface_pressure": 1013.0,
+                    "wind_speed_10m": 5.0,
+                    "wind_gusts_10m": 10.0,
+                },
+            ]
+            bronze_in = tmp_path / "bronze_weather"
+            silver_out = tmp_path / "silver_weather"
+            ledger_file = tmp_path / "quality" / "sensor_anomaly_ledger.parquet"
+            bronze_in.mkdir()
+            pd.DataFrame(mock_weather).to_parquet(bronze_in / "part_0000.parquet", index=False)
+
+            res = clean_and_validate_weather(
+                bronze_weather_dir=bronze_in,
+                silver_weather_dir=silver_out,
+                anomaly_ledger_path=ledger_file,
+            )
+            self.assertEqual(res["valid_rows"], 4)
+
+            clean_files = list(silver_out.glob("**/*.parquet"))
+            df_w = pd.concat([pd.read_parquet(f) for f in clean_files]).sort_values("timestamp_utc").reset_index(drop=True)
+
+            # Hour 1 raw precipitation was masked to NaN
+            self.assertTrue(pd.isna(df_w.loc[1, "precipitation"]))
+
+            # Hour 2 3-hour sum must be 2.0 + 3.0 = 5.0 (corrupt -999.0 was excluded)
+            self.assertEqual(df_w.loc[2, "precip_past_3h_mm"], 5.0)
+
+            # Hour 10 (after 8-hour gap) must ONLY sum Hour 10 (4.0 mm), ignoring Hour 2 from 8 hours ago
+            self.assertEqual(df_w.loc[3, "precip_past_3h_mm"], 4.0)
+
+            # Ledger must contain the negative precipitation violation
+            df_ledger = pd.read_parquet(ledger_file)
+            self.assertIn("PRECIPITATION_OUT_OF_BOUNDS", df_ledger["rule_violated"].values)
+
+    def test_multiple_unkeyed_records_all_quarantined_without_cdc_drop(self):
+        """
+        Verify that multiple unkeyed/invalid records are ALL routed to quarantine,
+        and not collapsed/dropped as duplicates of null by CDC deduplication.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            mock_records = [
+                # Unkeyed row 1
+                {
+                    "unique_key": None,
+                    "created_date": "2026-10-18T10:00:00.000",
+                    "complaint_type": "Noise",
+                    "borough": "MANHATTAN",
+                    "_batch_id": "b1",
+                },
+                # Unkeyed row 2 (different complaint)
+                {
+                    "unique_key": None,
+                    "created_date": "2026-10-18T10:05:00.000",
+                    "complaint_type": "Illegal Parking",
+                    "borough": "BROOKLYN",
+                    "_batch_id": "b1",
+                },
+                # Invalid text key row 3
+                {
+                    "unique_key": "CORRUPT_KEY",
+                    "created_date": "2026-10-18T10:10:00.000",
+                    "complaint_type": "Pothole",
+                    "borough": "QUEENS",
+                    "_batch_id": "b1",
+                },
+                # Valid row 4
+                {
+                    "unique_key": "55555",
+                    "created_date": "2026-10-18T10:15:00.000",
+                    "complaint_type": "Heat/Hot Water",
+                    "borough": "BRONX",
+                    "latitude": "40.8500",
+                    "longitude": "-73.9000",
+                    "_batch_id": "b1",
+                },
+            ]
+            bronze_in = tmp_path / "bronze"
+            silver_out = tmp_path / "silver"
+            quar_out = tmp_path / "quarantine"
+            bronze_in.mkdir()
+            pd.DataFrame(mock_records).to_parquet(bronze_in / "part_0000.parquet", index=False)
+
+            res = clean_and_validate_311(bronze_in, silver_out, quar_out)
+            self.assertEqual(res["input_rows"], 4)
+            # Crucial: ALL 3 invalid records must be in quarantine! None dropped by CDC dedup!
+            self.assertEqual(res["quarantined_rows"], 3)
+            self.assertEqual(res["valid_rows_accepted"], 1)
+
+            df_quar = pd.read_parquet(quar_out / "quarantined_311.parquet")
+            self.assertEqual(len(df_quar), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

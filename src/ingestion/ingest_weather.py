@@ -50,6 +50,13 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("ingest_weather")
 
 
+def get_relative_path(path: Path) -> str:
+    """Safely return path relative to PROJECT_ROOT, or as_posix if outside PROJECT_ROOT."""
+    try:
+        return path.relative_to(PROJECT_ROOT).as_posix()
+    except ValueError:
+        return path.as_posix()
+
 def compute_weather_row_hashes(df: pd.DataFrame) -> List[str]:
     """Compute deterministic SHA-256 hash for each hourly observation row."""
     # Hash time + grid_id + temperature + precipitation + wind
@@ -172,7 +179,7 @@ def run_weather_ingestion(
     manifest_files_list: List[Dict[str, Any]] = [
         {
             "file_name": landing_file.name,
-            "relative_path": landing_file.relative_to(PROJECT_ROOT).as_posix(),
+            "relative_path": get_relative_path(landing_file),
             "layer": "landing",
             "rows": sum(len(loc.get("hourly", {}).get("time", [])) for loc in locations_data),
             "bytes": landing_bytes,
@@ -206,7 +213,7 @@ def run_weather_ingestion(
         row_hashes = compute_weather_row_hashes(df_grid)
         df_grid["_batch_id"] = batch_id
         df_grid["_ingested_at_utc"] = retrieved_at_utc
-        df_grid["_source_file"] = landing_file.relative_to(PROJECT_ROOT).as_posix()
+        df_grid["_source_file"] = get_relative_path(landing_file)
         df_grid["_source_name"] = SOURCE_NAME_WEATHER
         df_grid["_extraction_mode"] = mode
         df_grid["_schema_version"] = SCHEMA_VERSION
@@ -234,7 +241,7 @@ def run_weather_ingestion(
 
             manifest_files_list.append({
                 "file_name": parquet_file.name,
-                "relative_path": parquet_file.relative_to(PROJECT_ROOT).as_posix(),
+                "relative_path": get_relative_path(parquet_file),
                 "layer": "bronze",
                 "rows": len(year_group),
                 "bytes": p_bytes,

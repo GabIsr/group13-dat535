@@ -190,26 +190,11 @@ def clean_and_validate_311(
     input_rows = df_raw_spark.count()
     logger.info(f"Loaded {input_rows:,} raw 311 records from Bronze via PySpark.")
 
-    # 1. CDC Deduplication via PySpark Window (Lab 3 requirement)
-    cols = set(df_raw_spark.columns)
-    if "_ingested_at_utc" in cols:
-        order_col = col("_ingested_at_utc").desc()
-    elif "created_date" in cols:
-        order_col = col("created_date").desc()
-    else:
-        order_col = col("unique_key").desc()
-
-    w_dedup = Window.partitionBy("unique_key").orderBy(order_col)
-    df_dedup_spark = df_raw_spark.withColumn("_rn", row_number().over(w_dedup)).filter(col("_rn") == 1).drop("_rn")
-    df_dedup_spark.persist(StorageLevel.MEMORY_AND_DISK)
-    dedup_count = df_dedup_spark.count()
-    duplicate_rows_removed = input_rows - dedup_count
-    logger.info(f"Deduplication (PySpark): removed {duplicate_rows_removed:,} duplicate records on unique_key.")
-
-    # 2. PySpark Timestamp Normalization (America/New_York -> UTC) & Temporal Validation
+    # 1. PySpark Timestamp Normalization (America/New_York -> UTC) & Temporal Validation on Raw Bronze
     # Normalize created_date to UTC timestamp directly within Spark SQL
+    cols = set(df_raw_spark.columns)
     created_ts = to_utc_timestamp(to_timestamp(col("created_date")), "America/New_York")
-    df_spark_proc = df_dedup_spark.withColumn("created_at_utc", created_ts)
+    df_spark_proc = df_raw_spark.withColumn("created_at_utc", created_ts)
 
     if "closed_date" in df_spark_proc.columns:
         closed_ts = to_utc_timestamp(to_timestamp(col("closed_date")), "America/New_York")
@@ -251,7 +236,8 @@ def clean_and_validate_311(
     df_spark_proc = df_spark_proc.withColumn("is_weekend", col("day_of_week").isin([5, 6]))
     df_spark_proc = df_spark_proc.withColumn("month_of_year", spark_month(local_ts))
 
-    # 3. Hard Quarantine Boundary Validation (Spark SQL Boolean Predicates)
+    # 2. Hard Quarantine Boundary Validation (Spark SQL Boolean Predicates on Raw Stream)
+    # Evaluated BEFORE deduplication so corrupted/unkeyed records are NEVER dropped as duplicates of null!
     parsed_keys = col("unique_key").cast("long")
     launch_epoch = int(datetime(2003, 3, 1, tzinfo=timezone.utc).timestamp())
     future_grace_epoch = now_epoch + 7200
@@ -280,7 +266,23 @@ def clean_and_validate_311(
     )
 
     df_quarantined_spark = df_spark_proc.filter(quarantine_cond)
-    df_valid_spark = df_spark_proc.filter(~quarantine_cond)
+    df_valid_candidates = df_spark_proc.filter(~quarantine_cond)
+
+    # 3. CDC Deduplication via PySpark Window (on Valid Records with Known Unique Key)
+    if "_ingested_at_utc" in cols:
+        order_col = col("_ingested_at_utc").desc()
+    elif "created_date" in cols:
+        order_col = col("created_date").desc()
+    else:
+        order_col = col("unique_key").desc()
+
+    w_dedup = Window.partitionBy("unique_key").orderBy(order_col)
+    df_valid_spark = df_valid_candidates.withColumn("_rn", row_number().over(w_dedup)).filter(col("_rn") == 1).drop("_rn")
+    df_valid_spark.persist(StorageLevel.MEMORY_AND_DISK)
+    valid_count = df_valid_spark.count()
+    duplicate_rows_removed = df_valid_candidates.count() - valid_count
+    if duplicate_rows_removed > 0:
+        logger.info(f"Deduplication (PySpark): removed {duplicate_rows_removed:,} duplicate records on unique_key.")
 
     # 3b. Hierarchical Spatial Imputation & Haversine Distance in PySpark
     raw_lats = col("latitude").cast("double") if "latitude" in cols else lit(None).cast("double")
@@ -443,7 +445,6 @@ def clean_and_validate_311(
     # Retain only valid records for clean Silver and enforce Int64 primary key
     df_valid = df_valid_spark.toPandas().copy()
     df_valid_spark.unpersist()
-    df_dedup_spark.unpersist()
 
     df_valid["created_at_utc"] = pd.to_datetime(df_valid["created_at_utc"], utc=True)
     if "closed_at_utc" in df_valid.columns:
@@ -689,8 +690,6 @@ def clean_and_validate_311(
         table = pa.Table.from_pandas(save_df, preserve_index=False)
         pq.write_table(table, out_path, compression="snappy")
         written_files += 1
-
-    df_dedup_spark.unpersist()
 
     elapsed = time.time() - start_time
     logger.info(

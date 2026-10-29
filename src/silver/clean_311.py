@@ -288,7 +288,7 @@ def clean_and_validate_311(
 
     if "incident_zip" in cols:
         extracted_zips = regexp_extract(col("incident_zip").cast("string"), r"(\d{5})", 1)
-        clean_zip_expr = when(extracted_zips.isin(["", "00000", "nan", "None"]), lit(None)).otherwise(extracted_zips)
+        clean_zip_expr = when(extracted_zips.isin(["", "nan", "None", "00000_invalid"]), lit(None)).otherwise(extracted_zips)
     else:
         clean_zip_expr = lit(None).cast("string")
 
@@ -466,52 +466,12 @@ def clean_and_validate_311(
         ~df_valid["clean_incident_zip"].str[:3].isin(NYC_METRO_ZIP_PREFIXES)
     )
 
-    # 3. Hierarchical Spatial Imputation (3 Levels)
-    # Parse coordinates to numeric
+    # 3. Spatial Resolution & Uncertainty Metrics (Computed natively in PySpark Catalyst)
+    # Parse coordinates to numeric for schema compliance
     raw_lats = pd.to_numeric(df_valid["latitude"], errors="coerce") if "latitude" in df_valid.columns else pd.Series(np.nan, index=df_valid.index)
     raw_lons = pd.to_numeric(df_valid["longitude"], errors="coerce") if "longitude" in df_valid.columns else pd.Series(np.nan, index=df_valid.index)
 
-    # Mask for Level 1: Valid Native GPS Coordinates within NYC bounds
-    mask_level1 = (
-        raw_lats.between(NYC_LAT_MIN, NYC_LAT_MAX) &
-        raw_lons.between(NYC_LON_MIN, NYC_LON_MAX)
-    )
-
-    # Initialize spatial columns
-    df_valid["clean_latitude"] = np.nan
-    df_valid["clean_longitude"] = np.nan
-    df_valid["grid_id"] = "UNKNOWN"
-    df_valid["spatial_resolution_level"] = "UNLOCATED"
-
-    # Apply Level 1: Exact GPS coordinates
-    df_valid.loc[mask_level1, "clean_latitude"] = raw_lats[mask_level1].round(6)
-    df_valid.loc[mask_level1, "clean_longitude"] = raw_lons[mask_level1].round(6)
-    grid_lat_1 = raw_lats[mask_level1].round(1).astype(str)
-    grid_lon_1 = raw_lons[mask_level1].round(1).astype(str)
-    df_valid.loc[mask_level1, "grid_id"] = "GRID_" + grid_lat_1 + "_" + grid_lon_1
-    df_valid.loc[mask_level1, "spatial_resolution_level"] = "EXACT_COORDINATES"
-
-    # Level 2: ZIP Code Centroid Fallback (directly uses standardized clean_incident_zip)
-    mask_need_level2 = ~mask_level1
-    zip_ref = load_zip_reference()
-
-    if not zip_ref.empty and "clean_incident_zip" in df_valid.columns:
-        zip_map_lat = zip_ref.set_index("zip5")["centroid_lat"].to_dict()
-        zip_map_lon = zip_ref.set_index("zip5")["centroid_lon"].to_dict()
-        zip_map_grid = zip_ref.set_index("zip5")["grid_id"].to_dict()
-
-        level2_zips = df_valid.loc[mask_need_level2, "clean_incident_zip"]
-        level2_lats = level2_zips.map(zip_map_lat)
-        mask_level2_matched = level2_lats.notna()
-
-        matched_indices = level2_lats[mask_level2_matched].index
-        df_valid.loc[matched_indices, "clean_latitude"] = level2_lats[mask_level2_matched]
-        df_valid.loc[matched_indices, "clean_longitude"] = level2_zips[mask_level2_matched].map(zip_map_lon)
-        df_valid.loc[matched_indices, "grid_id"] = level2_zips[mask_level2_matched].map(zip_map_grid)
-        df_valid.loc[matched_indices, "spatial_resolution_level"] = "ZIP_APPROXIMATION"
-
-    # Level 3: Borough Centroid Fallback
-    # First, validate and normalize NYC Boroughs (5 Legal Boroughs + UNSPECIFIED)
+    # Validate and normalize NYC Boroughs (5 Legal Boroughs + UNSPECIFIED)
     if "borough" in df_valid.columns:
         b_clean = standardize_string_series(df_valid["borough"], "UNSPECIFIED", case="upper")
         is_unrec_b = ~b_clean.isin(VALID_NYC_BOROUGHS)
@@ -523,18 +483,7 @@ def clean_and_validate_311(
         df_valid["is_valid_borough"] = True
         df_valid["unrecognized_borough_val"] = ""
 
-    mask_need_level3 = df_valid["spatial_resolution_level"] == "UNLOCATED"
-    borough_series = df_valid.loc[mask_need_level3, "borough"]
-
-    for borough_name, (b_lat, b_lon, b_grid) in BOROUGH_CENTROIDS.items():
-        b_mask = borough_series == borough_name
-        b_indices = borough_series[b_mask].index
-        df_valid.loc[b_indices, "clean_latitude"] = b_lat
-        df_valid.loc[b_indices, "clean_longitude"] = b_lon
-        df_valid.loc[b_indices, "grid_id"] = b_grid
-        df_valid.loc[b_indices, "spatial_resolution_level"] = "BOROUGH_APPROXIMATION"
-
-    # 4. Spatial Uncertainty Quantification (Fallback to vectorized NumPy/Pandas if not precomputed by PySpark)
+    # Fallback to vectorized NumPy/Pandas only if grid_distance_km was not precomputed by PySpark
     if "grid_distance_km" not in df_valid.columns or df_valid["grid_distance_km"].isna().all():
         grid_pattern = r"^GRID_([0-9.-]+)_([0-9.-]+)$"
         extracted_coords = df_valid["grid_id"].str.extract(grid_pattern)

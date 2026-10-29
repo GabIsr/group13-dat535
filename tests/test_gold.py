@@ -14,6 +14,7 @@ import pyarrow.parquet as pq
 
 from src.gold.build_agency_performance import build_agency_resolution_performance_mart
 from src.gold.build_service_demand import build_daily_service_demand_mart
+from src.gold.build_zip_vulnerability import build_zip_infrastructure_vulnerability_mart
 from src.gold.config import GOLD_MARTS_DIR
 
 
@@ -166,6 +167,130 @@ class TestGoldLayerPipeline(unittest.TestCase):
             self.assertEqual(row_oct12["median_resolution_duration_hours"], 48.0)
             self.assertEqual(row_oct12["active_open_backlog_count"], 1)
             self.assertEqual(row_oct12["long_open_backlog_count"], 1)  # ticket 202 is 2 days old > 1 day
+
+    def test_zip_infrastructure_vulnerability_mart_and_spatial_scorecard(self):
+        """Verify ZIP vulnerability multiplier, <NA> ZIP reconciliation, and spatial precision metrics."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            silver_joined = tmp_path / "silver_joined"
+            silver_weather = tmp_path / "silver_weather"
+            gold_marts = tmp_path / "gold_marts"
+
+            silver_joined.mkdir()
+            silver_weather.mkdir()
+            gold_marts.mkdir()
+
+            # 4 joined records: 3 in ZIP 11434 (2 wet, 1 dry) and 1 with missing <NA> ZIP
+            mock_joined = [
+                {
+                    "unique_key": 301,
+                    "clean_incident_zip": "11434",
+                    "borough": "QUEENS",
+                    "complaint_type": "Sewer",
+                    "grid_id": "GRID_40.7_-73.8",
+                    "spatial_resolution_level": "EXACT_COORDINATES",
+                    "grid_distance_km": 2.0,
+                    "is_raining": True,
+                    "precip_past_3h_mm": 6.0,
+                    "wind_gusts_10m": 15.0,
+                    "is_extreme_weather": False,
+                    "is_ticket_closed": True,
+                    "is_instant_closure": False,
+                    "resolution_duration_hours": 10.0,
+                },
+                {
+                    "unique_key": 302,
+                    "clean_incident_zip": "11434",
+                    "borough": "QUEENS",
+                    "complaint_type": "Sewer",
+                    "grid_id": "GRID_40.7_-73.8",
+                    "spatial_resolution_level": "EXACT_COORDINATES",
+                    "grid_distance_km": 4.0,
+                    "is_raining": True,
+                    "precip_past_3h_mm": 8.0,
+                    "wind_gusts_10m": 20.0,
+                    "is_extreme_weather": True,
+                    "is_ticket_closed": True,
+                    "is_instant_closure": True,
+                    "resolution_duration_hours": 0.0,
+                },
+                {
+                    "unique_key": 303,
+                    "clean_incident_zip": "11434",
+                    "borough": "QUEENS",
+                    "complaint_type": "Sewer",
+                    "grid_id": "GRID_40.7_-73.8",
+                    "spatial_resolution_level": "ZIP_APPROXIMATION",
+                    "grid_distance_km": 6.0,
+                    "is_raining": False,
+                    "precip_past_3h_mm": 0.0,
+                    "wind_gusts_10m": 5.0,
+                    "is_extreme_weather": False,
+                    "is_ticket_closed": True,
+                    "is_instant_closure": False,
+                    "resolution_duration_hours": 20.0,
+                },
+                {
+                    "unique_key": 304,
+                    "clean_incident_zip": None,
+                    "borough": "MANHATTAN",
+                    "complaint_type": "Noise",
+                    "grid_id": "GRID_40.7_-74.0",
+                    "spatial_resolution_level": "BOROUGH_APPROXIMATION",
+                    "grid_distance_km": 3.5,
+                    "is_raining": False,
+                    "precip_past_3h_mm": 0.0,
+                    "wind_gusts_10m": 4.0,
+                    "is_extreme_weather": False,
+                    "is_ticket_closed": False,
+                    "is_instant_closure": False,
+                    "resolution_duration_hours": np.nan,
+                },
+            ]
+            pd.DataFrame(mock_joined).to_parquet(silver_joined / "fact_311_weather.parquet", index=False)
+
+            # Mock weather for GRID_40.7_-73.8: 2 wet hours and 8 dry hours (10 hours total)
+            mock_weather = [
+                {
+                    "grid_id": "GRID_40.7_-73.8",
+                    "timestamp_utc": f"2026-10-18T{h:02d}:00:00Z",
+                    "is_raining": h < 2,
+                    "precip_past_3h_mm": 5.0 if h < 2 else 0.0,
+                    "precipitation": 2.5 if h < 2 else 0.0,
+                }
+                for h in range(10)
+            ]
+            pd.DataFrame(mock_weather).to_parquet(silver_weather / "clean_weather.parquet", index=False)
+
+            res = build_zip_infrastructure_vulnerability_mart(
+                silver_joined_dir=silver_joined,
+                silver_weather_dir=silver_weather,
+                output_dir=gold_marts,
+            )
+
+            # 100% reconciliation including the <NA> ZIP ticket
+            self.assertEqual(res["total_complaints_reconciled"], 4)
+            self.assertEqual(res["rows"], 2)
+
+            df_vuln = pd.read_parquet(res["output_path"])
+            grain_cols = ["incident_zip", "borough", "complaint_type"]
+            self.assertEqual(df_vuln.duplicated(subset=grain_cols).sum(), 0)
+
+            row_q = df_vuln[df_vuln["incident_zip"] == "11434"].iloc[0]
+            self.assertEqual(row_q["total_complaints"], 3)
+            self.assertEqual(row_q["wet_weather_complaints"], 2)
+            self.assertEqual(row_q["dry_weather_complaints"], 1)
+            # Wet rate = 2 / 2 = 1.0/hr; Dry rate = 1 / 8 = 0.125/hr -> Multiplier = 8.0x
+            self.assertEqual(row_q["storm_sensitivity_multiplier"], 8.0)
+            self.assertEqual(row_q["avg_grid_distance_km"], 4.0)
+            self.assertEqual(row_q["exact_gps_share_pct"], 66.7)
+            self.assertEqual(row_q["imputed_centroid_share_pct"], 33.3)
+            # Instant closure (0.0h) excluded from field resolution median -> median(10.0, 20.0) = 15.0
+            self.assertEqual(row_q["median_resolution_hours"], 15.0)
+
+            # Verify <NA> ZIP mapped to UNSPECIFIED
+            row_unspec = df_vuln[df_vuln["incident_zip"] == "UNSPECIFIED"].iloc[0]
+            self.assertEqual(row_unspec["total_complaints"], 1)
 
 
 if __name__ == "__main__":

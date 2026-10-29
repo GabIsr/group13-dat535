@@ -20,7 +20,7 @@ from src.silver.config import (
     WEATHER_EXTREME_THRESHOLDS,
     WEATHER_HARD_LIMITS,
 )
-from src.silver.clean_311 import clean_and_validate_311, to_utc_datetime, standardize_string_series, haversine_distance_km
+from src.silver.clean_311 import clean_and_validate_311, to_utc_datetime, standardize_string_series, haversine_distance_km, spark_haversine_distance_km
 from src.silver.clean_weather import clean_and_validate_weather
 from src.silver.join_silver import join_silver_datasets
 
@@ -757,6 +757,30 @@ class TestSilverLayerPipeline(unittest.TestCase):
         self.assertAlmostEqual(dist.iloc[1], 8.44, delta=0.2)
         # Point 3: coordinate with NaN -> distance is NaN
         self.assertTrue(pd.isna(dist.iloc[2]))
+
+    def test_spark_haversine_distance_vectorization(self):
+        """Verify PySpark Great-Circle Haversine distance calculations and null handling."""
+        try:
+            from pyspark.sql.functions import col
+            from src.utils.spark import get_spark_session
+            spark = get_spark_session("test_spark_haversine")
+        except Exception:
+            self.skipTest("PySpark / Java environment not available")
+
+        test_data = [
+            (40.7500, -73.9900, 40.7500, -73.9900),
+            (40.8000, -74.0000, 40.8000, -73.9000),
+            (None, -73.9900, 40.7500, None),
+        ]
+        df = spark.createDataFrame(test_data, ["lat1", "lon1", "lat2", "lon2"])
+        df_res = (
+            df.withColumn("dist", spark_haversine_distance_km(col("lat1"), col("lon1"), col("lat2"), col("lon2")))
+            .collect()
+        )
+
+        self.assertEqual(df_res[0]["dist"], 0.0)
+        self.assertAlmostEqual(df_res[1]["dist"], 8.44, delta=0.2)
+        self.assertIsNone(df_res[2]["dist"])
 
     def test_borough_validation(self):
         """Verify strict 5-borough normalization and soft quarantine/tagging of unstandardized boroughs."""

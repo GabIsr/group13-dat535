@@ -19,6 +19,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 from pyspark.sql.functions import (
     asin,
+    broadcast,
     col,
     concat,
     cos,
@@ -30,6 +31,7 @@ from pyspark.sql.functions import (
     lit,
     month as spark_month,
     radians,
+    regexp_extract,
     round as spark_round,
     row_number,
     sin,
@@ -37,6 +39,7 @@ from pyspark.sql.functions import (
     to_timestamp,
     to_utc_timestamp,
     trim,
+    upper,
     when,
 )
 from pyspark.sql.window import Window
@@ -150,6 +153,7 @@ def spark_haversine_distance_km(lat1_col, lon1_col, lat2_col, lon2_col):
     """
     Compute Great-Circle Haversine distance in km using pure PySpark SQL functions.
     Fully optimized inside Catalyst optimizer without Python serialization overhead.
+    Clips intermediate values to [0.0, 1.0] to safeguard against floating-point NaN in asin.
     """
     r_lat1 = radians(lat1_col)
     r_lon1 = radians(lon1_col)
@@ -158,7 +162,8 @@ def spark_haversine_distance_km(lat1_col, lon1_col, lat2_col, lon2_col):
     dlat = r_lat2 - r_lat1
     dlon = r_lon2 - r_lon1
     a = (sin(dlat / 2.0) ** 2) + cos(r_lat1) * cos(r_lat2) * (sin(dlon / 2.0) ** 2)
-    return spark_round(lit(6371.0) * lit(2.0) * asin(sqrt(a)), 3)
+    a_safe = when(a > 1.0, lit(1.0)).when(a < 0.0, lit(0.0)).otherwise(a)
+    return spark_round(lit(6371.0) * lit(2.0) * asin(sqrt(a_safe)), 2)
 
 
 def clean_and_validate_311(
@@ -276,6 +281,123 @@ def clean_and_validate_311(
 
     df_quarantined_spark = df_spark_proc.filter(quarantine_cond)
     df_valid_spark = df_spark_proc.filter(~quarantine_cond)
+
+    # 3b. Hierarchical Spatial Imputation & Haversine Distance in PySpark
+    raw_lats = col("latitude").cast("double") if "latitude" in cols else lit(None).cast("double")
+    raw_lons = col("longitude").cast("double") if "longitude" in cols else lit(None).cast("double")
+
+    if "incident_zip" in cols:
+        extracted_zips = regexp_extract(col("incident_zip").cast("string"), r"(\d{5})", 1)
+        clean_zip_expr = when(extracted_zips.isin(["", "00000", "nan", "None"]), lit(None)).otherwise(extracted_zips)
+    else:
+        clean_zip_expr = lit(None).cast("string")
+
+    df_valid_spark = df_valid_spark.withColumn("clean_incident_zip", clean_zip_expr)
+
+    # Level 1: Native GPS Coordinates within NYC bounds
+    mask_l1 = (
+        raw_lats.isNotNull()
+        & raw_lons.isNotNull()
+        & (raw_lats >= lit(NYC_LAT_MIN))
+        & (raw_lats <= lit(NYC_LAT_MAX))
+        & (raw_lons >= lit(NYC_LON_MIN))
+        & (raw_lons <= lit(NYC_LON_MAX))
+    )
+    clean_lat_l1 = spark_round(raw_lats, 6)
+    clean_lon_l1 = spark_round(raw_lons, 6)
+    grid_lat_1 = spark_round(raw_lats, 1).cast("string")
+    grid_lon_1 = spark_round(raw_lons, 1).cast("string")
+    grid_id_l1 = concat(lit("GRID_"), grid_lat_1, lit("_"), grid_lon_1)
+
+    # Level 2: ZIP Centroid Lookup (via Broadcast Join of Reference Table)
+    zip_ref = load_zip_reference()
+    if not zip_ref.empty:
+        z_sub = zip_ref[["zip5", "centroid_lat", "centroid_lon", "grid_id"]].rename(
+            columns={
+                "zip5": "_ref_zip5",
+                "centroid_lat": "_ref_lat",
+                "centroid_lon": "_ref_lon",
+                "grid_id": "_ref_grid",
+            }
+        )
+        df_zip_ref = spark.createDataFrame(z_sub)
+        df_valid_spark = df_valid_spark.join(
+            broadcast(df_zip_ref),
+            col("clean_incident_zip") == col("_ref_zip5"),
+            how="left",
+        ).drop("_ref_zip5")
+    else:
+        df_valid_spark = (
+            df_valid_spark.withColumn("_ref_lat", lit(None).cast("double"))
+            .withColumn("_ref_lon", lit(None).cast("double"))
+            .withColumn("_ref_grid", lit(None).cast("string"))
+        )
+
+    # Level 3: Borough Centroid Fallback
+    b_lat_expr = lit(None).cast("double")
+    b_lon_expr = lit(None).cast("double")
+    b_grid_expr = lit("UNKNOWN")
+    b_col = upper(trim(col("borough"))) if "borough" in cols else lit("UNSPECIFIED")
+    for b_name, (lat_val, lon_val, grid_val) in BOROUGH_CENTROIDS.items():
+        b_cond = b_col == b_name
+        b_lat_expr = when(b_cond, lit(lat_val)).otherwise(b_lat_expr)
+        b_lon_expr = when(b_cond, lit(lon_val)).otherwise(b_lon_expr)
+        b_grid_expr = when(b_cond, lit(grid_val)).otherwise(b_grid_expr)
+
+    # Coalesce Hierarchical Resolution
+    df_valid_spark = df_valid_spark.withColumn(
+        "clean_latitude",
+        when(mask_l1, clean_lat_l1)
+        .when(col("_ref_lat").isNotNull(), col("_ref_lat"))
+        .when(b_lat_expr.isNotNull(), b_lat_expr)
+        .otherwise(lit(None).cast("double")),
+    )
+    df_valid_spark = df_valid_spark.withColumn(
+        "clean_longitude",
+        when(mask_l1, clean_lon_l1)
+        .when(col("_ref_lon").isNotNull(), col("_ref_lon"))
+        .when(b_lon_expr.isNotNull(), b_lon_expr)
+        .otherwise(lit(None).cast("double")),
+    )
+    df_valid_spark = df_valid_spark.withColumn(
+        "grid_id",
+        when(mask_l1, grid_id_l1)
+        .when(col("_ref_grid").isNotNull(), col("_ref_grid"))
+        .when(b_grid_expr != lit("UNKNOWN"), b_grid_expr)
+        .otherwise(lit("UNKNOWN")),
+    )
+    df_valid_spark = df_valid_spark.withColumn(
+        "spatial_resolution_level",
+        when(mask_l1, lit("EXACT_COORDINATES"))
+        .when(col("_ref_lat").isNotNull(), lit("ZIP_APPROXIMATION"))
+        .when(b_lat_expr.isNotNull(), lit("BOROUGH_APPROXIMATION"))
+        .otherwise(lit("UNLOCATED")),
+    ).drop("_ref_lat", "_ref_lon", "_ref_grid")
+
+    # 4. Spatial Uncertainty Quantification (Great-Circle Haversine Distance in Catalyst PySpark)
+    grid_pattern = r"^GRID_([0-9.-]+)_([0-9.-]+)$"
+    grid_center_lat = regexp_extract(col("grid_id"), grid_pattern, 1).cast("double")
+    grid_center_lon = regexp_extract(col("grid_id"), grid_pattern, 2).cast("double")
+    has_coords = (
+        col("clean_latitude").isNotNull()
+        & col("clean_longitude").isNotNull()
+        & grid_center_lat.isNotNull()
+        & grid_center_lon.isNotNull()
+    )
+
+    df_valid_spark = df_valid_spark.withColumn(
+        "grid_distance_km",
+        when(
+            has_coords,
+            spark_haversine_distance_km(
+                col("clean_latitude"),
+                col("clean_longitude"),
+                grid_center_lat,
+                grid_center_lon,
+            ),
+        ).otherwise(lit(None).cast("double")),
+    )
+
     df_valid_spark.persist(StorageLevel.MEMORY_AND_DISK)
 
     df_quarantined = df_quarantined_spark.toPandas().copy()
@@ -412,18 +534,19 @@ def clean_and_validate_311(
         df_valid.loc[b_indices, "grid_id"] = b_grid
         df_valid.loc[b_indices, "spatial_resolution_level"] = "BOROUGH_APPROXIMATION"
 
-    # 4. Spatial Uncertainty Quantification (Great-Circle Haversine Distance to Assigned ERA5 Grid Center)
-    grid_pattern = r"^GRID_([0-9.-]+)_([0-9.-]+)$"
-    extracted_coords = df_valid["grid_id"].str.extract(grid_pattern)
-    grid_center_lat = pd.to_numeric(extracted_coords[0], errors="coerce")
-    grid_center_lon = pd.to_numeric(extracted_coords[1], errors="coerce")
+    # 4. Spatial Uncertainty Quantification (Fallback to vectorized NumPy/Pandas if not precomputed by PySpark)
+    if "grid_distance_km" not in df_valid.columns or df_valid["grid_distance_km"].isna().all():
+        grid_pattern = r"^GRID_([0-9.-]+)_([0-9.-]+)$"
+        extracted_coords = df_valid["grid_id"].str.extract(grid_pattern)
+        grid_center_lat = pd.to_numeric(extracted_coords[0], errors="coerce")
+        grid_center_lon = pd.to_numeric(extracted_coords[1], errors="coerce")
 
-    df_valid["grid_distance_km"] = haversine_distance_km(
-        df_valid["clean_latitude"],
-        df_valid["clean_longitude"],
-        grid_center_lat,
-        grid_center_lon,
-    )
+        df_valid["grid_distance_km"] = haversine_distance_km(
+            df_valid["clean_latitude"],
+            df_valid["clean_longitude"],
+            grid_center_lat,
+            grid_center_lon,
+        )
 
     # Spatial resolution statistics
     spatial_stats = df_valid["spatial_resolution_level"].value_counts().to_dict()

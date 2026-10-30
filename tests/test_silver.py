@@ -1099,6 +1099,139 @@ class TestSilverLayerPipeline(unittest.TestCase):
             df_quar = pd.read_parquet(quar_out / "quarantined_311.parquet")
             self.assertEqual(len(df_quar), 3)
 
+    def test_cdc_dedup_prioritizes_source_updated_at_over_ingestion_time(self):
+        """
+        Verify that CDC deduplication prioritizes source_updated_at over _ingested_at_utc.
+        Simulates an out-of-order backfill: a 2025 backfill (OPEN) ingested LATER at 12:00
+        must NOT overwrite a 2026 batch (CLOSED) that was ingested EARLIER at 10:00!
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            bronze_in = tmp_path / "bronze"
+            silver_out = tmp_path / "silver"
+            quar_out = tmp_path / "quarantine"
+            bronze_in.mkdir()
+
+            mock_records = [
+                # Record 1: From 2026 batch (ingested at 10:00, but updated on Socrata on 2026-01-15: CLOSED)
+                {
+                    "unique_key": "999999",
+                    "created_date": "2025-12-20T10:00:00.000",
+                    "closed_date": "2026-01-15T12:00:00.000",
+                    "status": "CLOSED",
+                    "agency": "NYPD",
+                    "complaint_type": "Noise",
+                    "borough": "MANHATTAN",
+                    "latitude": "40.7500",
+                    "longitude": "-73.9900",
+                    "source_updated_at": "2026-01-15T12:00:00.000Z",
+                    "source_created_at": "2025-12-20T15:05:00.000Z",
+                    "_ingested_at_utc": "2026-10-30T10:00:00Z",
+                    "_batch_id": "b_2026",
+                },
+                # Record 2: From historical 2025 backfill (ingested at 12:00, but Socrata update was 2025-12-20: OPEN)
+                {
+                    "unique_key": "999999",
+                    "created_date": "2025-12-20T10:00:00.000",
+                    "closed_date": None,
+                    "status": "OPEN",
+                    "agency": "NYPD",
+                    "complaint_type": "Noise",
+                    "borough": "MANHATTAN",
+                    "latitude": "40.7500",
+                    "longitude": "-73.9900",
+                    "source_updated_at": "2025-12-20T10:00:00.000Z",
+                    "source_created_at": "2025-12-20T15:05:00.000Z",
+                    "_ingested_at_utc": "2026-10-30T12:00:00Z",
+                    "_batch_id": "b_2025",
+                },
+            ]
+            pd.DataFrame(mock_records).to_parquet(bronze_in / "part_0000.parquet", index=False)
+
+            res = clean_and_validate_311(bronze_in, silver_out, quar_out)
+            self.assertEqual(res["input_rows"], 2)
+            self.assertEqual(res["duplicate_rows_removed"], 1)
+            self.assertEqual(res["valid_rows_accepted"], 1)
+
+            clean_files = list(silver_out.glob("**/*.parquet"))
+            df_res = pd.concat([pd.read_parquet(f) for f in clean_files])
+            winner = df_res.iloc[0]
+
+            # The 2026 update MUST win because source_updated_at was 2026-01-15!
+            self.assertEqual(winner["status"], "CLOSED")
+            self.assertEqual(str(winner["_batch_id"]), "b_2026")
+            self.assertIn("source_intake_lag_hours", df_res.columns)
+            self.assertAlmostEqual(winner["source_intake_lag_hours"], 0.08, delta=0.05)
+
+    def test_weather_soil_and_cloud_cover_bounds_and_flags(self):
+        """
+        Verify validation of extended meteorological variables:
+        soil_temperature_0_to_7cm, soil_moisture_0_to_7cm, and cloud_cover.
+        """
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            bronze_in = tmp_path / "bronze_weather"
+            silver_out = tmp_path / "silver_weather"
+            ledger_file = tmp_path / "quality" / "sensor_anomaly_ledger.parquet"
+            bronze_in.mkdir()
+
+            mock_weather = [
+                # Row 1: Valid sub-zero soil temp -> is_ground_frozen, saturated moisture -> is_soil_saturated, overcast
+                {
+                    "grid_id": "GRID_40.7_-74.0",
+                    "time": "2026-10-18T10:00",
+                    "temperature_2m": -3.0,
+                    "precipitation": 2.0,
+                    "surface_pressure": 1013.0,
+                    "wind_speed_10m": 5.0,
+                    "wind_gusts_10m": 10.0,
+                    "soil_temperature_0_to_7cm": -1.5,
+                    "soil_moisture_0_to_7cm": 0.45,
+                    "cloud_cover": 95,
+                },
+                # Row 2: Corrupted soil temp (999.0) and corrupted soil moisture (-5.0) -> masked to NaN
+                {
+                    "grid_id": "GRID_40.7_-74.0",
+                    "time": "2026-10-18T11:00",
+                    "temperature_2m": 15.0,
+                    "precipitation": 0.0,
+                    "surface_pressure": 1013.0,
+                    "wind_speed_10m": 5.0,
+                    "wind_gusts_10m": 10.0,
+                    "soil_temperature_0_to_7cm": 999.0,  # Corrupt
+                    "soil_moisture_0_to_7cm": -5.0,     # Corrupt
+                    "cloud_cover": 20,
+                },
+            ]
+            pd.DataFrame(mock_weather).to_parquet(bronze_in / "part_0000.parquet", index=False)
+
+            res = clean_and_validate_weather(
+                bronze_weather_dir=bronze_in,
+                silver_weather_dir=silver_out,
+                anomaly_ledger_path=ledger_file,
+            )
+            self.assertEqual(res["valid_rows"], 2)
+            self.assertEqual(res["sensor_anomalies_logged"], 2)
+
+            clean_files = list(silver_out.glob("**/*.parquet"))
+            df_w = pd.concat([pd.read_parquet(f) for f in clean_files]).sort_values("timestamp_utc").reset_index(drop=True)
+
+            # Row 1 checks:
+            self.assertTrue(df_w.loc[0, "is_ground_frozen"])
+            self.assertTrue(df_w.loc[0, "is_soil_saturated"])
+            self.assertTrue(df_w.loc[0, "is_overcast"])
+
+            # Row 2 checks (corrupt sensors masked):
+            self.assertTrue(np.isnan(df_w.loc[1, "soil_temperature_0_to_7cm"]))
+            self.assertTrue(np.isnan(df_w.loc[1, "soil_moisture_0_to_7cm"]))
+            self.assertFalse(df_w.loc[1, "is_ground_frozen"])
+            self.assertFalse(df_w.loc[1, "is_soil_saturated"])
+
+            # Anomaly ledger checks:
+            df_ledger = pd.read_parquet(ledger_file)
+            self.assertIn("SOIL_TEMP_OUT_OF_BOUNDS", df_ledger["rule_violated"].values)
+            self.assertIn("SOIL_MOISTURE_OUT_OF_BOUNDS", df_ledger["rule_violated"].values)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -21,6 +21,7 @@ from src.utils.manifest import (
     compute_schema_fingerprint,
     create_manifest_dict,
     generate_batch_id,
+    get_latest_cdc_watermark,
     get_latest_watermark,
     is_batch_completed,
     save_manifest,
@@ -40,8 +41,16 @@ class TestIngestionPipeline(unittest.TestCase):
             self.assertIn(pt["borough_hint"], ["MANHATTAN", "BRONX", "BROOKLYN", "QUEENS", "STATEN ISLAND"])
 
     def test_weather_variables_list(self):
-        """Ensure all required core meteorological variables are configured."""
-        required = ["temperature_2m", "precipitation", "wind_speed_10m", "relative_humidity_2m"]
+        """Ensure all required core and extended meteorological variables are configured."""
+        required = [
+            "temperature_2m",
+            "precipitation",
+            "wind_speed_10m",
+            "relative_humidity_2m",
+            "soil_temperature_0_to_7cm",
+            "soil_moisture_0_to_7cm",
+            "cloud_cover",
+        ]
         for var in required:
             self.assertIn(var, WEATHER_HOURLY_VARIABLES)
 
@@ -135,10 +144,26 @@ class TestIngestionPipeline(unittest.TestCase):
             landing_dir.mkdir(parents=True)
             bronze_dir = tmp_path / "bronze"
 
-            # Create mock compressed landing JSON
+            # Create mock compressed landing JSON including Socrata system columns :updated_at and :created_at
             mock_records = [
-                {"unique_key": "1001", "created_date": "2026-10-18T10:00:00.000", "complaint_type": "Noise", "latitude": "40.71", "longitude": "-74.00"},
-                {"unique_key": "1002", "created_date": "2026-10-19T14:30:00.000", "complaint_type": "Illegal Parking", "latitude": "40.75", "longitude": "-73.98"},
+                {
+                    "unique_key": "1001",
+                    "created_date": "2026-10-18T10:00:00.000",
+                    "complaint_type": "Noise",
+                    "latitude": "40.71",
+                    "longitude": "-74.00",
+                    ":updated_at": 1729245600,
+                    ":created_at": 1729245000,
+                },
+                {
+                    "unique_key": "1002",
+                    "created_date": "2026-10-19T14:30:00.000",
+                    "complaint_type": "Illegal Parking",
+                    "latitude": "40.75",
+                    "longitude": "-73.98",
+                    ":updated_at": "2026-10-19T14:35:00.000Z",
+                    ":created_at": "2026-10-19T14:30:00.000Z",
+                },
             ]
             gz_path = landing_dir / "raw_part_0000.json.gz"
             with gzip.open(gz_path, "wb") as f:
@@ -163,6 +188,72 @@ class TestIngestionPipeline(unittest.TestCase):
             self.assertIn("_raw_row_hash", df_bronze.columns)
             self.assertIn("_batch_id", df_bronze.columns)
             self.assertEqual(df_bronze["_batch_id"].iloc[0], "311_20261029_001")
+
+            # Verify colon columns :updated_at and :created_at were cleanly renamed to standard Bronze identifiers
+            self.assertIn("source_updated_at", df_bronze.columns)
+            self.assertIn("source_created_at", df_bronze.columns)
+            self.assertNotIn(":updated_at", df_bronze.columns)
+            self.assertNotIn(":created_at", df_bronze.columns)
+
+    def test_cdc_watermark_dual_mode_manifest_tracking(self):
+        """Verify that get_latest_cdc_watermark independently tracks :updated_at without corrupting backfill watermarks."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+
+            # 1. Backfill batch (targets created_date 2025, no cdc_watermark)
+            m_backfill = create_manifest_dict(
+                batch_id="311_2025_backfill",
+                dataset_name="nyc_311",
+                source_name="nyc_open_data",
+                source_dataset_id="erm2-nwe9",
+                source_url="https://data.cityofnewyork.us/resource/erm2-nwe9.json",
+                retrieved_at_utc="2026-10-30T10:00:00Z",
+                source_data_start="2025-01-01",
+                source_data_end="2025-12-31",
+                extraction_mode="backfill",
+                environment="dev",
+                code_version="git_test",
+                duration_seconds=5.0,
+                byte_size=50000,
+                row_count=1000,
+                schema_fingerprint="sha256:test",
+                status="success",
+                files=[],
+                cdc_updated_at_watermark=None,
+            )
+            save_manifest(m_backfill, output_dir=tmp_path)
+
+            # Incremental CDC watermark should still be None
+            self.assertIsNone(get_latest_cdc_watermark("nyc_311", manifests_dir=tmp_path))
+            # Standard watermark sees the 2025 backfill
+            self.assertEqual(get_latest_watermark("nyc_311", manifests_dir=tmp_path), "2025-12-31")
+
+            # 2. Incremental batch advances cdc_updated_at_watermark
+            m_incr = create_manifest_dict(
+                batch_id="311_20261030_001",
+                dataset_name="nyc_311",
+                source_name="nyc_open_data",
+                source_dataset_id="erm2-nwe9",
+                source_url="https://data.cityofnewyork.us/resource/erm2-nwe9.json",
+                retrieved_at_utc="2026-10-30T11:00:00Z",
+                source_data_start="2026-10-29",
+                source_data_end="2026-10-30",
+                extraction_mode="incremental",
+                environment="dev",
+                code_version="git_test",
+                duration_seconds=2.0,
+                byte_size=10000,
+                row_count=200,
+                schema_fingerprint="sha256:test",
+                status="success",
+                files=[],
+                cdc_updated_at_watermark="2026-10-30T10:45:00.000",
+            )
+            save_manifest(m_incr, output_dir=tmp_path)
+
+            # Both watermarks exist cleanly separated!
+            self.assertEqual(get_latest_cdc_watermark("nyc_311", manifests_dir=tmp_path), "2026-10-30T10:45:00.000")
+            self.assertEqual(get_latest_watermark("nyc_311", manifests_dir=tmp_path), "2026-10-30")
 
 
 if __name__ == "__main__":

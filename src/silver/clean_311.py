@@ -282,6 +282,20 @@ def clean_and_validate_311(
         when(~col("is_ticket_closed"), spark_round(open_age_secs / 86400.0, 2)).otherwise(lit(None).cast("double")),
     )
 
+    # Source timestamps normalization (Socrata :created_at and :updated_at)
+    if "source_updated_at" in cols:
+        df_spark_proc = df_spark_proc.withColumn("source_updated_at", to_timestamp(col("source_updated_at")))
+
+    if "source_created_at" in cols:
+        src_cr_ts = to_timestamp(col("source_created_at"))
+        df_spark_proc = df_spark_proc.withColumn("source_created_at", src_cr_ts)
+        intake_lag_secs = src_cr_ts.cast("long") - col("created_at_utc").cast("long")
+        df_spark_proc = df_spark_proc.withColumn(
+            "source_intake_lag_hours",
+            when(src_cr_ts.isNotNull() & col("created_at_utc").isNotNull(), spark_round(intake_lag_secs / 3600.0, 2))
+            .otherwise(lit(None).cast("double")),
+        )
+
     # Hourly join key for UTC weather alignment
     df_spark_proc = df_spark_proc.withColumn("weather_join_hour_utc", date_trunc("hour", col("created_at_utc")))
 
@@ -326,14 +340,19 @@ def clean_and_validate_311(
     df_valid_candidates = df_spark_proc.filter(~quarantine_cond)
 
     # 3. CDC Deduplication via PySpark Window (on Valid Records with Known Unique Key)
+    # Prioritizes true Socrata source mutation time (:updated_at) over arrival time (_ingested_at_utc),
+    # ensuring historical backfills never overwrite newer ticket states!
+    order_cols = []
+    if "source_updated_at" in cols:
+        order_cols.append(col("source_updated_at").desc())
     if "_ingested_at_utc" in cols:
-        order_col = col("_ingested_at_utc").desc()
-    elif "created_date" in cols:
-        order_col = col("created_date").desc()
-    else:
-        order_col = col("unique_key").desc()
+        order_cols.append(col("_ingested_at_utc").desc())
+    if "created_date" in cols:
+        order_cols.append(col("created_date").desc())
+    if not order_cols:
+        order_cols.append(col("unique_key").desc())
 
-    w_dedup = Window.partitionBy("unique_key").orderBy(order_col)
+    w_dedup = Window.partitionBy("unique_key").orderBy(*order_cols)
     df_valid_spark = df_valid_candidates.withColumn("_rn", row_number().over(w_dedup)).filter(col("_rn") == 1).drop("_rn")
     df_valid_spark.persist(StorageLevel.MEMORY_AND_DISK)
     valid_count = df_valid_spark.count()

@@ -89,6 +89,35 @@ def get_latest_watermark(dataset_name: str, manifests_dir: Path = MANIFESTS_DIR)
     return latest_watermark
 
 
+def get_latest_cdc_watermark(dataset_name: str, manifests_dir: Path = MANIFESTS_DIR) -> Optional[str]:
+    """
+    Inspect existing successful manifests for a dataset to determine the highest cdc_updated_at_watermark.
+    Returns None if no previous incremental CDC batches exist.
+    """
+    manifests_dir = Path(manifests_dir)
+    if not manifests_dir.exists():
+        return None
+
+    pattern = f"{dataset_name}_*.json"
+    manifest_files = list(manifests_dir.glob(pattern))
+    if not manifest_files:
+        return None
+
+    latest_cdc_watermark = None
+    for mf in manifest_files:
+        try:
+            with open(mf, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("status") == "success" and data.get("cdc_updated_at_watermark"):
+                val = str(data["cdc_updated_at_watermark"])
+                if latest_cdc_watermark is None or val > latest_cdc_watermark:
+                    latest_cdc_watermark = val
+        except Exception:
+            continue
+
+    return latest_cdc_watermark
+
+
 def is_batch_completed(batch_id: str, dataset_name: str, manifests_dir: Path = MANIFESTS_DIR) -> bool:
     """Check if an ingestion batch manifest already exists with status 'success' (idempotency check)."""
     manifest_path = Path(manifests_dir) / f"{dataset_name}_{batch_id}.json"
@@ -120,9 +149,10 @@ def create_manifest_dict(
     schema_fingerprint: str,
     status: str,
     files: List[Dict[str, Any]],
+    cdc_updated_at_watermark: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Construct a Tier 1 manifest dictionary complying strictly with specification."""
-    return {
+    d = {
         "batch_id": batch_id,
         "dataset_name": dataset_name,
         "source_name": source_name,
@@ -141,6 +171,9 @@ def create_manifest_dict(
         "status": status,
         "files": files,
     }
+    if cdc_updated_at_watermark:
+        d["cdc_updated_at_watermark"] = cdc_updated_at_watermark
+    return d
 
 
 def save_manifest(

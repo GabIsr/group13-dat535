@@ -44,6 +44,7 @@ from src.utils.manifest import (
     create_manifest_dict,
     generate_batch_id,
     get_git_commit_hash,
+    get_latest_cdc_watermark,
     get_latest_watermark,
     is_batch_completed,
     save_manifest,
@@ -76,16 +77,19 @@ def compute_row_hashes(df: pd.DataFrame, exclude_cols: Optional[List[str]] = Non
 
 def fetch_socrata_page(
     where_clause: Optional[str] = None,
+    order_clause: str = "created_date ASC",
+    select_clause: str = "*, :updated_at, :created_at",
     limit: int = 50000,
     offset: int = 0,
     app_token: Optional[str] = None,
     timeout: int = 60,
 ) -> Tuple[List[Dict[str, Any]], bytes]:
-    """Fetch a single page of records from Socrata API."""
+    """Fetch a single page of records from Socrata API, capturing system timestamps."""
     params: Dict[str, str] = {
+        "$select": select_clause,
         "$limit": str(limit),
         "$offset": str(offset),
-        "$order": "created_date ASC",
+        "$order": order_clause,
     }
     if where_clause:
         params["$where"] = where_clause
@@ -116,6 +120,21 @@ def write_bronze_partitioned(
     Returns file metadata list for the manifest.
     """
     written_files = []
+
+    # Standardize Socrata system metadata (:updated_at, :created_at) to clean Bronze identifiers
+    if ":updated_at" in df.columns:
+        df = df.rename(columns={":updated_at": "source_updated_at"})
+    if "source_updated_at" in df.columns:
+        df["source_updated_at"] = pd.to_datetime(df["source_updated_at"], unit="s", errors="coerce").fillna(
+            pd.to_datetime(df["source_updated_at"], errors="coerce")
+        )
+
+    if ":created_at" in df.columns:
+        df = df.rename(columns={":created_at": "source_created_at"})
+    if "source_created_at" in df.columns:
+        df["source_created_at"] = pd.to_datetime(df["source_created_at"], unit="s", errors="coerce").fillna(
+            pd.to_datetime(df["source_created_at"], errors="coerce")
+        )
 
     if "created_date" in df.columns:
         dt_series = pd.to_datetime(df["created_date"], errors="coerce")
@@ -182,6 +201,27 @@ def convert_landing_to_bronze_pyspark(
     if total_rows == 0:
         logger.warning(f"Landing files for batch {batch_id} contain 0 records.")
         return []
+
+    # Standardize Socrata system metadata (:updated_at, :created_at) before hashing
+    if ":updated_at" in df_raw.columns:
+        df_raw = df_raw.withColumnRenamed(":updated_at", "source_updated_at")
+    if "source_updated_at" in df_raw.columns:
+        upd_c = col("source_updated_at")
+        df_raw = df_raw.withColumn(
+            "source_updated_at",
+            when(upd_c.cast("long").isNotNull() & (upd_c.cast("long") > 100000000), upd_c.cast("long").cast("timestamp"))
+            .otherwise(to_timestamp(upd_c))
+        )
+
+    if ":created_at" in df_raw.columns:
+        df_raw = df_raw.withColumnRenamed(":created_at", "source_created_at")
+    if "source_created_at" in df_raw.columns:
+        cr_c = col("source_created_at")
+        df_raw = df_raw.withColumn(
+            "source_created_at",
+            when(cr_c.cast("long").isNotNull() & (cr_c.cast("long") > 100000000), cr_c.cast("long").cast("timestamp"))
+            .otherwise(to_timestamp(cr_c))
+        )
 
     # Vectorized SHA-256 row hashing across all payload columns
     cols_to_hash = sorted([c for c in df_raw.columns if not c.startswith("_")])
@@ -426,36 +466,36 @@ def run_311_ingestion(
                 break
 
     else:
-        # Network API Ingestion (incremental or backfill)
+        # Network API Ingestion (incremental CDC or backfill)
         where_conditions: List[str] = []
+        source_max_updated_at: Optional[str] = None
+        order_clause = "created_date ASC"
 
         if mode == "incremental":
-            last_watermark = get_latest_watermark(DATASET_311, manifests_dir=manifests_dir)
-            if last_watermark:
-                logger.info(f"Discovered previous watermark: {last_watermark}")
-                try:
-                    dt_watermark = pd.to_datetime(last_watermark)
-                    lookback_dt = dt_watermark - pd.Timedelta(days=lookback_days)
-                    lookback_iso = lookback_dt.strftime("%Y-%m-%dT%H:%M:%S.000")
-                    logger.info(
-                        f"Incremental CDC Strategy: Querying created_date >= '{lookback_iso}' "
-                        f"(watermark: {last_watermark} with {lookback_days}-day lookback window for status updates)"
-                    )
-                    where_conditions.append(f"created_date >= '{lookback_iso}'")
-                except Exception as e:
-                    logger.warning(f"Could not calculate lookback date from watermark '{last_watermark}': {e}. Falling back to strict watermark.")
-                    where_conditions.append(f"created_date > '{last_watermark}'")
+            last_cdc_watermark = get_latest_cdc_watermark(DATASET_311, manifests_dir=manifests_dir)
+            if last_cdc_watermark:
+                logger.info(f"Incremental CDC Strategy: Querying :updated_at > '{last_cdc_watermark}'")
+                where_conditions.append(f":updated_at > '{last_cdc_watermark}'")
+                order_clause = ":updated_at ASC"
             else:
-                logger.warning("No previous watermark found for incremental mode. Ingesting past 7 days.")
-                where_conditions.append("created_date >= '2026-10-15T00:00:00.000'")
-
-        if start_date:
-            where_conditions.append(f"created_date >= '{start_date}'")
-        if end_date:
-            where_conditions.append(f"created_date <= '{end_date}'")
+                last_watermark = get_latest_watermark(DATASET_311, manifests_dir=manifests_dir)
+                if last_watermark:
+                    logger.info(f"Discovered initial created_date watermark: {last_watermark}. Bootstrapping incremental stream.")
+                    where_conditions.append(f"created_date >= '{last_watermark}'")
+                else:
+                    logger.warning("No previous watermark found for incremental mode. Ingesting past 7 days.")
+                    where_conditions.append("created_date >= '2026-10-15T00:00:00.000'")
+                order_clause = "created_date ASC"
+        else:
+            # Backfill mode: strictly by created_date, does NOT advance CDC watermark
+            order_clause = "created_date ASC"
+            if start_date:
+                where_conditions.append(f"created_date >= '{start_date}'")
+            if end_date:
+                where_conditions.append(f"created_date <= '{end_date}'")
 
         where_clause = " AND ".join(where_conditions) if where_conditions else None
-        logger.info(f"Socrata SoQL filter: {where_clause}")
+        logger.info(f"Socrata SoQL filter: {where_clause} | Order: {order_clause}")
 
         offset = 0
         part_idx = 0
@@ -470,6 +510,8 @@ def run_311_ingestion(
             logger.info(f"Fetching page offset {offset:,} (limit {current_limit:,})...")
             records, raw_bytes = fetch_socrata_page(
                 where_clause=where_clause,
+                order_clause=order_clause,
+                select_clause="*, :updated_at, :created_at",
                 limit=current_limit,
                 offset=offset,
                 app_token=app_token,
@@ -488,6 +530,13 @@ def run_311_ingestion(
                 page_max = str(df_page["created_date"].max())
                 source_min_date = page_min if source_min_date is None else min(source_min_date, page_min)
                 source_max_date = page_max if source_max_date is None else max(source_max_date, page_max)
+
+            # Track latest Socrata mutation timestamp for CDC watermark
+            upd_col_name = ":updated_at" if ":updated_at" in df_page.columns else ("source_updated_at" if "source_updated_at" in df_page.columns else None)
+            if upd_col_name:
+                p_upd_max = str(df_page[upd_col_name].dropna().max())
+                if p_upd_max and p_upd_max != "nan":
+                    source_max_updated_at = p_upd_max if source_max_updated_at is None else max(source_max_updated_at, p_upd_max)
 
             # Write Landing JSON.GZ
             landing_filename = f"raw_part_{part_idx:04d}.json.gz"
@@ -562,6 +611,7 @@ def run_311_ingestion(
         schema_fingerprint=schema_fingerprint,
         status="success" if total_rows > 0 else "partial",
         files=manifest_files_list,
+        cdc_updated_at_watermark=source_max_updated_at if mode == "incremental" else None,
     )
 
     manifest_path = save_manifest(manifest_dict, manifests_dir=manifests_dir)

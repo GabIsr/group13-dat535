@@ -307,6 +307,27 @@ def clean_and_validate_weather(
         corrupt_wmo = df_clean["weather_code"].notna() & ~df_clean["weather_code"].isin(VALID_WMO_WEATHER_CODES)
         evaluate_sensor_rule(corrupt_wmo, "weather_code", "INVALID_WMO_WEATHER_CODE", "Weather code {val} not found in WMO Code Table 4677 standard")
 
+    # M. Soil Temperature Bounds [-30°C, 50°C]
+    if "soil_temperature_0_to_7cm" in df_clean.columns:
+        corrupt_soil_temp = df_clean["soil_temperature_0_to_7cm"].notna() & ~df_clean["soil_temperature_0_to_7cm"].between(
+            WEATHER_HARD_LIMITS["soil_temp_min"], WEATHER_HARD_LIMITS["soil_temp_max"]
+        )
+        evaluate_sensor_rule(corrupt_soil_temp, "soil_temperature_0_to_7cm", "SOIL_TEMP_OUT_OF_BOUNDS", "Soil temperature {val}°C outside physical limits [-30°C, 50°C]")
+
+    # N. Soil Moisture Bounds [0.0, 1.0 m3/m3]
+    if "soil_moisture_0_to_7cm" in df_clean.columns:
+        corrupt_soil_moist = df_clean["soil_moisture_0_to_7cm"].notna() & ~df_clean["soil_moisture_0_to_7cm"].between(
+            WEATHER_HARD_LIMITS["soil_moist_min"], WEATHER_HARD_LIMITS["soil_moist_max"]
+        )
+        evaluate_sensor_rule(corrupt_soil_moist, "soil_moisture_0_to_7cm", "SOIL_MOISTURE_OUT_OF_BOUNDS", "Volumetric soil moisture {val} m3/m3 outside saturation range [0, 1]")
+
+    # O. Cloud Cover Bounds [0%, 100%]
+    if "cloud_cover" in df_clean.columns:
+        corrupt_cloud = df_clean["cloud_cover"].notna() & ~df_clean["cloud_cover"].between(
+            WEATHER_HARD_LIMITS["cloud_cover_min"], WEATHER_HARD_LIMITS["cloud_cover_max"]
+        )
+        evaluate_sensor_rule(corrupt_cloud, "cloud_cover", "CLOUD_COVER_OUT_OF_BOUNDS", "Cloud cover {val}% outside range [0, 100]")
+
     # Attach Row-Level Observability Metadata
     df_clean["quality_audit_notes"] = [
         "; ".join(audit_notes_map[idx]) if audit_notes_map[idx] else None
@@ -391,8 +412,20 @@ def clean_and_validate_weather(
     # 5. Standardization and Derived Row Attributes (Pure Metric: Celsius and m/s)
     df_clean["is_freezing"] = df_clean["temperature_2m"] <= 0.0
     df_clean["is_raining"] = df_clean["precipitation"] > 0.0
+    df_clean["is_ground_frozen"] = (
+        (df_clean["soil_temperature_0_to_7cm"] < 0.0)
+        if "soil_temperature_0_to_7cm" in df_clean.columns
+        else False
+    )
+    df_clean["is_soil_saturated"] = (
+        (df_clean["soil_moisture_0_to_7cm"] >= 0.40)
+        if "soil_moisture_0_to_7cm" in df_clean.columns
+        else False
+    )
+    if "cloud_cover" in df_clean.columns:
+        df_clean["is_overcast"] = df_clean["cloud_cover"] >= 80.0
 
-    for int16_col in ["weather_code", "relative_humidity_2m", "wind_direction_10m"]:
+    for int16_col in ["weather_code", "relative_humidity_2m", "wind_direction_10m", "cloud_cover"]:
         if int16_col in df_clean.columns:
             df_clean[int16_col] = pd.to_numeric(df_clean[int16_col], errors="coerce").astype("Int16")
 

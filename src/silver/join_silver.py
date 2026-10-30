@@ -84,6 +84,12 @@ def join_silver_datasets(
         "is_freezing",
         "is_raining",
         "is_extreme_weather",
+        "is_ground_frozen",
+        "is_soil_saturated",
+        "is_overcast",
+        "soil_temperature_0_to_7cm",
+        "soil_moisture_0_to_7cm",
+        "cloud_cover",
         "model_elevation",
     ]
     w_cols = [c for c in weather_join_cols if c in df_weather_spark.columns]

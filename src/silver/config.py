@@ -178,6 +178,12 @@ WEATHER_HARD_LIMITS = {
     "humidity_max": 100,    # Relative humidity percentage ceiling
     "wind_dir_min": 0,      # Compass degrees
     "wind_dir_max": 360,
+    "soil_temp_min": -30.0, # Ground frost / soil temperature floor
+    "soil_temp_max": 50.0,  # Summer surface soil heat ceiling
+    "soil_moist_min": 0.0,  # Volumetric soil water content m3/m3 floor
+    "soil_moist_max": 1.0,  # Full soil saturation ceiling (1.0 = 100% water by volume)
+    "cloud_cover_min": 0,   # Sky cloud cover percentage floor
+    "cloud_cover_max": 100, # Sky cloud cover percentage ceiling
 }
 
 # Weather Soft Quality Thresholds (Tag as extreme weather, DO NOT discard)

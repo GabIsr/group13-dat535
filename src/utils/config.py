@@ -46,7 +46,10 @@ WEATHER_HOURLY_VARIABLES = [
     "surface_pressure",
     "wind_speed_10m",
     "wind_gusts_10m",
-    "wind_direction_10m"
+    "wind_direction_10m",
+    "soil_temperature_0_to_7cm",
+    "soil_moisture_0_to_7cm",
+    "cloud_cover",
 ]
 
 # 19 Native ERA5-Land Grid Cells Covering New York City (0.1 deg / ~9 km resolution)

@@ -126,35 +126,91 @@ def haversine_distance_km(
     """
     Compute vectorized Great-Circle Haversine distance in kilometers between two coordinate Series.
     Mean Earth radius R = 6,371.0 km.
-    Returns NaN for any coordinate pair with missing components.
+    Safeguards:
+      1. Defensive dimension check: returns NaN Series with a warning if input lengths mismatch (never raises).
+      2. Operates positionally using NumPy to prevent accidental Pandas index misalignment.
+      3. Validates geographic coordinate bounds: latitude in [-90, 90], longitude in [-180, 180].
+      4. Returns NaN for missing, out-of-bounds, or physically invalid coordinates.
+      5. Preserves the index of lat1 on the returned Series.
     """
-    valid_mask = lat1.notna() & lon1.notna() & lat2.notna() & lon2.notna()
-    dist = pd.Series(np.nan, index=lat1.index, dtype="float64")
+    target_index = getattr(lat1, "index", None)
+    try:
+        n1, n2, n3, n4 = len(lat1), len(lon1), len(lat2), len(lon2)
+    except (TypeError, AttributeError):
+        logger.warning("haversine_distance_km: Invalid input types received. Returning empty NaN Series.")
+        return pd.Series(np.nan, index=target_index, dtype="float64")
 
-    if not valid_mask.any():
-        return dist
+    if not (n1 == n2 == n3 == n4):
+        logger.warning(
+            f"haversine_distance_km: Dimension mismatch (lat1={n1}, lon1={n2}, lat2={n3}, lon2={n4}). "
+            "Defensively returning NaN Series to prevent pipeline crash."
+        )
+        return pd.Series(np.nan, index=target_index, dtype="float64")
 
-    r_lat1 = np.radians(lat1[valid_mask].astype(float))
-    r_lon1 = np.radians(lon1[valid_mask].astype(float))
-    r_lat2 = np.radians(lat2[valid_mask].astype(float))
-    r_lon2 = np.radians(lon2[valid_mask].astype(float))
+    # Extract positional 1D NumPy float arrays to prevent Pandas index misalignment
+    v_lat1 = pd.to_numeric(pd.Series(lat1).to_numpy(), errors="coerce").astype(float)
+    v_lon1 = pd.to_numeric(pd.Series(lon1).to_numpy(), errors="coerce").astype(float)
+    v_lat2 = pd.to_numeric(pd.Series(lat2).to_numpy(), errors="coerce").astype(float)
+    v_lon2 = pd.to_numeric(pd.Series(lon2).to_numpy(), errors="coerce").astype(float)
 
-    dlat = r_lat2 - r_lat1
-    dlon = r_lon2 - r_lon1
+    # Geographic boundary check (-90..90 for lat, -180..180 for lon)
+    valid_mask = (
+        ~np.isnan(v_lat1)
+        & ~np.isnan(v_lon1)
+        & ~np.isnan(v_lat2)
+        & ~np.isnan(v_lon2)
+        & (v_lat1 >= -90.0)
+        & (v_lat1 <= 90.0)
+        & (v_lat2 >= -90.0)
+        & (v_lat2 <= 90.0)
+        & (v_lon1 >= -180.0)
+        & (v_lon1 <= 180.0)
+        & (v_lon2 >= -180.0)
+        & (v_lon2 <= 180.0)
+    )
 
-    a = np.sin(dlat / 2.0) ** 2 + np.cos(r_lat1) * np.cos(r_lat2) * np.sin(dlon / 2.0) ** 2
-    a = np.clip(a, 0.0, 1.0)
-    c = 2.0 * np.arcsin(np.sqrt(a))
-    dist.loc[valid_mask] = (6371.0 * c).round(2)
-    return dist
+    dist = np.full(n1, np.nan, dtype=np.float64)
+    if np.any(valid_mask):
+        r_lat1 = np.radians(v_lat1[valid_mask])
+        r_lon1 = np.radians(v_lon1[valid_mask])
+        r_lat2 = np.radians(v_lat2[valid_mask])
+        r_lon2 = np.radians(v_lon2[valid_mask])
+
+        dlat = r_lat2 - r_lat1
+        dlon = r_lon2 - r_lon1
+
+        a = np.sin(dlat / 2.0) ** 2 + np.cos(r_lat1) * np.cos(r_lat2) * np.sin(dlon / 2.0) ** 2
+        a = np.clip(a, 0.0, 1.0)
+        c = 2.0 * np.arcsin(np.sqrt(a))
+        dist[valid_mask] = np.round(6371.0 * c, 2)
+
+    return pd.Series(dist, index=target_index, dtype="float64")
 
 
 def spark_haversine_distance_km(lat1_col, lon1_col, lat2_col, lon2_col):
     """
     Compute Great-Circle Haversine distance in km using pure PySpark SQL functions.
     Fully optimized inside Catalyst optimizer without Python serialization overhead.
-    Clips intermediate values to [0.0, 1.0] to safeguard against floating-point NaN in asin.
+    Safeguards:
+      1. Validates coordinate bounds: lat in [-90, 90], lon in [-180, 180].
+         Returns null for invalid or missing coordinates.
+      2. Clips intermediate values to [0.0, 1.0] to safeguard against floating-point NaN in asin.
     """
+    valid_coords = (
+        lat1_col.isNotNull()
+        & lon1_col.isNotNull()
+        & lat2_col.isNotNull()
+        & lon2_col.isNotNull()
+        & (lat1_col >= lit(-90.0))
+        & (lat1_col <= lit(90.0))
+        & (lat2_col >= lit(-90.0))
+        & (lat2_col <= lit(90.0))
+        & (lon1_col >= lit(-180.0))
+        & (lon1_col <= lit(180.0))
+        & (lon2_col >= lit(-180.0))
+        & (lon2_col <= lit(180.0))
+    )
+
     r_lat1 = radians(lat1_col)
     r_lon1 = radians(lon1_col)
     r_lat2 = radians(lat2_col)
@@ -163,7 +219,8 @@ def spark_haversine_distance_km(lat1_col, lon1_col, lat2_col, lon2_col):
     dlon = r_lon2 - r_lon1
     a = (sin(dlat / 2.0) ** 2) + cos(r_lat1) * cos(r_lat2) * (sin(dlon / 2.0) ** 2)
     a_safe = when(a > 1.0, lit(1.0)).when(a < 0.0, lit(0.0)).otherwise(a)
-    return spark_round(lit(6371.0) * lit(2.0) * asin(sqrt(a_safe)), 2)
+    dist = spark_round(lit(6371.0) * lit(2.0) * asin(sqrt(a_safe)), 2)
+    return when(valid_coords, dist).otherwise(lit(None).cast("double"))
 
 
 def clean_and_validate_311(

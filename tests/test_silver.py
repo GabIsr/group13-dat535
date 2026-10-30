@@ -743,7 +743,7 @@ class TestSilverLayerPipeline(unittest.TestCase):
 
 
     def test_haversine_distance_vectorization(self):
-        """Verify Great-Circle Haversine distance calculations and null handling."""
+        """Verify Great-Circle Haversine distance calculations, index independence, and bounds handling."""
         # 1. Identical coordinates -> distance must be 0.0
         lat1 = pd.Series([40.7500, 40.8000, np.nan])
         lon1 = pd.Series([-73.9900, -74.0000, -73.9900])
@@ -758,8 +758,38 @@ class TestSilverLayerPipeline(unittest.TestCase):
         # Point 3: coordinate with NaN -> distance is NaN
         self.assertTrue(pd.isna(dist.iloc[2]))
 
+        # 2. Mismatched index test: Series with different index labels must evaluate positionally without NaN corruption
+        s_lat1 = pd.Series([40.7500, 40.8000], index=[100, 200])
+        s_lon1 = pd.Series([-73.9900, -74.0000], index=[100, 200])
+        s_lat2 = pd.Series([40.7500, 40.8000], index=[0, 1])
+        s_lon2 = pd.Series([-73.9900, -73.9000], index=[0, 1])
+        mismatch_dist = haversine_distance_km(s_lat1, s_lon1, s_lat2, s_lon2)
+        self.assertEqual(list(mismatch_dist.index), [100, 200])
+        self.assertEqual(mismatch_dist.loc[100], 0.0)
+        self.assertAlmostEqual(mismatch_dist.loc[200], 8.44, delta=0.2)
+
+        # 3. Unequal length handling defensively returns NaN Series instead of raising ValueError
+        mismatched_len_dist = haversine_distance_km(
+            pd.Series([40.75]),
+            pd.Series([-73.99]),
+            pd.Series([40.75, 40.80]),
+            pd.Series([-73.99, -74.00]),
+        )
+        self.assertEqual(len(mismatched_len_dist), 1)
+        self.assertTrue(pd.isna(mismatched_len_dist.iloc[0]))
+
+        # 4. Out-of-bounds coordinate handling -> NaN
+        bad_coords = haversine_distance_km(
+            pd.Series([999.0, 40.7500]),
+            pd.Series([-73.9900, -300.0]),
+            pd.Series([40.7500, 40.7500]),
+            pd.Series([-73.9900, -73.9900]),
+        )
+        self.assertTrue(pd.isna(bad_coords.iloc[0]))
+        self.assertTrue(pd.isna(bad_coords.iloc[1]))
+
     def test_spark_haversine_distance_vectorization(self):
-        """Verify PySpark Great-Circle Haversine distance calculations and null handling."""
+        """Verify PySpark Great-Circle Haversine distance calculations, null handling, and physical bounds."""
         try:
             from pyspark.sql.functions import col
             from src.utils.spark import get_spark_session
@@ -771,6 +801,8 @@ class TestSilverLayerPipeline(unittest.TestCase):
             (40.7500, -73.9900, 40.7500, -73.9900),
             (40.8000, -74.0000, 40.8000, -73.9000),
             (None, -73.9900, 40.7500, None),
+            (999.0, -73.9900, 40.7500, -73.9900),  # Latitude > 90 out of bounds -> None
+            (40.7500, -250.0, 40.7500, -73.9900),  # Longitude < -180 out of bounds -> None
         ]
         df = spark.createDataFrame(test_data, ["lat1", "lon1", "lat2", "lon2"])
         df_res = (
@@ -781,6 +813,8 @@ class TestSilverLayerPipeline(unittest.TestCase):
         self.assertEqual(df_res[0]["dist"], 0.0)
         self.assertAlmostEqual(df_res[1]["dist"], 8.44, delta=0.2)
         self.assertIsNone(df_res[2]["dist"])
+        self.assertIsNone(df_res[3]["dist"])
+        self.assertIsNone(df_res[4]["dist"])
 
     def test_borough_validation(self):
         """Verify strict 5-borough normalization and soft quarantine/tagging of unstandardized boroughs."""

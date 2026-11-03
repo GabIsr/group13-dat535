@@ -439,7 +439,10 @@ class TestSilverLayerPipeline(unittest.TestCase):
                     "complaint_type": "Noise",
                 }
             ]
-            pd.DataFrame(mock_311).to_parquet(s_311 / "part_0000.parquet", index=False)
+            df_m311 = pd.DataFrame(mock_311)
+            df_m311["created_at_utc"] = df_m311["created_at_utc"].astype("datetime64[us, UTC]")
+            df_m311["weather_join_hour_utc"] = df_m311["weather_join_hour_utc"].astype("datetime64[us, UTC]")
+            df_m311.to_parquet(s_311 / "part_0000.parquet", index=False)
 
             # Intentionally duplicate weather dimension row
             mock_weather = [
@@ -454,7 +457,9 @@ class TestSilverLayerPipeline(unittest.TestCase):
                     "temperature_2m": 15.0,
                 },
             ]
-            pd.DataFrame(mock_weather).to_parquet(s_weather / "part_0000.parquet", index=False)
+            df_mw = pd.DataFrame(mock_weather)
+            df_mw["timestamp_utc"] = df_mw["timestamp_utc"].astype("datetime64[us, UTC]")
+            df_mw.to_parquet(s_weather / "part_0000.parquet", index=False)
 
             with self.assertRaises(ValueError) as ctx:
                 join_silver_datasets(s_311, s_weather, s_joined)
@@ -1231,6 +1236,61 @@ class TestSilverLayerPipeline(unittest.TestCase):
             df_ledger = pd.read_parquet(ledger_file)
             self.assertIn("SOIL_TEMP_OUT_OF_BOUNDS", df_ledger["rule_violated"].values)
             self.assertIn("SOIL_MOISTURE_OUT_OF_BOUNDS", df_ledger["rule_violated"].values)
+
+
+
+    def test_negative_duration_sub18s_quarantined(self):
+        """
+        Verify that sub-18s negative durations (e.g. closed 5s before creation) are caught
+        by raw epoch seconds check and routed to quarantine, rather than rounding to 0.00h
+        and falsely masquerading as instant closures.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            bronze_in = tmp_path / "bronze_311"
+            silver_out = tmp_path / "silver_311"
+            quarantine_out = tmp_path / "quarantine"
+            bronze_in.mkdir()
+
+            mock_data = [
+                {
+                    "unique_key": 70990001,
+                    "created_date": "2026-10-18T12:00:05.000",
+                    "closed_date": "2026-10-18T12:00:00.000",  # 5 seconds BEFORE created!
+                    "agency": "NYPD",
+                    "complaint_type": "Noise",
+                    "status": "Closed",
+                    "borough": "MANHATTAN",
+                    "_batch_id": "test_batch_001",
+                },
+                {
+                    "unique_key": 70990002,
+                    "created_date": "2026-10-18T12:00:00.000",
+                    "closed_date": "2026-10-18T12:00:00.000",  # Exact 0-second instant closure
+                    "agency": "NYPD",
+                    "complaint_type": "Noise",
+                    "status": "Closed",
+                    "borough": "MANHATTAN",
+                    "_batch_id": "test_batch_001",
+                },
+            ]
+            pd.DataFrame(mock_data).to_parquet(bronze_in / "part_0000.parquet", index=False)
+
+            res = clean_and_validate_311(bronze_in, silver_out, quarantine_out)
+
+            # Row 1 must be quarantined! Row 2 is valid instant closure.
+            self.assertEqual(res["quarantined_rows"], 1)
+            self.assertEqual(res["valid_rows_accepted"], 1)
+
+            df_q = pd.read_parquet(quarantine_out / "quarantined_311.parquet")
+            self.assertEqual(df_q.iloc[0]["unique_key"], 70990001)
+            self.assertIn("NEGATIVE_RESOLUTION_DURATION", df_q.iloc[0]["quarantine_reason"])
+
+            df_clean = pd.read_parquet(silver_out)
+            self.assertEqual(df_clean.iloc[0]["unique_key"], 70990002)
+            self.assertTrue(df_clean.iloc[0]["is_instant_closure"])
+            self.assertIn("created_hour_utc", df_clean.columns)
+            self.assertIn("created_hour_local", df_clean.columns)
 
 
 if __name__ == "__main__":

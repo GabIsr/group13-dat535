@@ -301,7 +301,7 @@ def clean_and_validate_311(
 
     # Calendar row attributes derived from local New York time in PySpark
     local_ts = from_utc_timestamp(col("created_at_utc"), "America/New_York")
-    df_spark_proc = df_spark_proc.withColumn("hour_of_day", hour(col("created_at_utc")))
+    df_spark_proc = df_spark_proc.withColumn("created_hour_utc", hour(col("created_at_utc")))
     df_spark_proc = df_spark_proc.withColumn("created_hour_local", hour(local_ts))
     df_spark_proc = df_spark_proc.withColumn("day_of_week", (dayofweek(local_ts) + 5) % 7)
     df_spark_proc = df_spark_proc.withColumn("is_weekend", col("day_of_week").isin([5, 6]))
@@ -314,7 +314,7 @@ def clean_and_validate_311(
     future_grace_epoch = now_epoch + 7200
 
     cond_missing_created = col("created_at_utc").isNull()
-    cond_negative_duration = col("is_ticket_closed") & (col("resolution_duration_hours") < 0.0)
+    cond_negative_duration = col("is_ticket_closed") & (duration_secs < 0)
     cond_invalid_key = parsed_keys.isNull() | (parsed_keys <= 0)
     cond_pre_epoch = col("created_at_utc").isNotNull() & (col("created_at_utc").cast("long") < lit(launch_epoch))
     cond_future_created = col("created_at_utc").isNotNull() & (col("created_at_utc").cast("long") > lit(future_grace_epoch))
@@ -489,7 +489,8 @@ def clean_and_validate_311(
         q_launch = pd.Timestamp(NYC_311_LAUNCH_DATE)
 
         q_missing_cr = df_quarantined["created_at_utc"].isna()
-        q_neg_dur = df_quarantined["is_ticket_closed"] & (df_quarantined["resolution_duration_hours"] < 0.0)
+        dur_secs_q = (df_quarantined["closed_at_utc"] - df_quarantined["created_at_utc"]).dt.total_seconds()
+        q_neg_dur = df_quarantined["is_ticket_closed"] & (dur_secs_q < 0)
         q_bad_key = q_keys.isna() | (q_keys <= 0)
         q_pre_ep = df_quarantined["created_at_utc"].notna() & (df_quarantined["created_at_utc"] < q_launch)
         q_fut_cr = df_quarantined["created_at_utc"].notna() & (df_quarantined["created_at_utc"] > q_grace)
@@ -662,7 +663,8 @@ def clean_and_validate_311(
 
     # 7. Quality Tagging & Observability Audit Notes
     # Instant Closures (Closed at creation: 0.0 duration)
-    df_valid["is_instant_closure"] = df_valid["is_ticket_closed"] & (df_valid["resolution_duration_hours"] == 0.0)
+    valid_dur_secs = (df_valid["closed_at_utc"] - df_valid["created_at_utc"]).dt.total_seconds()
+    df_valid["is_instant_closure"] = df_valid["is_ticket_closed"] & (valid_dur_secs == 0)
 
     # Status vs. Closed Date Contradiction:
     # (a) Agency status is OPEN/IN PROGRESS/PENDING/etc., but closed_date is populated

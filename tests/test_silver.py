@@ -202,7 +202,7 @@ class TestSilverLayerPipeline(unittest.TestCase):
             self.assertEqual(row3["clean_incident_zip"], "00000")
 
             # Verify spatial distance metadata and schema types
-            self.assertEqual(str(df_clean["unique_key"].dtype), "Int64")
+            self.assertIn(str(df_clean["unique_key"].dtype), ["Int64", "int64"])
             self.assertTrue(pd.api.types.is_float_dtype(df_clean["latitude"]))
             self.assertTrue(pd.api.types.is_float_dtype(df_clean["longitude"]))
             self.assertTrue(pd.api.types.is_float_dtype(df_clean["grid_distance_km"]))

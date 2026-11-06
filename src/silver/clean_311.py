@@ -1,13 +1,13 @@
 """
 Silver Layer: NYC 311 Service Requests Cleaning, Deduplication, and Spatial Imputation.
-Applies deduplication, UTC timestamp normalization, temporal duration validation,
+100% Pure PySpark Pipeline:
+Applies CDC deduplication, UTC timestamp normalization, temporal duration validation,
 3-level hierarchical spatial imputation (Coordinates -> ZIP Centroid -> Borough Centroid),
 comprehensive institutional & spatial consistency checks, and routes invalid rows to quarantine.
 Author: Group 13
 """
 
 import logging
-import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,28 +15,36 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import (
+    array,
+    array_compact,
     asin,
+    avg,
     broadcast,
     col,
     concat,
+    concat_ws,
     cos,
+    date_format,
     date_trunc,
     dayofweek,
     desc,
     from_utc_timestamp,
     hour,
     initcap,
+    length,
     lit,
     month as spark_month,
+    percentile_approx,
     radians,
     regexp_extract,
     round as spark_round,
     row_number,
     sin,
     sqrt,
+    substring,
+    sum as spark_sum,
     to_timestamp,
     to_utc_timestamp,
     trim,
@@ -51,9 +59,7 @@ from src.silver.incident_clustering import (
     generate_hierarchical_location_keys,
     cluster_citizen_call_bursts,
 )
-
 from src.utils.spark import get_spark_session
-
 from src.silver.config import (
     BOROUGH_CENTROIDS,
     BRONZE_DIR,
@@ -80,8 +86,12 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("clean_311")
 
 
+# =========================================================================
+# Standalone Helper Functions (Kept for unit test compatibility)
+# =========================================================================
+
 def load_zip_reference(zip_ref_path: Path = ZIP_CENTROIDS_PATH) -> pd.DataFrame:
-    """Load the precomputed NYC ZIP centroid reference table."""
+    """Load the precomputed NYC ZIP centroid reference table (kept for unit test compatibility)."""
     if not zip_ref_path.exists():
         logger.warning(f"ZIP reference table not found at {zip_ref_path}. Creating fallback mapping.")
         return pd.DataFrame(columns=["zip5", "centroid_lat", "centroid_lon", "grid_id", "primary_borough"])
@@ -134,7 +144,7 @@ def haversine_distance_km(
     Compute vectorized Great-Circle Haversine distance in kilometers between two coordinate Series.
     Mean Earth radius R = 6,371.0 km.
     Safeguards:
-      1. Defensive dimension check: returns NaN Series with a warning if input lengths mismatch (never raises).
+      1. Defensive dimension check: returns NaN Series with a warning if input lengths mismatch.
       2. Operates positionally using NumPy to prevent accidental Pandas index misalignment.
       3. Validates geographic coordinate bounds: latitude in [-90, 90], longitude in [-180, 180].
       4. Returns NaN for missing, out-of-bounds, or physically invalid coordinates.
@@ -154,13 +164,11 @@ def haversine_distance_km(
         )
         return pd.Series(np.nan, index=target_index, dtype="float64")
 
-    # Extract positional 1D NumPy float arrays to prevent Pandas index misalignment
     v_lat1 = pd.to_numeric(pd.Series(lat1).to_numpy(), errors="coerce").astype(float)
     v_lon1 = pd.to_numeric(pd.Series(lon1).to_numpy(), errors="coerce").astype(float)
     v_lat2 = pd.to_numeric(pd.Series(lat2).to_numpy(), errors="coerce").astype(float)
     v_lon2 = pd.to_numeric(pd.Series(lon2).to_numpy(), errors="coerce").astype(float)
 
-    # Geographic boundary check (-90..90 for lat, -180..180 for lon)
     valid_mask = (
         ~np.isnan(v_lat1)
         & ~np.isnan(v_lon1)
@@ -230,95 +238,91 @@ def spark_haversine_distance_km(lat1_col, lon1_col, lat2_col, lon2_col):
     return when(valid_coords, dist).otherwise(lit(None).cast("double"))
 
 
-def clean_and_validate_311(
-    bronze_311_dir: Path = BRONZE_DIR / "nyc311",
-    silver_311_dir: Path = SILVER_DIR / "nyc311",
-    quarantine_dir: Path = QUARANTINE_DIR / "nyc311",
-) -> Dict[str, Any]:
+# =========================================================================
+# Pure PySpark Silver 311 Pipeline Modular Functions
+# =========================================================================
+
+def normalize_timestamps_and_durations(df: DataFrame, now_epoch: int) -> DataFrame:
     """
-    Load Bronze 311 records, deduplicate, validate durations and timestamps,
-    apply hierarchical spatial imputation, normalize strings, and save clean & quarantined Parquet tables.
+    Normalize 311 local Eastern Time timestamps to UTC and derive temporal duration metrics.
+    Computes ticket status categories, resolution durations, active ticket age, and calendar features.
+    100% pure PySpark.
     """
-    start_time = time.time()
-    processed_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    bronze_files = sorted(bronze_311_dir.glob("**/*.parquet"))
-    if not bronze_files:
-        logger.warning(f"No Bronze 311 files found in {bronze_311_dir}")
-        return {"status": "skipped", "reason": "no_input_files"}
-
-    logger.info(f"Loading {len(bronze_files)} Bronze 311 partition files into PySpark...")
-    spark = get_spark_session("DAT535-Silver-Clean-311")
-    file_paths = [str(f.resolve()) for f in bronze_files]
-    df_raw_spark = spark.read.parquet(*file_paths)
-    input_rows = df_raw_spark.count()
-    logger.info(f"Loaded {input_rows:,} raw 311 records from Bronze via PySpark.")
-
-    # 1. PySpark Timestamp Normalization (America/New_York -> UTC) & Temporal Validation on Raw Bronze
-    # Normalize created_date to UTC timestamp directly within Spark SQL
-    cols = set(df_raw_spark.columns)
+    cols = set(df.columns)
     created_ts = to_utc_timestamp(to_timestamp(col("created_date")), "America/New_York")
-    df_spark_proc = df_raw_spark.withColumn("created_at_utc", created_ts)
+    df_proc = df.withColumn("created_at_utc", created_ts)
 
-    if "closed_date" in df_spark_proc.columns:
+    if "closed_date" in cols:
         closed_ts = to_utc_timestamp(to_timestamp(col("closed_date")), "America/New_York")
-        df_spark_proc = df_spark_proc.withColumn("closed_at_utc", closed_ts)
+        df_proc = df_proc.withColumn("closed_at_utc", closed_ts)
     else:
-        df_spark_proc = df_spark_proc.withColumn("closed_at_utc", lit(None).cast("timestamp"))
+        df_proc = df_proc.withColumn("closed_at_utc", lit(None).cast("timestamp"))
 
-    # Open vs. Closed Ticket Semantics in PySpark
-    df_spark_proc = df_spark_proc.withColumn("is_ticket_closed", col("closed_at_utc").isNotNull())
-    df_spark_proc = df_spark_proc.withColumn(
+    df_proc = df_proc.withColumn("is_ticket_closed", col("closed_at_utc").isNotNull())
+    df_proc = df_proc.withColumn(
         "ticket_status_category",
         when(col("is_ticket_closed"), lit("CLOSED")).otherwise(lit("OPEN")),
     )
 
     # Resolution duration in hours (only applicable to closed tickets)
     duration_secs = col("closed_at_utc").cast("long") - col("created_at_utc").cast("long")
-    df_spark_proc = df_spark_proc.withColumn(
+    df_proc = df_proc.withColumn(
         "resolution_duration_hours",
         when(col("is_ticket_closed"), spark_round(duration_secs / 3600.0, 2)).otherwise(lit(None).cast("double")),
     )
 
     # Active queue age in days (relative to current UTC runtime)
-    now_utc = datetime.now(timezone.utc)
-    now_epoch = int(now_utc.timestamp())
     open_age_secs = lit(now_epoch) - col("created_at_utc").cast("long")
-    df_spark_proc = df_spark_proc.withColumn(
+    df_proc = df_proc.withColumn(
         "open_ticket_age_days",
         when(~col("is_ticket_closed"), spark_round(open_age_secs / 86400.0, 2)).otherwise(lit(None).cast("double")),
     )
 
     # Source timestamps normalization (Socrata :created_at and :updated_at)
     if "source_updated_at" in cols:
-        df_spark_proc = df_spark_proc.withColumn("source_updated_at", to_timestamp(col("source_updated_at")))
+        df_proc = df_proc.withColumn("source_updated_at", to_timestamp(col("source_updated_at")))
 
     if "source_created_at" in cols:
         src_cr_ts = to_timestamp(col("source_created_at"))
-        df_spark_proc = df_spark_proc.withColumn("source_created_at", src_cr_ts)
+        df_proc = df_proc.withColumn("source_created_at", src_cr_ts)
         intake_lag_secs = src_cr_ts.cast("long") - col("created_at_utc").cast("long")
-        df_spark_proc = df_spark_proc.withColumn(
+        df_proc = df_proc.withColumn(
             "source_intake_lag_hours",
             when(src_cr_ts.isNotNull() & col("created_at_utc").isNotNull(), spark_round(intake_lag_secs / 3600.0, 2))
             .otherwise(lit(None).cast("double")),
         )
 
     # Hourly join key for UTC weather alignment
-    df_spark_proc = df_spark_proc.withColumn("weather_join_hour_utc", date_trunc("hour", col("created_at_utc")))
+    df_proc = df_proc.withColumn("weather_join_hour_utc", date_trunc("hour", col("created_at_utc")))
 
     # Calendar row attributes derived from local New York time in PySpark
     local_ts = from_utc_timestamp(col("created_at_utc"), "America/New_York")
-    df_spark_proc = df_spark_proc.withColumn("created_hour_utc", hour(col("created_at_utc")))
-    df_spark_proc = df_spark_proc.withColumn("created_hour_local", hour(local_ts))
-    df_spark_proc = df_spark_proc.withColumn("day_of_week", (dayofweek(local_ts) + 5) % 7)
-    df_spark_proc = df_spark_proc.withColumn("is_weekend", col("day_of_week").isin([5, 6]))
-    df_spark_proc = df_spark_proc.withColumn("month_of_year", spark_month(local_ts))
+    df_proc = (
+        df_proc.withColumn("created_hour_utc", hour(col("created_at_utc")))
+        .withColumn("created_hour_local", hour(local_ts))
+        .withColumn("day_of_week", (dayofweek(local_ts) + 5) % 7)
+        .withColumn("is_weekend", col("day_of_week").isin([5, 6]))
+        .withColumn("month_of_year", spark_month(local_ts))
+    )
 
-    # 2. Hard Quarantine Boundary Validation (Spark SQL Boolean Predicates on Raw Stream)
-    # Evaluated BEFORE deduplication so corrupted/unkeyed records are NEVER dropped as duplicates of null!
+    return df_proc
+
+
+def quarantine_invalid_311_records(
+    df: DataFrame,
+    now_epoch: int,
+    quarantine_dir: Path,
+) -> Tuple[DataFrame, int]:
+    """
+    Evaluate strict boundary validation predicates in Spark SQL.
+    Routes corrupted/unkeyed/negative-duration/out-of-bounds records to quarantine Parquet
+    BEFORE deduplication so corrupted records are never collapsed as nulls.
+    100% pure PySpark.
+    """
     parsed_keys = col("unique_key").cast("long")
     launch_epoch = int(datetime(2003, 3, 1, tzinfo=timezone.utc).timestamp())
     future_grace_epoch = now_epoch + 7200
+    duration_secs = col("closed_at_utc").cast("long") - col("created_at_utc").cast("long")
 
     cond_missing_created = col("created_at_utc").isNull()
     cond_negative_duration = col("is_ticket_closed") & (duration_secs < 0)
@@ -327,7 +331,7 @@ def clean_and_validate_311(
     cond_future_created = col("created_at_utc").isNotNull() & (col("created_at_utc").cast("long") > lit(future_grace_epoch))
     cond_future_closed = col("closed_at_utc").isNotNull() & (col("closed_at_utc").cast("long") > lit(future_grace_epoch))
 
-    if "_batch_id" in df_spark_proc.columns:
+    if "_batch_id" in df.columns:
         b_str = trim(col("_batch_id").cast("string"))
         cond_corrupt_lineage = col("_batch_id").isNull() | b_str.isin(["", "nan", "None", "<NA>"])
     else:
@@ -343,12 +347,37 @@ def clean_and_validate_311(
         | cond_corrupt_lineage
     )
 
-    df_quarantined_spark = df_spark_proc.filter(quarantine_cond)
-    df_valid_candidates = df_spark_proc.filter(~quarantine_cond)
+    df_quarantined = df.filter(quarantine_cond)
+    quarantined_count = df_quarantined.count()
 
-    # 3. CDC Deduplication via PySpark Window (on Valid Records with Known Unique Key)
-    # Prioritizes true Socrata source mutation time (:updated_at) over arrival time (_ingested_at_utc),
-    # ensuring historical backfills never overwrite newer ticket states!
+    if quarantined_count > 0:
+        rule_checks = array_compact(array(
+            when(cond_missing_created, lit("MISSING_CREATED_TIMESTAMP")),
+            when(cond_invalid_key, lit("INVALID_OR_NON_NUMERIC_UNIQUE_KEY")),
+            when(cond_pre_epoch, lit("PRE_311_EPOCH_DATE")),
+            when(cond_future_created, lit("FUTURE_CREATED_DATE")),
+            when(cond_future_closed, lit("FUTURE_CLOSED_DATE")),
+            when(cond_negative_duration, lit("NEGATIVE_RESOLUTION_DURATION")),
+            when(cond_corrupt_lineage, lit("CORRUPTED_INGESTION_METADATA")),
+        ))
+        df_quarantined = df_quarantined.withColumn("quarantine_reason", concat_ws("; ", rule_checks))
+        quarantine_dir.mkdir(parents=True, exist_ok=True)
+        q_path = quarantine_dir / "quarantined_311.parquet"
+        df_quarantined.coalesce(1).write.mode("overwrite").parquet(str(q_path))
+        logger.warning(f"Quarantined {quarantined_count:,} invalid records to {q_path}")
+
+    df_valid_candidates = df.filter(~quarantine_cond)
+    return df_valid_candidates, quarantined_count
+
+
+def deduplicate_311_records(df: DataFrame) -> Tuple[DataFrame, int]:
+    """
+    Perform Change Data Capture (CDC) deduplication via PySpark Window on valid records.
+    Prioritizes Socrata source update timestamp over arrival timestamp, ensuring historical
+    backfills never overwrite newer ticket states.
+    100% pure PySpark.
+    """
+    cols = set(df.columns)
     order_cols = []
     if "source_updated_at" in cols:
         order_cols.append(col("source_updated_at").desc())
@@ -359,15 +388,34 @@ def clean_and_validate_311(
     if not order_cols:
         order_cols.append(col("unique_key").desc())
 
+    # Ensure unique_key is cast to LongType
+    df_keyed = df.withColumn("unique_key", col("unique_key").cast("long"))
+
     w_dedup = Window.partitionBy("unique_key").orderBy(*order_cols)
-    df_valid_spark = df_valid_candidates.withColumn("_rn", row_number().over(w_dedup)).filter(col("_rn") == 1).drop("_rn")
-    df_valid_spark.persist(StorageLevel.MEMORY_AND_DISK)
-    valid_count = df_valid_spark.count()
-    duplicate_rows_removed = df_valid_candidates.count() - valid_count
+    df_dedup = df_keyed.withColumn("_rn", row_number().over(w_dedup)).filter(col("_rn") == 1).drop("_rn")
+    df_dedup.persist(StorageLevel.MEMORY_AND_DISK)
+
+    valid_count = df_dedup.count()
+    candidate_count = df.count()
+    duplicate_rows_removed = candidate_count - valid_count
     if duplicate_rows_removed > 0:
         logger.info(f"Deduplication (PySpark): removed {duplicate_rows_removed:,} duplicate records on unique_key.")
 
-    # 3b. Hierarchical Spatial Imputation & Haversine Distance in PySpark
+    return df_dedup, duplicate_rows_removed
+
+
+def impute_spatial_hierarchy_311(
+    df: DataFrame,
+    spark: SparkSession,
+    zip_ref_path: Path = ZIP_CENTROIDS_PATH,
+) -> DataFrame:
+    """
+    Apply 3-level hierarchical spatial imputation (Native GPS -> ZIP Centroid -> Borough Centroid),
+    quantify spatial distance uncertainty via Catalyst PySpark Haversine,
+    and apply hierarchical routing and citizen call burst clustering.
+    100% pure PySpark.
+    """
+    cols = set(df.columns)
     raw_lats = col("latitude").cast("double") if "latitude" in cols else lit(None).cast("double")
     raw_lons = col("longitude").cast("double") if "longitude" in cols else lit(None).cast("double")
 
@@ -377,7 +425,7 @@ def clean_and_validate_311(
     else:
         clean_zip_expr = lit(None).cast("string")
 
-    df_valid_spark = df_valid_spark.withColumn("clean_incident_zip", clean_zip_expr)
+    df = df.withColumn("clean_incident_zip", clean_zip_expr)
 
     # Level 1: Native GPS Coordinates within NYC bounds
     mask_l1 = (
@@ -394,26 +442,25 @@ def clean_and_validate_311(
     grid_lon_1 = spark_round(raw_lons, 1).cast("string")
     grid_id_l1 = concat(lit("GRID_"), grid_lat_1, lit("_"), grid_lon_1)
 
-    # Level 2: ZIP Centroid Lookup (via Broadcast Join of Reference Table)
-    zip_ref = load_zip_reference()
-    if not zip_ref.empty:
-        z_sub = zip_ref[["zip5", "centroid_lat", "centroid_lon", "grid_id"]].rename(
-            columns={
-                "zip5": "_ref_zip5",
-                "centroid_lat": "_ref_lat",
-                "centroid_lon": "_ref_lon",
-                "grid_id": "_ref_grid",
-            }
+    # Level 2: ZIP Centroid Lookup (via Broadcast Join of Reference Parquet)
+    if zip_ref_path.exists():
+        df_zip_ref = (
+            spark.read.parquet(str(zip_ref_path))
+            .select(
+                col("zip5").alias("_ref_zip5"),
+                col("centroid_lat").alias("_ref_lat"),
+                col("centroid_lon").alias("_ref_lon"),
+                col("grid_id").alias("_ref_grid"),
+            )
         )
-        df_zip_ref = spark.createDataFrame(z_sub)
-        df_valid_spark = df_valid_spark.join(
+        df = df.join(
             broadcast(df_zip_ref),
             col("clean_incident_zip") == col("_ref_zip5"),
             how="left",
         ).drop("_ref_zip5")
     else:
-        df_valid_spark = (
-            df_valid_spark.withColumn("_ref_lat", lit(None).cast("double"))
+        df = (
+            df.withColumn("_ref_lat", lit(None).cast("double"))
             .withColumn("_ref_lon", lit(None).cast("double"))
             .withColumn("_ref_grid", lit(None).cast("string"))
         )
@@ -430,28 +477,28 @@ def clean_and_validate_311(
         b_grid_expr = when(b_cond, lit(grid_val)).otherwise(b_grid_expr)
 
     # Coalesce Hierarchical Resolution
-    df_valid_spark = df_valid_spark.withColumn(
+    df = df.withColumn(
         "clean_latitude",
         when(mask_l1, clean_lat_l1)
         .when(col("_ref_lat").isNotNull(), col("_ref_lat"))
         .when(b_lat_expr.isNotNull(), b_lat_expr)
         .otherwise(lit(None).cast("double")),
     )
-    df_valid_spark = df_valid_spark.withColumn(
+    df = df.withColumn(
         "clean_longitude",
         when(mask_l1, clean_lon_l1)
         .when(col("_ref_lon").isNotNull(), col("_ref_lon"))
         .when(b_lon_expr.isNotNull(), b_lon_expr)
         .otherwise(lit(None).cast("double")),
     )
-    df_valid_spark = df_valid_spark.withColumn(
+    df = df.withColumn(
         "grid_id",
         when(mask_l1, grid_id_l1)
         .when(col("_ref_grid").isNotNull(), col("_ref_grid"))
         .when(b_grid_expr != lit("UNKNOWN"), b_grid_expr)
         .otherwise(lit("UNKNOWN")),
     )
-    df_valid_spark = df_valid_spark.withColumn(
+    df = df.withColumn(
         "spatial_resolution_level",
         when(mask_l1, lit("EXACT_COORDINATES"))
         .when(col("_ref_lat").isNotNull(), lit("ZIP_APPROXIMATION"))
@@ -459,7 +506,7 @@ def clean_and_validate_311(
         .otherwise(lit("UNLOCATED")),
     ).drop("_ref_lat", "_ref_lon", "_ref_grid")
 
-    # 4. Spatial Uncertainty Quantification (Great-Circle Haversine Distance in Catalyst PySpark)
+    # Spatial Uncertainty Quantification (Haversine Distance in Catalyst PySpark)
     grid_pattern = r"^GRID_([0-9.-]+)_([0-9.-]+)$"
     grid_center_lat = regexp_extract(col("grid_id"), grid_pattern, 1).cast("double")
     grid_center_lon = regexp_extract(col("grid_id"), grid_pattern, 2).cast("double")
@@ -470,7 +517,7 @@ def clean_and_validate_311(
         & grid_center_lon.isNotNull()
     )
 
-    df_valid_spark = df_valid_spark.withColumn(
+    df = df.withColumn(
         "grid_distance_km",
         when(
             has_coords,
@@ -483,368 +530,423 @@ def clean_and_validate_311(
         ).otherwise(lit(None).cast("double")),
     )
 
-    # 4c. PySpark Spatial Feature Normalization, Hierarchical Routing & Ticket-1 Adaptive Clustering
+    # PySpark Spatial Feature Normalization, Hierarchical Routing & Adaptive Clustering
     logger.info("Executing PySpark Spatial Normalization & Canonicalization...")
     if "complaint_type" in cols:
-        df_valid_spark = df_valid_spark.withColumn(
+        df = df.withColumn(
             "complaint_type",
-            when(col("complaint_type").isNull() | (trim(col("complaint_type")) == ""), lit("Unknown")).otherwise(initcap(trim(col("complaint_type"))))
+            when(col("complaint_type").isNull() | (trim(col("complaint_type")) == ""), lit("Unknown"))
+            .otherwise(initcap(trim(col("complaint_type")))),
         )
-    df_valid_spark = normalize_all_spatial_features(df_valid_spark)
+    df = normalize_all_spatial_features(df)
 
     logger.info("Evaluating 6-Route Hierarchical Spatial Routing in PySpark...")
-    df_valid_spark = generate_hierarchical_location_keys(df_valid_spark)
+    df = generate_hierarchical_location_keys(df)
 
     logger.info("Executing PySpark Ticket-1 Anchored Burst Deduplication Engine (Adaptive Window)...")
-    df_valid_spark = cluster_citizen_call_bursts(df_valid_spark, burst_window_hours=6.0)
+    df = cluster_citizen_call_bursts(df, burst_window_hours=6.0)
 
-    df_valid_spark.persist(StorageLevel.MEMORY_AND_DISK)
+    return df
 
-    df_quarantined = df_quarantined_spark.toPandas().copy()
-    if len(df_quarantined) > 0:
-        df_quarantined["created_at_utc"] = pd.to_datetime(df_quarantined["created_at_utc"], utc=True)
-        if "closed_at_utc" in df_quarantined.columns:
-            df_quarantined["closed_at_utc"] = pd.to_datetime(df_quarantined["closed_at_utc"], utc=True)
-        q_keys = pd.to_numeric(df_quarantined["unique_key"], errors="coerce")
-        q_now = pd.Timestamp.now(tz=timezone.utc)
-        q_grace = q_now + pd.Timedelta(hours=2)
-        q_launch = pd.Timestamp(NYC_311_LAUNCH_DATE)
 
-        q_missing_cr = df_quarantined["created_at_utc"].isna()
-        dur_secs_q = (df_quarantined["closed_at_utc"] - df_quarantined["created_at_utc"]).dt.total_seconds()
-        q_neg_dur = df_quarantined["is_ticket_closed"] & (dur_secs_q < 0)
-        q_bad_key = q_keys.isna() | (q_keys <= 0)
-        q_pre_ep = df_quarantined["created_at_utc"].notna() & (df_quarantined["created_at_utc"] < q_launch)
-        q_fut_cr = df_quarantined["created_at_utc"].notna() & (df_quarantined["created_at_utc"] > q_grace)
-        q_fut_cl = df_quarantined["closed_at_utc"].notna() & (df_quarantined["closed_at_utc"] > q_grace)
-        q_corrupt = (
-            (df_quarantined["_batch_id"].isna() | df_quarantined["_batch_id"].astype(str).str.strip().isin(["", "nan", "None", "<NA>"]))
-            if "_batch_id" in df_quarantined.columns
-            else pd.Series(False, index=df_quarantined.index)
-        )
-        q_idx = df_quarantined.index
-        rule_checks = [
-            (q_missing_cr.loc[q_idx], "MISSING_CREATED_TIMESTAMP"),
-            (q_bad_key.loc[q_idx], "INVALID_OR_NON_NUMERIC_UNIQUE_KEY"),
-            (q_pre_ep.loc[q_idx], "PRE_311_EPOCH_DATE"),
-            (q_fut_cr.loc[q_idx], "FUTURE_CREATED_DATE"),
-            (q_fut_cl.loc[q_idx], "FUTURE_CLOSED_DATE"),
-            (q_neg_dur.loc[q_idx], "NEGATIVE_RESOLUTION_DURATION"),
-            (q_corrupt.loc[q_idx], "CORRUPTED_INGESTION_METADATA"),
-        ]
-        df_quarantined["quarantine_reason"] = [
-            "; ".join(label for mask, label in rule_checks if mask.at[idx])
-            for idx in q_idx
-        ]
-        quarantine_dir.mkdir(parents=True, exist_ok=True)
-        q_path = quarantine_dir / "quarantined_311.parquet"
-        pq.write_table(
-            pa.Table.from_pandas(df_quarantined, preserve_index=False),
-            q_path,
-            compression="snappy",
-            coerce_timestamps="us",
-            allow_truncated_timestamps=True,
-        )
-        logger.warning(f"Quarantined {len(df_quarantined):,} invalid records to {q_path}")
+def standardize_categorical_and_administrative_attributes(df: DataFrame) -> DataFrame:
+    """
+    Standardize Boroughs, agency acronyms, complaint types, descriptors, channels,
+    State Plane coordinates, and administrative districts (Council District, Police Precinct).
+    Derive soft tags (out-of-state ZIP, known agency) in 100% pure PySpark.
+    """
+    cols = set(df.columns)
 
-    # Retain only valid records for clean Silver and enforce Int64 primary key
-    df_valid = df_valid_spark.toPandas().copy()
-    df_valid_spark.unpersist()
-
-    df_valid["created_at_utc"] = pd.to_datetime(df_valid["created_at_utc"], utc=True)
-    if "closed_at_utc" in df_valid.columns:
-        df_valid["closed_at_utc"] = pd.to_datetime(df_valid["closed_at_utc"], utc=True)
-    df_valid["unique_key"] = pd.to_numeric(df_valid["unique_key"], errors="coerce").astype("Int64")
-    if "is_burst_duplicate" in df_valid.columns:
-        df_valid["is_burst_duplicate"] = df_valid["is_burst_duplicate"].astype(bool)
-    if "burst_sequence_num" in df_valid.columns:
-        df_valid["burst_sequence_num"] = pd.to_numeric(df_valid["burst_sequence_num"], errors="coerce").fillna(1).astype("int32")
-    if "cluster_size" in df_valid.columns:
-        df_valid["cluster_size"] = pd.to_numeric(df_valid["cluster_size"], errors="coerce").fillna(1).astype("int32")
-    if "incident_first_created_at_utc" in df_valid.columns:
-        df_valid["incident_first_created_at_utc"] = pd.to_datetime(df_valid["incident_first_created_at_utc"], utc=True)
-
-    # Standardize clean_incident_zip as a persistent 5-digit zero-padded string (never integer!)
-    if "incident_zip" in df_valid.columns:
-        extracted_zips = df_valid["incident_zip"].astype(str).str.extract(r"(\d{5})")[0]
-        df_valid["clean_incident_zip"] = extracted_zips.where(
-            extracted_zips.notna() & ~extracted_zips.isin(["nan", "None", "00000_invalid"]),
-            None,
-        )
-    else:
-        df_valid["clean_incident_zip"] = None
-
-    # Tag Out-of-State / Non-Metro ZIP Codes
-    df_valid["is_out_of_state_zip"] = (
-        df_valid["clean_incident_zip"].notna() &
-        ~df_valid["clean_incident_zip"].str[:3].isin(NYC_METRO_ZIP_PREFIXES)
+    # Out-of-state ZIP tag (first 3 digits outside NYC metro prefixes)
+    prefix_3 = substring(col("clean_incident_zip"), 1, 3)
+    df = df.withColumn(
+        "is_out_of_state_zip",
+        col("clean_incident_zip").isNotNull() & (~prefix_3.isin(list(NYC_METRO_ZIP_PREFIXES))),
     )
 
-    # 3. Spatial Resolution & Uncertainty Metrics (Computed natively in PySpark Catalyst)
-    # Parse coordinates to numeric for schema compliance
-    raw_lats = pd.to_numeric(df_valid["latitude"], errors="coerce") if "latitude" in df_valid.columns else pd.Series(np.nan, index=df_valid.index)
-    raw_lons = pd.to_numeric(df_valid["longitude"], errors="coerce") if "longitude" in df_valid.columns else pd.Series(np.nan, index=df_valid.index)
+    # Coordinates cast to double
+    if "latitude" in cols:
+        df = df.withColumn("latitude", col("latitude").cast("double"))
+    if "longitude" in cols:
+        df = df.withColumn("longitude", col("longitude").cast("double"))
 
-    # Validate and normalize NYC Boroughs (5 Legal Boroughs + UNSPECIFIED)
-    if "borough" in df_valid.columns:
-        b_clean = standardize_string_series(df_valid["borough"], "UNSPECIFIED", case="upper")
-        is_unrec_b = ~b_clean.isin(VALID_NYC_BOROUGHS)
-        df_valid["is_valid_borough"] = ~is_unrec_b
-        df_valid["unrecognized_borough_val"] = np.where(is_unrec_b, b_clean, "")
-        df_valid["borough"] = b_clean.where(~is_unrec_b, "UNSPECIFIED")
+    # Borough normalization & soft tagging
+    if "borough" in cols:
+        b_str = upper(trim(col("borough").cast("string")))
+        b_clean = when(b_str.isNull() | b_str.isin(["", "NAN", "NONE", "NULL", "<NA>"]), lit("UNSPECIFIED")).otherwise(b_str)
+        is_rec_b = b_clean.isin(list(VALID_NYC_BOROUGHS))
+        df = (
+            df.withColumn("is_valid_borough", is_rec_b)
+            .withColumn("unrecognized_borough_val", when(~is_rec_b, b_clean).otherwise(lit("")))
+            .withColumn("borough", when(is_rec_b, b_clean).otherwise(lit("UNSPECIFIED")))
+        )
     else:
-        df_valid["borough"] = "UNSPECIFIED"
-        df_valid["is_valid_borough"] = True
-        df_valid["unrecognized_borough_val"] = ""
-
-    # Fallback to vectorized NumPy/Pandas only if grid_distance_km was not precomputed by PySpark
-    if "grid_distance_km" not in df_valid.columns or df_valid["grid_distance_km"].isna().all():
-        grid_pattern = r"^GRID_([0-9.-]+)_([0-9.-]+)$"
-        extracted_coords = df_valid["grid_id"].str.extract(grid_pattern)
-        grid_center_lat = pd.to_numeric(extracted_coords[0], errors="coerce")
-        grid_center_lon = pd.to_numeric(extracted_coords[1], errors="coerce")
-
-        df_valid["grid_distance_km"] = haversine_distance_km(
-            df_valid["clean_latitude"],
-            df_valid["clean_longitude"],
-            grid_center_lat,
-            grid_center_lon,
+        df = (
+            df.withColumn("borough", lit("UNSPECIFIED"))
+            .withColumn("is_valid_borough", lit(True))
+            .withColumn("unrecognized_borough_val", lit(""))
         )
 
-    # Spatial resolution statistics
-    spatial_stats = df_valid["spatial_resolution_level"].value_counts().to_dict()
-    logger.info(f"Spatial imputation summary: {spatial_stats}")
-
-    # 5. Categorical, Syntactic & Institutional Validations
-    # A. Complaint Type and Descriptor Standardization
-    if "complaint_type" in df_valid.columns:
-        df_valid["complaint_type"] = standardize_string_series(df_valid["complaint_type"], "Unknown", case="title")
-    if "descriptor" in df_valid.columns:
-        df_valid["descriptor"] = standardize_string_series(df_valid["descriptor"], "Not Stated", case="preserve")
-
-    # C. Status Standardization & Validation
-    if "status" in df_valid.columns:
-        st_clean = standardize_string_series(df_valid["status"], "UNKNOWN", case="upper")
-        is_unrec_st = ~st_clean.isin(KNOWN_311_STATUSES)
-        df_valid["unrecognized_status_val"] = np.where(is_unrec_st, st_clean, "")
-        df_valid["status"] = st_clean
+    # Complaint type and descriptor
+    if "complaint_type" in cols:
+        ct_str = initcap(trim(col("complaint_type").cast("string")))
+        df = df.withColumn(
+            "complaint_type",
+            when(ct_str.isNull() | ct_str.isin(["", "Nan", "None", "Null", "<Na>"]), lit("Unknown")).otherwise(ct_str),
+        )
     else:
-        df_valid["status"] = "UNKNOWN"
-        df_valid["unrecognized_status_val"] = ""
+        df = df.withColumn("complaint_type", lit("Unknown"))
 
-    # D. Agency Acronym Syntactic Validation
-    # Enforces syntax: cannot be purely numeric (except "311"/"3-1-1"), length 2-10, valid characters
-    if "agency" in df_valid.columns:
-        ag_clean = standardize_string_series(df_valid["agency"], "UNKNOWN", case="upper")
-        cond_numeric = ag_clean.str.match(r"^\d+$") & ~ag_clean.isin(["311", "3-1-1"])
-        cond_bad_len = (ag_clean != "UNKNOWN") & ((ag_clean.str.len() < 2) | (ag_clean.str.len() > 10))
-        cond_bad_chars = (ag_clean != "UNKNOWN") & ~ag_clean.str.match(r"^[A-Z0-9\-]+$")
+    if "descriptor" in cols:
+        d_str = trim(col("descriptor").cast("string"))
+        df = df.withColumn(
+            "descriptor",
+            when(d_str.isNull() | upper(d_str).isin(["", "NAN", "NONE", "NULL", "<NA>"]), lit("Not Stated")).otherwise(d_str),
+        )
+    else:
+        df = df.withColumn("descriptor", lit("Not Stated"))
+
+    # Status standardization & validation
+    if "status" in cols:
+        st_str = upper(trim(col("status").cast("string")))
+        st_clean = when(st_str.isNull() | st_str.isin(["", "NAN", "NONE", "NULL", "<NA>"]), lit("UNKNOWN")).otherwise(st_str)
+        is_unrec_st = ~st_clean.isin(list(KNOWN_311_STATUSES))
+        df = (
+            df.withColumn("unrecognized_status_val", when(is_unrec_st, st_clean).otherwise(lit("")))
+            .withColumn("status", st_clean)
+        )
+    else:
+        df = df.withColumn("status", lit("UNKNOWN")).withColumn("unrecognized_status_val", lit(""))
+
+    # Agency syntactic & registry validation
+    if "agency" in cols:
+        ag_str = upper(trim(col("agency").cast("string")))
+        ag_clean = when(ag_str.isNull() | ag_str.isin(["", "NAN", "NONE", "NULL", "<NA>"]), lit("UNKNOWN")).otherwise(ag_str)
+        cond_numeric = ag_clean.rlike(r"^\d+$") & (~ag_clean.isin(["311", "3-1-1"]))
+        cond_bad_len = (ag_clean != "UNKNOWN") & ((length(ag_clean) < 2) | (length(ag_clean) > 10))
+        cond_bad_chars = (ag_clean != "UNKNOWN") & (~ag_clean.rlike(r"^[A-Z0-9\-]+$"))
         is_malformed_ag = cond_numeric | cond_bad_len | cond_bad_chars
-        df_valid["is_malformed_agency"] = is_malformed_ag
-        df_valid["malformed_agency_val"] = np.where(is_malformed_ag, ag_clean, "")
-        df_valid["agency"] = ag_clean.where(~is_malformed_ag, "UNKNOWN")
-    else:
-        df_valid["agency"] = "UNKNOWN"
-        df_valid["is_malformed_agency"] = False
-        df_valid["malformed_agency_val"] = ""
 
-    # E. Open Data Channel Type Validation
-    if "open_data_channel_type" in df_valid.columns:
-        ch_clean = standardize_string_series(df_valid["open_data_channel_type"], "UNKNOWN", case="upper")
-        is_unrec_ch = ~ch_clean.isin(VALID_OPEN_DATA_CHANNELS)
-        df_valid["unrecognized_channel_val"] = np.where(is_unrec_ch, ch_clean, "")
-        df_valid["open_data_channel_type"] = ch_clean.where(~is_unrec_ch, "UNKNOWN")
+        df = (
+            df.withColumn("is_malformed_agency", is_malformed_ag)
+            .withColumn("malformed_agency_val", when(is_malformed_ag, ag_clean).otherwise(lit("")))
+            .withColumn("agency", when(~is_malformed_ag, ag_clean).otherwise(lit("UNKNOWN")))
+        )
     else:
-        df_valid["open_data_channel_type"] = "UNKNOWN"
-        df_valid["unrecognized_channel_val"] = ""
+        df = (
+            df.withColumn("agency", lit("UNKNOWN"))
+            .withColumn("is_malformed_agency", lit(False))
+            .withColumn("malformed_agency_val", lit(""))
+        )
 
-    # 6. Type Enforcement & Consistency Validations
-    df_valid["latitude"] = raw_lats
-    df_valid["longitude"] = raw_lons
+    # Agency registry check
+    df = df.withColumn("is_known_agency", col("agency").isin(list(KNOWN_NYC_AGENCIES)))
+
+    # Open Data Channel Type validation
+    if "open_data_channel_type" in cols:
+        ch_str = upper(trim(col("open_data_channel_type").cast("string")))
+        ch_clean = when(ch_str.isNull() | ch_str.isin(["", "NAN", "NONE", "NULL", "<NA>"]), lit("UNKNOWN")).otherwise(ch_str)
+        is_unrec_ch = ~ch_clean.isin(list(VALID_OPEN_DATA_CHANNELS))
+        df = (
+            df.withColumn("unrecognized_channel_val", when(is_unrec_ch, ch_clean).otherwise(lit("")))
+            .withColumn("open_data_channel_type", when(~is_unrec_ch, ch_clean).otherwise(lit("UNKNOWN")))
+        )
+    else:
+        df = df.withColumn("open_data_channel_type", lit("UNKNOWN")).withColumn("unrecognized_channel_val", lit(""))
 
     # NY State Plane Coordinates (Sanity Bounds [900000..1075000, 110000..285000])
-    if "x_coordinate_state_plane" in df_valid.columns:
-        x_num = pd.to_numeric(df_valid["x_coordinate_state_plane"], errors="coerce")
-        df_valid["x_coordinate_state_plane"] = np.where(
-            x_num.between(NYC_STATE_PLANE_BOUNDS["x_min"], NYC_STATE_PLANE_BOUNDS["x_max"]),
-            x_num,
-            np.nan,
-        )
-    if "y_coordinate_state_plane" in df_valid.columns:
-        y_num = pd.to_numeric(df_valid["y_coordinate_state_plane"], errors="coerce")
-        df_valid["y_coordinate_state_plane"] = np.where(
-            y_num.between(NYC_STATE_PLANE_BOUNDS["y_min"], NYC_STATE_PLANE_BOUNDS["y_max"]),
-            y_num,
-            np.nan,
-        )
+    if "x_coordinate_state_plane" in cols:
+        x_num = col("x_coordinate_state_plane").cast("double")
+        cond_x = (x_num >= lit(NYC_STATE_PLANE_BOUNDS["x_min"])) & (x_num <= lit(NYC_STATE_PLANE_BOUNDS["x_max"]))
+        df = df.withColumn("x_coordinate_state_plane", when(cond_x, x_num).otherwise(lit(None).cast("double")))
+    if "y_coordinate_state_plane" in cols:
+        y_num = col("y_coordinate_state_plane").cast("double")
+        cond_y = (y_num >= lit(NYC_STATE_PLANE_BOUNDS["y_min"])) & (y_num <= lit(NYC_STATE_PLANE_BOUNDS["y_max"]))
+        df = df.withColumn("y_coordinate_state_plane", when(cond_y, y_num).otherwise(lit(None).cast("double")))
 
     # Council District: NYC Charter Chapter 2, Section 22 defines exactly 51 Council Districts (1-51)
-    if "council_district" in df_valid.columns:
-        c_num = pd.to_numeric(df_valid["council_district"], errors="coerce")
-        c_valid = c_num.where(c_num.between(NYC_COUNCIL_DISTRICT_MIN, NYC_COUNCIL_DISTRICT_MAX))
-        df_valid["council_district"] = c_valid.astype("Int16")
+    if "council_district" in cols:
+        c_num = col("council_district").cast("short")
+        cond_c = (c_num >= lit(NYC_COUNCIL_DISTRICT_MIN)) & (c_num <= lit(NYC_COUNCIL_DISTRICT_MAX))
+        df = df.withColumn("council_district", when(cond_c, c_num).otherwise(lit(None).cast("short")))
 
-    # Police Precinct: NYC has 77 NYPD precincts (ranging 1-123)
-    if "police_precinct" in df_valid.columns:
-        precinct_extracted = df_valid["police_precinct"].astype(str).str.extract(r"(\d+)")[0]
-        precinct_num = pd.to_numeric(precinct_extracted, errors="coerce")
-        p_valid = precinct_num.where(precinct_num.between(1, 123))
-        df_valid["clean_police_precinct"] = p_valid.astype("Int16")
+    # Police Precinct: NYC NYPD precincts (ranging 1-123)
+    if "police_precinct" in cols:
+        p_extr = regexp_extract(col("police_precinct").cast("string"), r"(\d+)", 1)
+        p_num = when(p_extr != "", p_extr.cast("short")).otherwise(lit(None).cast("short"))
+        cond_p = (p_num >= 1) & (p_num <= 123)
+        df = df.withColumn("clean_police_precinct", when(cond_p, p_num).otherwise(lit(None).cast("short")))
 
     # Secondary Timestamps: Parse to UTC
-    if "due_date" in df_valid.columns:
-        df_valid["due_date_utc"] = to_utc_datetime(df_valid["due_date"])
-    if "resolution_action_updated_date" in df_valid.columns:
-        df_valid["resolution_action_updated_date_utc"] = to_utc_datetime(df_valid["resolution_action_updated_date"])
+    if "due_date" in cols:
+        df = df.withColumn("due_date_utc", to_utc_timestamp(to_timestamp(col("due_date")), "America/New_York"))
+    if "resolution_action_updated_date" in cols:
+        df = df.withColumn(
+            "resolution_action_updated_date_utc",
+            to_utc_timestamp(to_timestamp(col("resolution_action_updated_date")), "America/New_York"),
+        )
 
-    # 7. Quality Tagging & Observability Audit Notes
-    # Instant Closures (Closed at creation: 0.0 duration)
-    valid_dur_secs = (df_valid["closed_at_utc"] - df_valid["created_at_utc"]).dt.total_seconds()
-    df_valid["is_instant_closure"] = df_valid["is_ticket_closed"] & (valid_dur_secs == 0)
+    return df
 
-    # Status vs. Closed Date Contradiction:
-    # (a) Agency status is OPEN/IN PROGRESS/PENDING/etc., but closed_date is populated
-    # (b) Agency status is CLOSED, but closed_date is missing (NaT)
-    open_statuses = {"OPEN", "IN PROGRESS", "PENDING", "ASSIGNED", "STARTED"}
-    closed_statuses = {"CLOSED"}
-    if "status" in df_valid.columns:
-        cond_open_with_closed_date = df_valid["is_ticket_closed"] & df_valid["status"].isin(open_statuses)
-        cond_closed_without_closed_date = (~df_valid["is_ticket_closed"]) & df_valid["status"].isin(closed_statuses)
-        df_valid["is_status_conflict"] = cond_open_with_closed_date | cond_closed_without_closed_date
-    else:
-        cond_open_with_closed_date = pd.Series(False, index=df_valid.index)
-        cond_closed_without_closed_date = pd.Series(False, index=df_valid.index)
-        df_valid["is_status_conflict"] = False
+
+def attach_quality_audit_tags(df: DataFrame, processed_at_utc: str) -> DataFrame:
+    """
+    Derive instant closure, status conflict, and extreme duration flags.
+    Construct human-readable quality audit notes string using pure PySpark Catalyst functions.
+    Attach Silver metadata and prune intermediate string helpers.
+    """
+    valid_dur_secs = col("closed_at_utc").cast("long") - col("created_at_utc").cast("long")
+    df = df.withColumn("is_instant_closure", col("is_ticket_closed") & (valid_dur_secs == 0))
+
+    # Status vs. Closed Date Contradiction
+    open_statuses = ["OPEN", "IN PROGRESS", "PENDING", "ASSIGNED", "STARTED"]
+    closed_statuses = ["CLOSED"]
+    cond_open_with_closed_date = col("is_ticket_closed") & col("status").isin(open_statuses)
+    cond_closed_without_closed_date = (~col("is_ticket_closed")) & col("status").isin(closed_statuses)
+    df = df.withColumn("is_status_conflict", cond_open_with_closed_date | cond_closed_without_closed_date)
 
     # Extreme Outlier Durations (> 2 years / 17,520 hours)
-    df_valid["is_extreme_duration"] = df_valid["is_ticket_closed"] & (df_valid["resolution_duration_hours"] > 17520.0)
-
-    # Agency Registry Soft Check (Identifies primary municipal agencies vs external / newly added entities)
-    df_valid["is_known_agency"] = df_valid["agency"].isin(KNOWN_NYC_AGENCIES)
-
-    # Vectorized Observability Audit String Construction (avoids slow row-by-row .iterrows())
-    df_valid["quality_audit_notes"] = None
-    any_audit_flag = (
-        df_valid["is_instant_closure"]
-        | df_valid["is_status_conflict"]
-        | df_valid["is_extreme_duration"]
-        | df_valid["is_out_of_state_zip"]
-        | (~df_valid["is_valid_borough"])
-        | df_valid["is_malformed_agency"]
-        | ((~df_valid["is_known_agency"]) & (df_valid["agency"] != "UNKNOWN"))
-        | (df_valid["unrecognized_channel_val"] != "")
-        | (df_valid["unrecognized_status_val"] != "")
-    )
-    if any_audit_flag.any():
-        sub = df_valid.loc[any_audit_flag]
-        status_vals = sub["status"].astype(str) if "status" in sub.columns else pd.Series("UNKNOWN", index=sub.index)
-        zip_vals = sub["clean_incident_zip"].astype(str) if "clean_incident_zip" in sub.columns else pd.Series("", index=sub.index)
-        agency_vals = sub["agency"].astype(str) if "agency" in sub.columns else pd.Series("UNKNOWN", index=sub.index)
-        dur_vals = sub["resolution_duration_hours"].astype(str)
-
-        note_parts = pd.DataFrame(index=sub.index)
-        note_parts["n1"] = np.where(sub["is_instant_closure"], "INSTANT_CLOSURE_0SEC", "")
-        note_parts["n2"] = np.where(
-            cond_open_with_closed_date.loc[sub.index],
-            "STATUS_CONFLICT(status=" + status_vals + "_with_closed_date)",
-            np.where(
-                cond_closed_without_closed_date.loc[sub.index],
-                "STATUS_CONFLICT(status=" + status_vals + "_without_closed_date)",
-                "",
-            ),
-        )
-        note_parts["n3"] = np.where(sub["is_extreme_duration"], "EXTREME_DURATION(" + dur_vals + "h)", "")
-        note_parts["n4"] = np.where(sub["is_out_of_state_zip"], "OUT_OF_STATE_ZIP(" + zip_vals + ")", "")
-        note_parts["n5"] = np.where(~sub["is_valid_borough"], "UNRECOGNIZED_BOROUGH(" + sub["unrecognized_borough_val"] + ")", "")
-        note_parts["n6"] = np.where(
-            sub["is_malformed_agency"],
-            "MALFORMED_AGENCY(" + sub["malformed_agency_val"] + ")",
-            np.where(
-                (~sub["is_known_agency"]) & (sub["agency"] != "UNKNOWN"),
-                "UNREGISTERED_AGENCY(" + agency_vals + ")",
-                "",
-            ),
-        )
-        note_parts["n7"] = np.where(sub["unrecognized_channel_val"] != "", "UNRECOGNIZED_CHANNEL(" + sub["unrecognized_channel_val"] + ")", "")
-        note_parts["n8"] = np.where(sub["unrecognized_status_val"] != "", "UNRECOGNIZED_STATUS(" + sub["unrecognized_status_val"] + ")", "")
-
-        df_valid.loc[any_audit_flag, "quality_audit_notes"] = [
-            "; ".join(val for val in row if val)
-            for row in note_parts.to_numpy()
-        ]
-
-    # Clean up temporary string helpers from output schema
-    df_valid.drop(
-        columns=[
-            "unrecognized_borough_val",
-            "is_malformed_agency",
-            "malformed_agency_val",
-            "unrecognized_channel_val",
-            "unrecognized_status_val",
-        ],
-        inplace=True,
+    df = df.withColumn(
+        "is_extreme_duration",
+        col("is_ticket_closed") & (col("resolution_duration_hours") > 17520.0),
     )
 
-    # Silver Audit Metadata
-    df_valid["_silver_processed_at_utc"] = processed_at_utc
+    # Observability Audit String Construction in PySpark Catalyst
+    n1 = when(col("is_instant_closure"), lit("INSTANT_CLOSURE_0SEC"))
+    n2 = (
+        when(cond_open_with_closed_date, concat(lit("STATUS_CONFLICT(status="), col("status"), lit("_with_closed_date)")))
+        .when(cond_closed_without_closed_date, concat(lit("STATUS_CONFLICT(status="), col("status"), lit("_without_closed_date)")))
+    )
+    n3 = when(col("is_extreme_duration"), concat(lit("EXTREME_DURATION("), col("resolution_duration_hours").cast("string"), lit("h)")))
+    n4 = when(col("is_out_of_state_zip"), concat(lit("OUT_OF_STATE_ZIP("), col("clean_incident_zip"), lit(")")))
+    n5 = when(~col("is_valid_borough"), concat(lit("UNRECOGNIZED_BOROUGH("), col("unrecognized_borough_val"), lit(")")))
+    n6 = (
+        when(col("is_malformed_agency"), concat(lit("MALFORMED_AGENCY("), col("malformed_agency_val"), lit(")")))
+        .when((~col("is_known_agency")) & (col("agency") != "UNKNOWN"), concat(lit("UNREGISTERED_AGENCY("), col("agency"), lit(")")))
+    )
+    n7 = when(col("unrecognized_channel_val") != "", concat(lit("UNRECOGNIZED_CHANNEL("), col("unrecognized_channel_val"), lit(")")))
+    n8 = when(col("unrecognized_status_val") != "", concat(lit("UNRECOGNIZED_STATUS("), col("unrecognized_status_val"), lit(")")))
 
-    # 7. Partitioned Parquet Write: year=YYYY / month=MM / clean_311.parquet
+    audit_array = array_compact(array(n1, n2, n3, n4, n5, n6, n7, n8))
+    notes_str = concat_ws("; ", audit_array)
+    df = df.withColumn(
+        "quality_audit_notes",
+        when(trim(notes_str) != "", notes_str).otherwise(lit(None).cast("string")),
+    )
+
+    # Drop temporary string helper columns from output schema
+    df = df.drop(
+        "unrecognized_borough_val",
+        "is_malformed_agency",
+        "malformed_agency_val",
+        "unrecognized_channel_val",
+        "unrecognized_status_val",
+    )
+
+    df = df.withColumn("_silver_processed_at_utc", lit(processed_at_utc))
+    return df
+
+
+def write_silver_311(df: DataFrame, silver_311_dir: Path) -> int:
+    """
+    Save validated Silver 311 records to partitioned Parquet files:
+    year=<YYYY>/month=<MM>/
+    100% pure PySpark, maintaining all columns inside Parquet schema.
+    """
     silver_311_dir.mkdir(parents=True, exist_ok=True)
-    df_valid["_partition_year"] = df_valid["created_at_utc"].dt.strftime("%Y")
-    df_valid["_partition_month"] = df_valid["created_at_utc"].dt.strftime("%m")
+    df_part = (
+        df.withColumn("_partition_year", date_format(col("created_at_utc"), "yyyy"))
+        .withColumn("_partition_month", date_format(col("created_at_utc"), "MM"))
+    )
 
+    partitions = df_part.select("_partition_year", "_partition_month").distinct().collect()
     written_files = 0
-    for (year, month), sub_df in df_valid.groupby(["_partition_year", "_partition_month"]):
+    for row in partitions:
+        year = row["_partition_year"]
+        month = row["_partition_month"]
+        if year is None or month is None:
+            continue
         partition_dir = silver_311_dir / f"year={year}" / f"month={month}"
         partition_dir.mkdir(parents=True, exist_ok=True)
-
-        out_path = partition_dir / "clean_311.parquet"
-        save_df = sub_df.drop(columns=["_partition_year", "_partition_month"])
-
-        table = pa.Table.from_pandas(save_df, preserve_index=False)
-        pq.write_table(
-            table,
-            out_path,
-            compression="snappy",
-            coerce_timestamps="us",
-            allow_truncated_timestamps=True,
+        (
+            df_part.filter((col("_partition_year") == year) & (col("_partition_month") == month))
+            .drop("_partition_year", "_partition_month")
+            .coalesce(1)
+            .write.mode("overwrite")
+            .parquet(str(partition_dir))
         )
         written_files += 1
 
-    elapsed = time.time() - start_time
-    logger.info(
-        f"Completed Silver 311 processing: {len(df_valid):,} valid records | "
-        f"{len(df_quarantined):,} quarantined | {written_files} partition files written | {elapsed:.2f}s"
+    return written_files
+
+
+def clean_and_validate_311(
+    bronze_311_dir: Path = BRONZE_DIR / "nyc311",
+    silver_311_dir: Path = SILVER_DIR / "nyc311",
+    quarantine_dir: Path = QUARANTINE_DIR / "nyc311",
+) -> Dict[str, Any]:
+    """
+    100% pure PySpark Silver Layer 311 Orchestrator:
+    1. Ingest Bronze Parquet files.
+    2. Normalize Eastern Time timestamps to UTC and compute durations.
+    3. Quarantine invalid boundary violations directly to Parquet.
+    4. CDC Deduplicate valid records by unique_key.
+    5. Hierarchical spatial imputation (Level 1 GPS -> Level 2 ZIP -> Level 3 Borough).
+    6. Standardize categorical and administrative features.
+    7. Attach quality audit notes and flags.
+    8. Write clean partitioned Parquet tables via pure PySpark.
+    """
+    start_time = time.time()
+    processed_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    now_epoch = int(datetime.now(timezone.utc).timestamp())
+
+    bronze_files = sorted(bronze_311_dir.glob("**/*.parquet"))
+    if not bronze_files:
+        logger.warning(f"No Bronze 311 files found in {bronze_311_dir}")
+        return {"status": "skipped", "reason": "no_input_files"}
+
+    logger.info(f"Loading {len(bronze_files)} Bronze 311 partition files into PySpark...")
+    spark = get_spark_session("DAT535-Silver-Clean-311")
+    file_paths = [str(f.resolve()) for f in bronze_files]
+    df_raw = spark.read.parquet(*file_paths)
+    input_rows = df_raw.count()
+    logger.info(f"Loaded {input_rows:,} raw 311 records from Bronze via PySpark.")
+
+    # 1. Temporal Normalization & Duration Derivations
+    df_proc = normalize_timestamps_and_durations(df_raw, now_epoch)
+
+    # 2. Strict Boundary Quarantine Validation
+    df_valid_candidates, quarantined_count = quarantine_invalid_311_records(
+        df_proc, now_epoch, quarantine_dir
     )
 
-    closed_count = int(df_valid["is_ticket_closed"].sum()) if "is_ticket_closed" in df_valid.columns else 0
-    open_count = len(df_valid) - closed_count
-    conflict_count = int(df_valid["is_status_conflict"].sum())
-    instant_count = int(df_valid["is_instant_closure"].sum())
+    candidate_count = df_valid_candidates.count()
+    if candidate_count == 0:
+        elapsed = time.time() - start_time
+        logger.info("Silver 311 processing complete: 0 valid records retained.")
+        return {
+            "dataset": "silver_311",
+            "input_rows": input_rows,
+            "duplicate_rows_removed": 0,
+            "valid_rows_accepted": 0,
+            "avg_grid_distance_km": 0.0,
+            "p95_grid_distance_km": 0.0,
+            "closed_tickets_count": 0,
+            "open_tickets_count": 0,
+            "status_conflict_count": 0,
+            "instant_closure_count": 0,
+            "quarantined_rows": quarantined_count,
+            "spatial_resolution_breakdown": {},
+            "incident_clustering": {
+                "total_locatable_records": 0,
+                "unlocatable_records": 0,
+                "duplicate_burst_calls_collapsed": 0,
+                "burst_collapse_rate_pct": 0.0,
+                "distinct_physical_incidents": 0,
+                "route_breakdown": {},
+            },
+            "partitions_written": 0,
+            "duration_seconds": round(elapsed, 2),
+            "status": "success",
+        }
 
-    valid_dist = df_valid["grid_distance_km"].dropna()
-    avg_grid_dist = round(float(valid_dist.mean()), 2) if len(valid_dist) > 0 else 0.0
-    p95_grid_dist = round(float(valid_dist.quantile(0.95)), 2) if len(valid_dist) > 0 else 0.0
+    # 3. CDC Deduplication on Valid Candidates
+    df_dedup, duplicate_rows_removed = deduplicate_311_records(df_valid_candidates)
 
-    total_loc = int((df_valid["loc_key"].notna() & (df_valid["loc_key"] != "")).sum()) if "loc_key" in df_valid.columns else 0
-    unloc_cnt = len(df_valid) - total_loc
-    dup_burst_cnt = int(df_valid["is_burst_duplicate"].sum()) if "is_burst_duplicate" in df_valid.columns else 0
-    distinct_inc = len(df_valid) - dup_burst_cnt
-    burst_rate = round((dup_burst_cnt / total_loc * 100.0), 2) if total_loc > 0 else 0.0
-    routes_dict = df_valid["loc_routing_type"].value_counts().to_dict() if "loc_routing_type" in df_valid.columns else {}
+    # 4. Hierarchical Spatial Imputation & Burst Clustering
+    df_spatial = impute_spatial_hierarchy_311(df_dedup, spark)
+
+    # 5. Categorical, Syntactic & Institutional Standardization
+    df_std = standardize_categorical_and_administrative_attributes(df_spatial)
+
+    # 6. Observability Audit Tags & Metadata
+    df_silver = attach_quality_audit_tags(df_std, processed_at_utc)
+    df_silver.persist(StorageLevel.MEMORY_AND_DISK)
+
+    # 7. Pure PySpark Partitioned Parquet Write
+    written_files = write_silver_311(df_silver, silver_311_dir)
+
+    # 8. Compute Audit Metrics in PySpark
+    valid_rows_accepted = df_silver.count()
+    if valid_rows_accepted > 0:
+        cols_silver = set(df_silver.columns)
+        loc_expr = (
+            spark_sum(when(col("loc_key").isNotNull() & (trim(col("loc_key")) != ""), 1).otherwise(0)).alias("total_loc")
+            if "loc_key" in cols_silver
+            else lit(0).alias("total_loc")
+        )
+        dup_burst_expr = (
+            spark_sum(when(col("is_burst_duplicate") == True, 1).otherwise(0)).alias("dup_burst_cnt")
+            if "is_burst_duplicate" in cols_silver
+            else lit(0).alias("dup_burst_cnt")
+        )
+
+        agg = df_silver.select(
+            spark_sum(when(col("is_ticket_closed"), 1).otherwise(0)).alias("closed_count"),
+            spark_sum(when(col("is_status_conflict"), 1).otherwise(0)).alias("conflict_count"),
+            spark_sum(when(col("is_instant_closure"), 1).otherwise(0)).alias("instant_count"),
+            avg("grid_distance_km").alias("avg_dist"),
+            percentile_approx("grid_distance_km", 0.95).alias("p95_dist"),
+            loc_expr,
+            dup_burst_expr,
+        ).first()
+
+        closed_count = int(agg["closed_count"] or 0)
+        open_count = valid_rows_accepted - closed_count
+        conflict_count = int(agg["conflict_count"] or 0)
+        instant_count = int(agg["instant_count"] or 0)
+        avg_grid_dist = round(float(agg["avg_dist"]), 2) if agg["avg_dist"] is not None else 0.0
+        p95_grid_dist = round(float(agg["p95_dist"]), 2) if agg["p95_dist"] is not None else 0.0
+        total_loc = int(agg["total_loc"] or 0)
+        unloc_cnt = valid_rows_accepted - total_loc
+        dup_burst_cnt = int(agg["dup_burst_cnt"] or 0)
+        distinct_inc = valid_rows_accepted - dup_burst_cnt
+        burst_rate = round((dup_burst_cnt / total_loc * 100.0), 2) if total_loc > 0 else 0.0
+
+        spatial_rows = df_silver.groupBy("spatial_resolution_level").count().collect()
+        spatial_stats = {r["spatial_resolution_level"]: int(r["count"]) for r in spatial_rows}
+
+        if "loc_routing_type" in cols_silver:
+            route_rows = df_silver.groupBy("loc_routing_type").count().collect()
+            routes_dict = {r["loc_routing_type"]: int(r["count"]) for r in route_rows}
+        else:
+            routes_dict = {}
+    else:
+        closed_count = 0
+        open_count = 0
+        conflict_count = 0
+        instant_count = 0
+        avg_grid_dist = 0.0
+        p95_grid_dist = 0.0
+        total_loc = 0
+        unloc_cnt = 0
+        dup_burst_cnt = 0
+        distinct_inc = 0
+        burst_rate = 0.0
+        spatial_stats = {}
+        routes_dict = {}
+
+    df_silver.unpersist()
+    df_dedup.unpersist()
+
+    elapsed = time.time() - start_time
+    logger.info(
+        f"Completed Silver 311 processing: {valid_rows_accepted:,} valid records | "
+        f"{quarantined_count:,} quarantined | {written_files} partition files written | {elapsed:.2f}s"
+    )
 
     return {
         "dataset": "silver_311",
         "input_rows": input_rows,
         "duplicate_rows_removed": duplicate_rows_removed,
-        "valid_rows_accepted": len(df_valid),
+        "valid_rows_accepted": valid_rows_accepted,
         "avg_grid_distance_km": avg_grid_dist,
         "p95_grid_distance_km": p95_grid_dist,
         "closed_tickets_count": closed_count,
         "open_tickets_count": open_count,
         "status_conflict_count": conflict_count,
         "instant_closure_count": instant_count,
-        "quarantined_rows": len(df_quarantined),
+        "quarantined_rows": quarantined_count,
         "spatial_resolution_breakdown": spatial_stats,
         "incident_clustering": {
             "total_locatable_records": total_loc,

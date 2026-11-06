@@ -25,6 +25,17 @@ jobs:
         # Persistent, non-tmp path: survives runner reboots/tmpfiles cleanup, unlike /tmp
         run: echo "dir=$HOME/spark-lab-data/dev" >> "$GITHUB_OUTPUT"
 
+      - name: Align PySpark with Course Specification (Spark 3.5.x for Java 8)
+        run: |
+          source ~/spark-env/bin/activate
+          # Ensure PySpark is aligned with the course specification (3.5.x) and Java 8
+          PYSPARK_VER=$(python -c "import pyspark; print(pyspark.__version__)" 2>/dev/null || echo "0")
+          if [[ "$PYSPARK_VER" =~ ^4\. ]]; then
+            echo "Notice: Detected PySpark $PYSPARK_VER (requires Java 17+)."
+            echo "Aligning virtualenv to PySpark 3.5.x for Java 8 compatibility..."
+            pip install "pyspark>=3.5.0,<4.0.0"
+          fi
+
       - name: Execute Automated Test Suite Gate
         run: |
           source ~/spark-env/bin/activate

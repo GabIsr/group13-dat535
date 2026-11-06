@@ -13,6 +13,31 @@ from typing import Dict, Optional
 logger = logging.getLogger("spark_session_factory")
 
 
+def _get_java_major_version(java_exe: Path) -> Optional[int]:
+    """Parse major Java version from java -version output (e.g. 8, 11, 17, 21)."""
+    try:
+        import subprocess
+        res = subprocess.run(
+            [str(java_exe), "-version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+        output = res.stderr or res.stdout
+        for line in output.splitlines():
+            if "version" in line:
+                parts = line.split('"')
+                if len(parts) >= 2:
+                    v_str = parts[1]
+                    if v_str.startswith("1."):
+                        return int(v_str.split(".")[1])
+                    return int(v_str.split(".")[0])
+    except Exception:
+        pass
+    return None
+
+
 def _configure_environment():
     """Ensure JAVA_HOME, SPARK_HOME, HADOOP_HOME (for Windows), PATH, and PySpark Python paths are properly configured."""
     # 1. Validate & sanitize SPARK_HOME to prevent classpath incompatibilities
@@ -41,15 +66,33 @@ def _configure_environment():
             except Exception:
                 pass
 
-    # 2. Validate JAVA_HOME
+    # 2. Validate JAVA_HOME and check version compatibility with PySpark
+    pyspark_major = None
+    try:
+        import pyspark
+        pyspark_major = int(pyspark.__version__.split(".")[0])
+    except Exception:
+        pass
+
     if "JAVA_HOME" in os.environ:
         java_home = Path(os.environ["JAVA_HOME"])
         java_exe = "java.exe" if sys.platform == "win32" else "java"
-        if not (java_home / "bin" / java_exe).exists():
+        j_bin = java_home / "bin" / java_exe
+        if not j_bin.exists():
             logger.warning(f"JAVA_HOME={java_home} does not contain bin/{java_exe}. Removing invalid JAVA_HOME.")
             del os.environ["JAVA_HOME"]
+        elif pyspark_major and pyspark_major >= 4:
+            # PySpark 4.x bytecode requires Java 17+ (class file version 61.0).
+            # If current JAVA_HOME is Java 8 or 11, it will fail with UnsupportedClassVersionError.
+            j_ver = _get_java_major_version(j_bin)
+            if j_ver and j_ver < 17:
+                logger.warning(
+                    f"Configured JAVA_HOME ({java_home}) is Java {j_ver}, but PySpark {pyspark_major}.x "
+                    f"requires Java 17+. Searching for compatible Java runtime..."
+                )
+                del os.environ["JAVA_HOME"]
 
-    # If JAVA_HOME is not set, try to locate it within the conda environment
+    # If JAVA_HOME is not set, try to locate it within the conda environment or system paths
     if "JAVA_HOME" not in os.environ:
         conda_env = sys.prefix
         candidate_jvm = Path(conda_env) / "Library" / "lib" / "jvm"
@@ -58,6 +101,20 @@ def _configure_environment():
             os.environ["JAVA_HOME"] = str(candidate_jvm)
         elif candidate_library.exists() and (candidate_library / "bin" / "java.exe").exists():
             os.environ["JAVA_HOME"] = str(candidate_library)
+        elif sys.platform != "win32":
+            # Search /usr/lib/jvm on Linux for Java 17 or 21
+            jvm_dir = Path("/usr/lib/jvm")
+            if jvm_dir.is_dir():
+                candidates = sorted(list(jvm_dir.glob("*17*")) + list(jvm_dir.glob("*21*")), reverse=True)
+                for cand in candidates:
+                    cand_bin = cand / "bin" / "java"
+                    if cand_bin.exists() and cand.is_dir():
+                        cand_ver = _get_java_major_version(cand_bin)
+                        if cand_ver and cand_ver >= 17:
+                            logger.info(f"Auto-selected Java {cand_ver} runtime at {cand} for PySpark {pyspark_major}.x")
+                            os.environ["JAVA_HOME"] = str(cand)
+                            os.environ["PATH"] = str(cand / "bin") + os.pathsep + os.environ.get("PATH", "")
+                            break
 
     # Windows Hadoop / winutils configuration
     if sys.platform == "win32" and "HADOOP_HOME" not in os.environ:

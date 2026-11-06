@@ -40,6 +40,12 @@ jobs:
       run: |
         source ~/spark-env/bin/activate
         if [ -n "$SPARK_HOME" ]; then unset SPARK_HOME; fi
+        PYSPARK_VER=$(python -c "import pyspark; print(pyspark.__version__)" 2>/dev/null || echo "0")
+        if [[ "$PYSPARK_VER" =~ ^4\. ]]; then
+          echo "Notice: Detected PySpark $PYSPARK_VER (requires Java 17+)."
+          echo "Aligning virtualenv to PySpark 3.5.x for Java 8 compatibility..."
+          pip install "pyspark>=3.5.0,<4.0.0"
+        fi
         echo "=== PySpark & Java Runtime Verification ==="
         python -c "import sys, pyspark; print(f'Python: {sys.version.split()[0]} | PySpark: {pyspark.__version__}')"
         java -version 2>&1 | head -n 2 || true

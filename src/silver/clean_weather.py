@@ -404,14 +404,26 @@ def clean_and_validate_weather(
     # Computed on MASKED sensor values so corrupted readings do not pollute rolling metrics!
     # Uses true chronological time windows rangeBetween(-2 * 3600, 0) on epoch seconds.
     # Dynamically preserve integer types and extend schema with row observability metadata:
+    def _to_clean_int(v):
+        if pd.isna(v) or v is None:
+            return None
+        try:
+            if isinstance(v, (float, np.floating)) and np.isnan(v):
+                return None
+            return int(round(float(v)))
+        except (ValueError, TypeError):
+            return None
+
     int_types = (LongType, IntegerType, ShortType, ByteType)
     fields = []
     for f in df_clean_spark.schema.fields:
         if f.name in df_clean.columns:
             if isinstance(f.dataType, int_types):
                 # Ensure integer preservation: non-null values remain pure int, nulls become None
-                df_clean[f.name] = df_clean[f.name].apply(
-                    lambda v: int(v) if pd.notna(v) and not (isinstance(v, float) and np.isnan(v)) else None
+                df_clean[f.name] = pd.Series(
+                    [_to_clean_int(v) for v in df_clean[f.name]],
+                    index=df_clean.index,
+                    dtype=object,
                 )
             fields.append(f)
 
@@ -427,8 +439,10 @@ def clean_and_validate_weather(
                 if not s.empty:
                     val = s.iloc[0]
                     if isinstance(val, (int, np.integer)):
-                        df_clean[col_name] = df_clean[col_name].apply(
-                            lambda v: int(v) if pd.notna(v) and not (isinstance(v, float) and np.isnan(v)) else None
+                        df_clean[col_name] = pd.Series(
+                            [_to_clean_int(v) for v in df_clean[col_name]],
+                            index=df_clean.index,
+                            dtype=object,
                         )
                         fields.append(StructField(col_name, LongType(), True))
                     elif isinstance(val, (float, np.floating)):
@@ -441,7 +455,8 @@ def clean_and_validate_weather(
                     fields.append(StructField(col_name, StringType(), True))
 
     dynamic_schema = StructType(fields)
-    df_window_spark = spark.createDataFrame(df_clean[dynamic_schema.names], schema=dynamic_schema)
+    clean_records = df_clean[dynamic_schema.names].to_dict(orient="records")
+    df_window_spark = spark.createDataFrame(clean_records, schema=dynamic_schema)
 
     # Sanitize floating-point NaNs to SQL NULL so Catalyst window aggregations skip missing values instead of propagating NaN:
     for field in df_window_spark.schema.fields:

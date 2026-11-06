@@ -88,6 +88,25 @@ def generate_quality_reconciliation_report(
     if avg_dist is not None:
         print(f"    - Grid Center Uncertainty Distance: Mean = {avg_dist:.2f} km | P95 = {p95_dist:.2f} km")
 
+    # Incident Clustering & Burst Deduplication Breakdown
+    clustering = clean_311_metrics.get("incident_clustering", {})
+    if clustering:
+        print("\n  STAGE 1B: CITIZEN CALL BURST DEDUPLICATION & INCIDENT CLUSTERING:")
+        loc_recs = clustering.get("total_locatable_records", 0)
+        unloc_recs = clustering.get("unlocatable_records", 0)
+        dup_calls = clustering.get("duplicate_burst_calls_collapsed", 0)
+        distinct_inc = clustering.get("distinct_physical_incidents", 0)
+        burst_rate = clustering.get("burst_collapse_rate_pct", 0.0)
+        print(f"    - Locatable Records Routed            : {loc_recs:,}")
+        print(f"    - Unlocatable Records (Isolated)      : {unloc_recs:,}")
+        print(f"    - Duplicate Burst Calls Collapsed     : -{dup_calls:,} ({burst_rate:.2f}%)")
+        print(f"    - Distinct Physical Incidents Derived : = {distinct_inc:,}")
+        routes = clustering.get("route_breakdown", {})
+        if routes:
+            print("    Route Distribution:")
+            for r_name, r_cnt in sorted(routes.items()):
+                print(f"      * {r_name:<34}: {r_cnt:,}")
+
     # Weather Reconciliation
     print("\n" + "-" * 90)
     w_in = clean_weather_metrics.get("input_rows", 0)

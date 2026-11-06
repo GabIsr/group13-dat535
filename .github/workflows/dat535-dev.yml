@@ -1,4 +1,4 @@
-name: DAT535 — Dev Pipeline
+name: DAT535 — Dev Pipeline & Quality Gate
 
 on:
   push:
@@ -9,13 +9,13 @@ on:
 
 jobs:
   run-dev:
-    name: Run Dev Pipeline
+    name: Run Dev Pipeline & Automated Tests
     runs-on: self-hosted
     environment: dev
     env:
       DAT535_ENV: dev
-      SPARK_HOME: /opt/spark
-      JAVA_HOME: /usr/lib/jvm/java-8-openjdk-amd64
+      SOCRATA_APP_TOKEN: ${{ secrets.SOCRATA_APP_TOKEN }}
+      PYTHONWARNINGS: "ignore::DeprecationWarning,ignore::FutureWarning,ignore::ResourceWarning"
 
     steps:
       - name: Checkout code
@@ -26,20 +26,59 @@ jobs:
         # Persistent, non-tmp path: survives runner reboots/tmpfiles cleanup, unlike /tmp
         run: echo "dir=$HOME/spark-lab-data/dev" >> "$GITHUB_OUTPUT"
 
-      - name: Run Lab 2 & Lab 3 Pipelines
+      - name: Align PySpark with Course Specification (Spark 3.5.x for Java 8)
+        run: |
+          source ~/spark-env/bin/activate
+          # Ensure PySpark is aligned with the course specification (3.5.x) and Java 8
+          PYSPARK_VER=$(python -c "import pyspark; print(pyspark.__version__)" 2>/dev/null || echo "0")
+          if [[ "$PYSPARK_VER" =~ ^4\. ]]; then
+            echo "Notice: Detected PySpark $PYSPARK_VER (requires Java 17+)."
+            echo "Aligning virtualenv to PySpark 3.5.x for Java 8 compatibility..."
+            pip install "pyspark>=3.5.0,<4.0.0"
+          fi
+
+      - name: Execute Automated Test Suite Gate
+        run: |
+          source ~/spark-env/bin/activate
+          if [ -n "$SPARK_HOME" ]; then unset SPARK_HOME; fi
+          echo "=== PySpark & Java Runtime Verification ==="
+          python -c "import sys, pyspark; print(f'Python: {sys.version.split()[0]} | PySpark: {pyspark.__version__}')"
+          java -version 2>&1 | head -n 2 || true
+          echo "=== Running Automated Unit & Integration Tests ==="
+          python $GITHUB_WORKSPACE/run_project.py test
+
+      - name: Execute Medallion Pipeline (Incremental CDC -> Silver -> Gold)
         env:
           DAT535_OUTPUT_DIR: ${{ steps.output-dir.outputs.dir }}
         run: |
           source ~/spark-env/bin/activate
+          if [ -n "$SPARK_HOME" ]; then unset SPARK_HOME; fi
           mkdir -p "$DAT535_OUTPUT_DIR"
           
-          echo "=== Running Dev Pipeline ==="
-          python $GITHUB_WORKSPACE/run_pipeline.py all
+          echo "=== Running Course Project Medallion Pipeline ==="
+          python $GITHUB_WORKSPACE/run_project.py all --env dev
 
-      - name: Upload Dev artifacts
+      - name: Publish Data Quality & Incident Scorecard to Summary
+        if: always()
+        run: |
+          source ~/spark-env/bin/activate
+          if [ -n "$SPARK_HOME" ]; then unset SPARK_HOME; fi
+          echo "=== Publishing Data Quality Scorecard ==="
+          python $GITHUB_WORKSPACE/src/utils/publish_ci_summary.py
+
+      - name: Upload Data Quality Reports & Anomaly Ledgers
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: dev-quality-reports-${{ github.run_number }}
+          path: data/metadata/quality/
+          retention-days: 30
+          if-no-files-found: ignore
+
+      - name: Upload Gold Analytical Marts
         uses: actions/upload-artifact@v7
         with:
-          name: dev-outputs-${{ github.run_number }}
-          path: ${{ steps.output-dir.outputs.dir }}/
-          retention-days: 7
+          name: dev-gold-marts-${{ github.run_number }}
+          path: data/gold/
+          retention-days: 30
           if-no-files-found: ignore

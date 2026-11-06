@@ -3,10 +3,22 @@ Configuration and constants for DAT535 Ingestion and Bronze Layer.
 Author: Group 13
 """
 
+import os
 from pathlib import Path
 
 # Base Paths (relative to workspace root)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+# Automatically load .env file if present in workspace root (Zero external dependency)
+env_file = PROJECT_ROOT / ".env"
+if env_file.exists():
+    with open(env_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip("'\""))
+
 DATA_DIR = PROJECT_ROOT / "data"
 LANDING_DIR = DATA_DIR / "landing"
 BRONZE_DIR = DATA_DIR / "bronze"
@@ -25,6 +37,7 @@ DATASET_WEATHER = "weather_era5"
 SOCRATA_311_ENDPOINT = "https://data.cityofnewyork.us/resource/erm2-nwe9.json"
 SOCRATA_DATASET_ID = "erm2-nwe9"
 SOURCE_NAME_311 = "nyc_open_data"
+SOCRATA_APP_TOKEN = os.environ.get("SOCRATA_APP_TOKEN")
 
 OPEN_METEO_ARCHIVE_ENDPOINT = "https://archive-api.open-meteo.com/v1/archive"
 OPEN_METEO_DATASET_ID = "era5_land"

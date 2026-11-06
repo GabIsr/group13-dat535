@@ -12,23 +12,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import numpy as np
-import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 from pyspark.sql.functions import (
     broadcast,
+    coalesce,
     col,
     count as spark_count,
     countDistinct,
+    dayofweek,
     lit,
     max as spark_max,
     mean as spark_mean,
     min as spark_min,
+    month as spark_month,
     round as spark_round,
     sum as spark_sum,
     to_date,
     when,
+    year as spark_year,
 )
 from pyspark.storagelevel import StorageLevel
 
@@ -105,13 +105,27 @@ def build_daily_service_demand_mart(
 
     # 4. Aggregate 311 to Daily Demand Grain (date × grid_id × borough × complaint_type) via PySpark
     logger.info("Aggregating daily 311 service demand with PySpark...")
+    cols_311 = set(df_311_spark.columns)
+    has_burst_dup = "is_burst_duplicate" in cols_311
+    inc_count_expr = spark_sum(when(col("is_burst_duplicate") == False, 1).otherwise(0)) if has_burst_dup else spark_count("unique_key")
+    dup_burst_expr = spark_sum(when(col("is_burst_duplicate") == True, 1).otherwise(0)) if has_burst_dup else lit(0)
+
     daily_311_spark = (
         df_311_spark.withColumn("date", to_date(col("created_at_utc")))
         .groupBy("date", "grid_id", "borough", "complaint_type")
         .agg(
             spark_count("unique_key").alias("complaint_count"),
+            inc_count_expr.alias("distinct_incidents_count"),
+            dup_burst_expr.alias("duplicate_burst_calls_count"),
             spark_sum(when(col("is_ticket_closed") == True, 1).otherwise(0)).alias("closed_complaint_count"),
             countDistinct("agency").alias("distinct_agencies_handling"),
+        )
+        .withColumn(
+            "demand_inflation_ratio",
+            when(
+                col("distinct_incidents_count") > 0,
+                spark_round(col("complaint_count") / col("distinct_incidents_count"), 2)
+            ).otherwise(lit(1.0))
         )
     )
 
@@ -123,62 +137,65 @@ def build_daily_service_demand_mart(
         how="left",
     )
 
+    # 6. Add Calendar and Coverage Attributes in pure PySpark (Zero toPandas Anti-Pattern)
+    mart_spark = (
+        mart_spark
+        .withColumn(
+            "weather_data_coverage_pct",
+            spark_round((coalesce(col("valid_weather_obs_count"), lit(0)) / 24.0) * 100.0, 1)
+        )
+        .withColumn("is_extreme_weather_day", coalesce(col("is_extreme_weather_day"), lit(False)))
+        .withColumn("hours_of_precipitation", coalesce(col("hours_of_precipitation"), lit(0)))
+        .withColumn("closed_complaint_count", coalesce(col("closed_complaint_count"), lit(0)))
+        .withColumn("year", spark_year(col("date")))
+        .withColumn("month", spark_month(col("date")))
+        .withColumn("day_of_week", (dayofweek(col("date")) + 5) % 7)
+        .withColumn("is_weekend", col("day_of_week").isin([5, 6]))
+        .withColumn("_gold_built_at_utc", lit(built_at_utc))
+    )
+
     mart_spark.persist(StorageLevel.MEMORY_AND_DISK)
-    mart_df = mart_spark.toPandas().copy()
-    mart_spark.unpersist()
+    mart_rows = mart_spark.count()
 
-    # Weather coverage percentage (24 hours in a full day)
-    mart_df["weather_data_coverage_pct"] = (
-        (mart_df["valid_weather_obs_count"].fillna(0) / 24.0) * 100.0
-    ).round(1)
-
-    # Impute missing weather flags for unlocated or unobserved grid cells
-    mart_df["weather_data_coverage_pct"] = mart_df["weather_data_coverage_pct"].fillna(0.0)
-    mart_df["is_extreme_weather_day"] = mart_df["is_extreme_weather_day"].fillna(False).astype(bool)
-    mart_df["hours_of_precipitation"] = mart_df["hours_of_precipitation"].fillna(0).astype(int)
-    mart_df["closed_complaint_count"] = mart_df["closed_complaint_count"].fillna(0).astype(int)
-
-    reconciled_total_complaints = int(mart_df["complaint_count"].sum())
+    reconciled_total_complaints = int(mart_spark.agg(spark_sum("complaint_count")).collect()[0][0])
     if reconciled_total_complaints != total_311_input:
+        mart_spark.unpersist()
         raise ValueError(
             f"Row count reconciliation violation in Daily Demand Mart! "
             f"Silver input ({total_311_input}) != Mart total ({reconciled_total_complaints})"
         )
 
-    # 6. Add Calendar and Temporal Context Attributes
-    dt_series = pd.to_datetime(mart_df["date"])
-    mart_df["year"] = dt_series.dt.year
-    mart_df["month"] = dt_series.dt.month
-    mart_df["day_of_week"] = dt_series.dt.dayofweek  # 0=Monday, 6=Sunday
-    mart_df["is_weekend"] = mart_df["day_of_week"].isin([5, 6])
-    mart_df["_gold_built_at_utc"] = built_at_utc
+    # 7. Verification: Ensure Grain Uniqueness in PySpark
+    distinct_grains = mart_spark.select("date", "grid_id", "borough", "complaint_type").distinct().count()
+    if distinct_grains != mart_rows:
+        mart_spark.unpersist()
+        raise ValueError(f"Grain uniqueness violation: {mart_rows - distinct_grains} duplicate keys on grain")
 
-    # 7. Verification: Ensure Grain Uniqueness
-    grain_cols = ["date", "grid_id", "borough", "complaint_type"]
-    duplicate_grain_count = int(mart_df.duplicated(subset=grain_cols).sum())
-    if duplicate_grain_count > 0:
-        raise ValueError(f"Grain uniqueness violation: {duplicate_grain_count} duplicate keys on {grain_cols}")
-
-    # 8. Write Parquet Mart
+    # 8. Write Parquet Mart using PySpark distributed write
     output_dir.mkdir(parents=True, exist_ok=True)
     out_file = output_dir / "gold_daily_service_demand.parquet"
-    table = pa.Table.from_pandas(mart_df, preserve_index=False)
-    pq.write_table(table, out_file, compression="snappy")
+    mart_spark.coalesce(1).write.mode("overwrite").parquet(str(out_file))
+
+    distinct_dates = mart_spark.select("date").distinct().count()
+    distinct_grid_cells = mart_spark.select("grid_id").distinct().count()
+    distinct_complaint_types = mart_spark.select("complaint_type").distinct().count()
+    weather_matched_rows = mart_spark.filter(col("weather_data_coverage_pct") > 0).count()
+    mart_spark.unpersist()
 
     elapsed = time.time() - start_time
     logger.info(
-        f"Built Gold Daily Service Demand Mart with PySpark: {len(mart_df):,} rows | "
+        f"Built Gold Daily Service Demand Mart with PySpark: {mart_rows:,} rows | "
         f"{reconciled_total_complaints:,} complaints reconciled | {elapsed:.2f}s | Output: {out_file.name}"
     )
 
     return {
         "mart": "gold_daily_service_demand",
-        "rows": len(mart_df),
+        "rows": mart_rows,
         "total_complaints_reconciled": reconciled_total_complaints,
-        "distinct_dates": mart_df["date"].nunique(),
-        "distinct_grid_cells": mart_df["grid_id"].nunique(),
-        "distinct_complaint_types": mart_df["complaint_type"].nunique(),
-        "weather_matched_rows": int((mart_df["weather_data_coverage_pct"] > 0).sum()),
+        "distinct_dates": distinct_dates,
+        "distinct_grid_cells": distinct_grid_cells,
+        "distinct_complaint_types": distinct_complaint_types,
+        "weather_matched_rows": weather_matched_rows,
         "output_path": str(out_file),
         "duration_seconds": round(elapsed, 2),
         "status": "success",

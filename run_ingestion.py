@@ -137,7 +137,7 @@ def main():
                 batch_size=args.batch_size,
                 max_records=args.max_records,
                 lookback_days=args.lookback_days,
-                app_token=args.app_token,
+                app_token=args.app_token or os.environ.get("SOCRATA_APP_TOKEN"),
                 env=args.env,
                 manifests_dir=MANIFESTS_DIR,
             )

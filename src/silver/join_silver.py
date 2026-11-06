@@ -128,6 +128,13 @@ def join_silver_datasets(
         if int16_col in df_joined.columns:
             df_joined[int16_col] = pd.to_numeric(df_joined[int16_col], errors="coerce").astype("Int16")
 
+    for int32_col in ["cluster_size", "burst_sequence_num"]:
+        if int32_col in df_joined.columns:
+            df_joined[int32_col] = pd.to_numeric(df_joined[int32_col], errors="coerce").astype("Int32")
+
+    if "incident_first_created_at_utc" in df_joined.columns:
+        df_joined["incident_first_created_at_utc"] = pd.to_datetime(df_joined["incident_first_created_at_utc"], utc=True)
+
     # Audit match status
     df_joined["is_weather_matched"] = df_joined["temperature_2m"].notna()
     matched_count = int(df_joined["is_weather_matched"].sum())

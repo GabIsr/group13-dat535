@@ -26,6 +26,7 @@ from pyspark.sql.functions import (
     concat,
     concat_ws,
     date_format,
+    isnan,
     lit,
     max as spark_max,
     min as spark_min,
@@ -36,6 +37,7 @@ from pyspark.sql.functions import (
     trim,
     when,
 )
+from pyspark.sql.types import DoubleType, FloatType
 from pyspark.storagelevel import StorageLevel
 
 from src.silver.config import (
@@ -350,10 +352,44 @@ def clean_and_validate_weather(
         )
     pq.write_table(pa.Table.from_pandas(df_ledger, preserve_index=False), anomaly_ledger_path, compression="snappy")
 
+    # If all input rows were quarantined, there are no valid rows to compute windows on:
+    if df_clean.empty:
+        df_evaluated.unpersist()
+        df_clean_spark.unpersist()
+        elapsed = time.time() - start_time
+        logger.info(
+            f"Completed Silver Weather processing with PySpark: 0 valid rows | "
+            f"0 partition files written | {len(anomaly_records)} sensor anomalies ledgered | {elapsed:.2f}s"
+        )
+        return {
+            "dataset": "silver_weather",
+            "input_rows": input_rows,
+            "valid_rows": 0,
+            "dropped_unkeyed_rows": quarantined_weather_rows,
+            "quarantined_rows": quarantined_weather_rows,
+            "duplicate_rows_dropped": duplicate_rows_dropped,
+            "corrupted_fields_masked": corrupted_fields_rows,
+            "sensor_anomalies_logged": len(anomaly_records),
+            "extreme_weather_tagged_rows": 0,
+            "distinct_grid_cells": 0,
+            "partitions_written": 0,
+            "duration_seconds": round(elapsed, 2),
+            "status": "success",
+        }
+
     # 3. Cumulative & Lagged Weather Features (Chronological Rolling Windows via PySpark Window functions - Lab 3)
     # Computed on MASKED sensor values so corrupted readings do not pollute rolling metrics!
     # Uses true chronological time windows rangeBetween(-2 * 3600, 0) on epoch seconds.
-    df_window_spark = spark.createDataFrame(df_clean)
+    # Reuse df_clean_spark.schema to maintain dynamic schema evolution without hardcoding:
+    df_window_spark = spark.createDataFrame(df_clean, schema=df_clean_spark.schema)
+
+    # Sanitize floating-point NaNs to SQL NULL so Catalyst window aggregations skip missing values instead of propagating NaN:
+    for field in df_window_spark.schema.fields:
+        if isinstance(field.dataType, (DoubleType, FloatType)):
+            df_window_spark = df_window_spark.withColumn(
+                field.name, when(isnan(col(field.name)), lit(None)).otherwise(col(field.name))
+            )
+
     df_window_spark = df_window_spark.withColumn("_ts_secs", col("timestamp_utc").cast("long"))
 
     w_grid_3 = Window.partitionBy("grid_id").orderBy("_ts_secs").rangeBetween(-2 * 3600, 0)

@@ -16,7 +16,7 @@ import shutil
 import time
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -82,9 +82,10 @@ def fetch_socrata_page(
     limit: int = 50000,
     offset: int = 0,
     app_token: Optional[str] = None,
-    timeout: int = 60,
+    timeout: int = 120,
+    max_retries: int = 5,
 ) -> Tuple[List[Dict[str, Any]], bytes]:
-    """Fetch a single page of records from Socrata API, capturing system timestamps."""
+    """Fetch a single page of records from Socrata API with exponential backoff retry."""
     params: Dict[str, str] = {
         "$select": select_clause,
         "$limit": str(limit),
@@ -102,11 +103,23 @@ def fetch_socrata_page(
         headers["X-App-Token"] = app_token
 
     req = urllib.request.Request(url, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        raw_bytes = response.read()
 
-    data = json.loads(raw_bytes.decode("utf-8"))
-    return data, raw_bytes
+    for attempt in range(1, max_retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                raw_bytes = response.read()
+            data = json.loads(raw_bytes.decode("utf-8"))
+            return data, raw_bytes
+        except (TimeoutError, urllib.error.URLError, urllib.error.HTTPError, Exception) as e:
+            if attempt == max_retries:
+                logger.error(f"Failed to fetch page at offset {offset} after {max_retries} attempts: {e}")
+                raise
+            wait_time = 2 ** attempt * 2
+            logger.warning(
+                f"Transient network/timeout error at offset {offset} (attempt {attempt}/{max_retries}): {e}. "
+                f"Retrying in {wait_time}s..."
+            )
+            time.sleep(wait_time)
 
 
 def write_bronze_partitioned(
@@ -196,7 +209,9 @@ def convert_landing_to_bronze_pyspark(
     logger.info(f"PySpark Landing-to-Bronze: Processing {len(landing_files)} landing file(s) for batch {batch_id}...")
     spark = get_spark_session("DAT535-Landing-To-Bronze-311")
     file_paths = [str(f.resolve()) for f in landing_files]
-    df_raw = spark.read.json(*file_paths)
+    df_raw = spark.read.option("multiLine", True).json(file_paths)
+    if "_corrupt_record" in df_raw.columns:
+        df_raw = df_raw.drop("_corrupt_record")
     total_rows = df_raw.count()
     if total_rows == 0:
         logger.warning(f"Landing files for batch {batch_id} contain 0 records.")
@@ -249,6 +264,7 @@ def convert_landing_to_bronze_pyspark(
     else:
         df_bronze = df_bronze.withColumn("year", lit("unknown")).withColumn("month", lit("unknown"))
 
+    df_bronze = df_bronze.cache()
     partitions = df_bronze.select("year", "month").distinct().collect()
     written_files: List[Dict[str, Any]] = []
 
@@ -290,6 +306,7 @@ def convert_landing_to_bronze_pyspark(
                 "sha256": f_sha,
             })
 
+    df_bronze.unpersist()
     logger.info(f"PySpark Bronze complete: wrote {len(written_files)} partition file(s) ({total_rows:,} total rows).")
     return written_files
 
@@ -317,6 +334,9 @@ def run_311_ingestion(
     start_time = time.time()
     retrieved_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     bronze_311_dir = BRONZE_DIR / "nyc311"
+    app_token = app_token or os.environ.get("SOCRATA_APP_TOKEN")
+    if app_token:
+        logger.info("Using authenticated Socrata App Token (elevated API rate limit).")
 
     # -------------------------------------------------------------------------
     # Mode 1: --from-landing-only (Idempotent PySpark Landing-to-Bronze conversion)
@@ -472,18 +492,23 @@ def run_311_ingestion(
         order_clause = "created_date ASC"
 
         if mode == "incremental":
+            # Guard against pulling 311 tickets ahead of available ERA5-Land weather reanalysis (5-day ECMWF lag)
+            safe_weather_ceiling = (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%d")
+            effective_end = end_date or f"{safe_weather_ceiling}T23:59:59.000"
+            where_conditions.append(f"created_date <= '{effective_end}'")
+
             last_cdc_watermark = get_latest_cdc_watermark(DATASET_311, manifests_dir=manifests_dir)
             if last_cdc_watermark:
-                logger.info(f"Incremental CDC Strategy: Querying :updated_at > '{last_cdc_watermark}'")
+                logger.info(f"Incremental CDC Strategy: Querying :updated_at > '{last_cdc_watermark}' up to {effective_end}")
                 where_conditions.append(f":updated_at > '{last_cdc_watermark}'")
                 order_clause = ":updated_at ASC"
             else:
                 last_watermark = get_latest_watermark(DATASET_311, manifests_dir=manifests_dir)
                 if last_watermark:
-                    logger.info(f"Discovered initial created_date watermark: {last_watermark}. Bootstrapping incremental stream.")
+                    logger.info(f"Discovered initial created_date watermark: {last_watermark}. Bootstrapping incremental stream up to {effective_end}.")
                     where_conditions.append(f"created_date >= '{last_watermark}'")
                 else:
-                    logger.warning("No previous watermark found for incremental mode. Ingesting past 7 days.")
+                    logger.warning(f"No previous watermark found for incremental mode. Ingesting past 7 days up to {effective_end}.")
                     where_conditions.append("created_date >= '2026-10-15T00:00:00.000'")
                 order_clause = "created_date ASC"
         else:

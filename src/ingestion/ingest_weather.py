@@ -129,8 +129,8 @@ def run_weather_ingestion(
         logger.info(f"Batch {batch_id} has already succeeded. Skipping execution.")
         return None
 
-    # Determine date intervals
-    default_reanalysis_end = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%d")
+    # Determine date intervals (ERA5-Land reanalysis latency is 5 days from ECMWF)
+    default_reanalysis_end = (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%d")
 
     if mode == "incremental":
         last_watermark = get_latest_watermark(DATASET_WEATHER, manifests_dir=manifests_dir)

@@ -254,7 +254,13 @@ def build_agency_resolution_performance_mart(
     output_dir.mkdir(parents=True, exist_ok=True)
     out_file = output_dir / "gold_agency_resolution_performance.parquet"
     table = pa.Table.from_pandas(df_perf, preserve_index=False)
-    pq.write_table(table, out_file, compression="snappy")
+    pq.write_table(
+        table,
+        out_file,
+        compression="snappy",
+        coerce_timestamps="us",
+        allow_truncated_timestamps=True,
+    )
 
     elapsed = time.time() - start_time
     logger.info(

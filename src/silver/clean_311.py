@@ -538,7 +538,13 @@ def clean_and_validate_311(
         ]
         quarantine_dir.mkdir(parents=True, exist_ok=True)
         q_path = quarantine_dir / "quarantined_311.parquet"
-        pq.write_table(pa.Table.from_pandas(df_quarantined, preserve_index=False), q_path, compression="snappy")
+        pq.write_table(
+            pa.Table.from_pandas(df_quarantined, preserve_index=False),
+            q_path,
+            compression="snappy",
+            coerce_timestamps="us",
+            allow_truncated_timestamps=True,
+        )
         logger.warning(f"Quarantined {len(df_quarantined):,} invalid records to {q_path}")
 
     # Retain only valid records for clean Silver and enforce Int64 primary key
@@ -796,7 +802,13 @@ def clean_and_validate_311(
         save_df = sub_df.drop(columns=["_partition_year", "_partition_month"])
 
         table = pa.Table.from_pandas(save_df, preserve_index=False)
-        pq.write_table(table, out_path, compression="snappy")
+        pq.write_table(
+            table,
+            out_path,
+            compression="snappy",
+            coerce_timestamps="us",
+            allow_truncated_timestamps=True,
+        )
         written_files += 1
 
     elapsed = time.time() - start_time

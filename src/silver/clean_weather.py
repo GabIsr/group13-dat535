@@ -369,14 +369,12 @@ def evaluate_sensor_rules_and_mask(
         empty_ledger = df.sparkSession.createDataFrame([], schema=LEDGER_SCHEMA)
         empty_ledger.coalesce(1).write.mode("overwrite").parquet(str(anomaly_ledger_path))
 
-    # 2. Attach Row-Level Observability Audit Notes & Mask Corrupted Fields in PySpark
+    # 2. Attach Row-Level Observability Audit Notes BEFORE masking target_col
     df_masked = df
     audit_note_exprs = []
     for target_col, rule_name, cond, _ in rules:
-        note_expr = when(cond, concat(lit(f"MASKED {target_col}="), col(target_col), lit(f" ({rule_name})")))
+        note_expr = when(cond, concat(lit(f"MASKED {target_col}="), col(target_col).cast("string"), lit(f" ({rule_name})")))
         audit_note_exprs.append(note_expr)
-        # Mask violated sensor reading to SQL NULL (Catalyst skips NULL in window sums/min/max)
-        df_masked = df_masked.withColumn(target_col, when(cond, lit(None)).otherwise(col(target_col)))
 
     notes_array = array_compact(array(*audit_note_exprs))
     audit_notes_str = concat_ws("; ", notes_array)
@@ -385,6 +383,10 @@ def evaluate_sensor_rules_and_mask(
         when(trim(audit_notes_str) != "", audit_notes_str).otherwise(lit(None)),
     )
     df_masked = df_masked.withColumn("has_corrupted_sensor_fields", col("quality_audit_notes").isNotNull())
+
+    # Now mask violated sensor readings to SQL NULL (Catalyst skips NULL in window sums/min/max)
+    for target_col, rule_name, cond, _ in rules:
+        df_masked = df_masked.withColumn(target_col, when(cond, lit(None)).otherwise(col(target_col)))
 
     corrupted_fields_rows = df_masked.filter(col("has_corrupted_sensor_fields") == True).count()
 
@@ -493,17 +495,24 @@ def enrich_weather_attributes(df: DataFrame, processed_at_utc: str) -> DataFrame
 def write_silver_weather(df_silver: DataFrame, silver_weather_dir: Path) -> int:
     """
     Write partitioned Parquet dataset to disk structured by grid_id and year.
-    Uses pure PySpark distributed writer with dynamic partition overwriting.
+    Uses pure PySpark with directory partitioning, keeping grid_id and year in Parquet schema.
     """
     silver_weather_dir.mkdir(parents=True, exist_ok=True)
-    df_silver.sparkSession.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
-    
-    df_silver.write \
-        .mode("overwrite") \
-        .partitionBy("grid_id", "year") \
-        .parquet(str(silver_weather_dir))
+    partitions = df_silver.select("grid_id", "year").distinct().collect()
+    written_files = 0
+    for row in partitions:
+        g_id = row["grid_id"]
+        yr = row["year"]
+        part_dir = silver_weather_dir / f"grid_id={g_id}" / f"year={yr}"
+        part_dir.mkdir(parents=True, exist_ok=True)
+        (
+            df_silver.filter((col("grid_id") == g_id) & (col("year") == yr))
+            .coalesce(1)
+            .write.mode("overwrite")
+            .parquet(str(part_dir))
+        )
+        written_files += 1
 
-    written_files = len(list(silver_weather_dir.glob("**/*.parquet")))
     return written_files
 
 

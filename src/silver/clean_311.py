@@ -393,7 +393,6 @@ def deduplicate_311_records(df: DataFrame) -> Tuple[DataFrame, int]:
 
     w_dedup = Window.partitionBy("unique_key").orderBy(*order_cols)
     df_dedup = df_keyed.withColumn("_rn", row_number().over(w_dedup)).filter(col("_rn") == 1).drop("_rn")
-    df_dedup.persist(StorageLevel.MEMORY_AND_DISK)
 
     valid_count = df_dedup.count()
     candidate_count = df.count()
@@ -751,33 +750,20 @@ def write_silver_311(df: DataFrame, silver_311_dir: Path) -> int:
     """
     Save validated Silver 311 records to partitioned Parquet files:
     year=<YYYY>/month=<MM>/
-    100% pure PySpark, maintaining all columns inside Parquet schema.
+    100% pure PySpark native streaming partition write.
     """
     silver_311_dir.mkdir(parents=True, exist_ok=True)
     df_part = (
-        df.withColumn("_partition_year", date_format(col("created_at_utc"), "yyyy"))
-        .withColumn("_partition_month", date_format(col("created_at_utc"), "MM"))
+        df.withColumn("year", date_format(col("created_at_utc"), "yyyy"))
+        .withColumn("month", date_format(col("created_at_utc"), "MM"))
     )
-
-    partitions = df_part.select("_partition_year", "_partition_month").distinct().collect()
-    written_files = 0
-    for row in partitions:
-        year = row["_partition_year"]
-        month = row["_partition_month"]
-        if year is None or month is None:
-            continue
-        partition_dir = silver_311_dir / f"year={year}" / f"month={month}"
-        partition_dir.mkdir(parents=True, exist_ok=True)
-        (
-            df_part.filter((col("_partition_year") == year) & (col("_partition_month") == month))
-            .drop("_partition_year", "_partition_month")
-            .coalesce(1)
-            .write.mode("overwrite")
-            .parquet(str(partition_dir))
-        )
-        written_files += 1
-
-    return written_files
+    (
+        df_part.write
+        .mode("overwrite")
+        .partitionBy("year", "month")
+        .parquet(str(silver_311_dir))
+    )
+    return len(list(silver_311_dir.glob("**/*.parquet")))
 
 
 def clean_and_validate_311(
@@ -861,15 +847,21 @@ def clean_and_validate_311(
 
     # 6. Observability Audit Tags & Metadata
     df_silver = attach_quality_audit_tags(df_std, processed_at_utc)
-    df_silver.persist(StorageLevel.MEMORY_AND_DISK)
 
-    # 7. Pure PySpark Partitioned Parquet Write
+    # 7. Pure PySpark Partitioned Parquet Write (streaming distributed write)
     written_files = write_silver_311(df_silver, silver_311_dir)
 
-    # 8. Compute Audit Metrics in PySpark
-    valid_rows_accepted = df_silver.count()
-    if valid_rows_accepted > 0:
-        cols_silver = set(df_silver.columns)
+    # 8. Compute Audit Metrics in PySpark directly from written Parquet (avoids driver heap bloat & plan re-eval)
+    written_silver_files = sorted(silver_311_dir.glob("**/*.parquet"))
+    if written_silver_files:
+        df_written = spark.read.parquet(str(silver_311_dir))
+        valid_rows_accepted = df_written.count()
+    else:
+        df_written = None
+        valid_rows_accepted = 0
+
+    if valid_rows_accepted > 0 and df_written is not None:
+        cols_silver = set(df_written.columns)
         loc_expr = (
             spark_sum(when(col("loc_key").isNotNull() & (trim(col("loc_key")) != ""), 1).otherwise(0)).alias("total_loc")
             if "loc_key" in cols_silver
@@ -881,7 +873,7 @@ def clean_and_validate_311(
             else lit(0).alias("dup_burst_cnt")
         )
 
-        agg = df_silver.select(
+        agg = df_written.select(
             spark_sum(when(col("is_ticket_closed"), 1).otherwise(0)).alias("closed_count"),
             spark_sum(when(col("is_status_conflict"), 1).otherwise(0)).alias("conflict_count"),
             spark_sum(when(col("is_instant_closure"), 1).otherwise(0)).alias("instant_count"),
@@ -903,11 +895,11 @@ def clean_and_validate_311(
         distinct_inc = valid_rows_accepted - dup_burst_cnt
         burst_rate = round((dup_burst_cnt / total_loc * 100.0), 2) if total_loc > 0 else 0.0
 
-        spatial_rows = df_silver.groupBy("spatial_resolution_level").count().collect()
+        spatial_rows = df_written.groupBy("spatial_resolution_level").count().collect()
         spatial_stats = {r["spatial_resolution_level"]: int(r["count"]) for r in spatial_rows}
 
         if "loc_routing_type" in cols_silver:
-            route_rows = df_silver.groupBy("loc_routing_type").count().collect()
+            route_rows = df_written.groupBy("loc_routing_type").count().collect()
             routes_dict = {r["loc_routing_type"]: int(r["count"]) for r in route_rows}
         else:
             routes_dict = {}
@@ -925,9 +917,6 @@ def clean_and_validate_311(
         burst_rate = 0.0
         spatial_stats = {}
         routes_dict = {}
-
-    df_silver.unpersist()
-    df_dedup.unpersist()
 
     elapsed = time.time() - start_time
     logger.info(

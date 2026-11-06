@@ -37,7 +37,18 @@ from pyspark.sql.functions import (
     trim,
     when,
 )
-from pyspark.sql.types import DoubleType, FloatType
+from pyspark.sql.types import (
+    BooleanType,
+    ByteType,
+    DoubleType,
+    FloatType,
+    IntegerType,
+    LongType,
+    ShortType,
+    StringType,
+    StructField,
+    StructType,
+)
 from pyspark.storagelevel import StorageLevel
 
 from src.silver.config import (
@@ -136,7 +147,13 @@ def clean_and_validate_weather(
         save_q = df_quarantined.withColumn("quarantine_reason", col("_quarantine_reason")) \
                                .withColumn("_quarantined_at_utc", lit(processed_at_utc)) \
                                .drop("_is_quarantined", "_quarantine_reason")
-        save_q.toPandas().to_parquet(q_path, index=False, compression="snappy")
+        pq.write_table(
+            pa.Table.from_pandas(save_q.toPandas(), preserve_index=False),
+            q_path,
+            compression="snappy",
+            coerce_timestamps="us",
+            allow_truncated_timestamps=True,
+        )
         logger.warning(f"Quarantined {quarantined_weather_rows:,} unkeyed/unparseable weather rows to {q_path}")
 
     # Retain only valid rows
@@ -350,7 +367,13 @@ def clean_and_validate_weather(
         df_ledger = pd.DataFrame(
             columns=["timestamp_utc", "grid_id", "field_name", "raw_value", "rule_violated", "reason", "action_taken", "masked_at_utc"]
         )
-    pq.write_table(pa.Table.from_pandas(df_ledger, preserve_index=False), anomaly_ledger_path, compression="snappy")
+    pq.write_table(
+        pa.Table.from_pandas(df_ledger, preserve_index=False),
+        anomaly_ledger_path,
+        compression="snappy",
+        coerce_timestamps="us",
+        allow_truncated_timestamps=True,
+    )
 
     # If all input rows were quarantined, there are no valid rows to compute windows on:
     if df_clean.empty:
@@ -380,8 +403,45 @@ def clean_and_validate_weather(
     # 3. Cumulative & Lagged Weather Features (Chronological Rolling Windows via PySpark Window functions - Lab 3)
     # Computed on MASKED sensor values so corrupted readings do not pollute rolling metrics!
     # Uses true chronological time windows rangeBetween(-2 * 3600, 0) on epoch seconds.
-    # Reuse df_clean_spark.schema to maintain dynamic schema evolution without hardcoding:
-    df_window_spark = spark.createDataFrame(df_clean, schema=df_clean_spark.schema)
+    # Dynamically preserve integer types and extend schema with row observability metadata:
+    int_types = (LongType, IntegerType, ShortType, ByteType)
+    fields = []
+    for f in df_clean_spark.schema.fields:
+        if f.name in df_clean.columns:
+            if isinstance(f.dataType, int_types):
+                # Ensure integer preservation: non-null values remain pure int, nulls become None
+                df_clean[f.name] = df_clean[f.name].apply(
+                    lambda v: int(v) if pd.notna(v) and not (isinstance(v, float) and np.isnan(v)) else None
+                )
+            fields.append(f)
+
+    existing_names = {f.name for f in fields}
+    for col_name in df_clean.columns:
+        if col_name not in existing_names:
+            if col_name == "quality_audit_notes":
+                fields.append(StructField("quality_audit_notes", StringType(), True))
+            elif col_name == "has_corrupted_sensor_fields":
+                fields.append(StructField("has_corrupted_sensor_fields", BooleanType(), True))
+            else:
+                s = df_clean[col_name].dropna()
+                if not s.empty:
+                    val = s.iloc[0]
+                    if isinstance(val, (int, np.integer)):
+                        df_clean[col_name] = df_clean[col_name].apply(
+                            lambda v: int(v) if pd.notna(v) and not (isinstance(v, float) and np.isnan(v)) else None
+                        )
+                        fields.append(StructField(col_name, LongType(), True))
+                    elif isinstance(val, (float, np.floating)):
+                        fields.append(StructField(col_name, DoubleType(), True))
+                    elif isinstance(val, (bool, np.bool_)):
+                        fields.append(StructField(col_name, BooleanType(), True))
+                    else:
+                        fields.append(StructField(col_name, StringType(), True))
+                else:
+                    fields.append(StructField(col_name, StringType(), True))
+
+    dynamic_schema = StructType(fields)
+    df_window_spark = spark.createDataFrame(df_clean[dynamic_schema.names], schema=dynamic_schema)
 
     # Sanitize floating-point NaNs to SQL NULL so Catalyst window aggregations skip missing values instead of propagating NaN:
     for field in df_window_spark.schema.fields:
@@ -482,7 +542,13 @@ def clean_and_validate_weather(
         save_df = sub_df.drop(columns=["_partition_year"])
 
         table = pa.Table.from_pandas(save_df, preserve_index=False)
-        pq.write_table(table, out_path, compression="snappy")
+        pq.write_table(
+            table,
+            out_path,
+            compression="snappy",
+            coerce_timestamps="us",
+            allow_truncated_timestamps=True,
+        )
         written_files += 1
 
     df_evaluated.unpersist()

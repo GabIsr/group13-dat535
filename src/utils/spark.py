@@ -179,6 +179,7 @@ def get_spark_session(
         .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
         .config("spark.sql.session.timeZone", "UTC")
         .config("spark.sql.ansi.enabled", "false")
+        .config("spark.sql.parquet.outputTimestampType", "TIMESTAMP_MICROS")
     )
 
     # Windows specific networking stability

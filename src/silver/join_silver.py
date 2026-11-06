@@ -161,7 +161,13 @@ def join_silver_datasets(
         save_df = sub_df.drop(columns=["_partition_year", "_partition_month"])
 
         table = pa.Table.from_pandas(save_df, preserve_index=False)
-        pq.write_table(table, out_path, compression="snappy")
+        pq.write_table(
+            table,
+            out_path,
+            compression="snappy",
+            coerce_timestamps="us",
+            allow_truncated_timestamps=True,
+        )
         written_files += 1
 
     elapsed = time.time() - start_time

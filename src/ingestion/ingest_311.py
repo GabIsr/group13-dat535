@@ -170,7 +170,13 @@ def write_bronze_partitioned(
         clean_sub_df = sub_df.drop(columns=["_partition_year", "_partition_month"])
 
         table = pa.Table.from_pandas(clean_sub_df, preserve_index=False)
-        pq.write_table(table, file_path, compression="snappy")
+        pq.write_table(
+            table,
+            file_path,
+            compression="snappy",
+            coerce_timestamps="us",
+            allow_truncated_timestamps=True,
+        )
 
         file_sha256 = compute_file_sha256(file_path)
         file_bytes = file_path.stat().st_size

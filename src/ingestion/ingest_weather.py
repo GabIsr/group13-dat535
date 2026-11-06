@@ -234,7 +234,13 @@ def run_weather_ingestion(
             clean_sub_df = year_group.drop(columns=["_year"])
 
             table = pa.Table.from_pandas(clean_sub_df, preserve_index=False)
-            pq.write_table(table, parquet_file, compression="snappy")
+            pq.write_table(
+                table,
+                parquet_file,
+                compression="snappy",
+                coerce_timestamps="us",
+                allow_truncated_timestamps=True,
+            )
 
             p_sha256 = compute_file_sha256(parquet_file)
             p_bytes = parquet_file.stat().st_size

@@ -28,6 +28,7 @@ from pyspark.sql.functions import (
     desc,
     from_utc_timestamp,
     hour,
+    initcap,
     lit,
     month as spark_month,
     radians,
@@ -44,6 +45,12 @@ from pyspark.sql.functions import (
 )
 from pyspark.sql.window import Window
 from pyspark.storagelevel import StorageLevel
+
+from src.silver.spatial_cleaning import normalize_all_spatial_features
+from src.silver.incident_clustering import (
+    generate_hierarchical_location_keys,
+    cluster_citizen_call_bursts,
+)
 
 from src.utils.spark import get_spark_session
 
@@ -476,6 +483,21 @@ def clean_and_validate_311(
         ).otherwise(lit(None).cast("double")),
     )
 
+    # 4c. PySpark Spatial Feature Normalization, Hierarchical Routing & Ticket-1 Adaptive Clustering
+    logger.info("Executing PySpark Spatial Normalization & Canonicalization...")
+    if "complaint_type" in cols:
+        df_valid_spark = df_valid_spark.withColumn(
+            "complaint_type",
+            when(col("complaint_type").isNull() | (trim(col("complaint_type")) == ""), lit("Unknown")).otherwise(initcap(trim(col("complaint_type"))))
+        )
+    df_valid_spark = normalize_all_spatial_features(df_valid_spark)
+
+    logger.info("Evaluating 6-Route Hierarchical Spatial Routing in PySpark...")
+    df_valid_spark = generate_hierarchical_location_keys(df_valid_spark)
+
+    logger.info("Executing PySpark Ticket-1 Anchored Burst Deduplication Engine (Adaptive Window)...")
+    df_valid_spark = cluster_citizen_call_bursts(df_valid_spark, burst_window_hours=6.0)
+
     df_valid_spark.persist(StorageLevel.MEMORY_AND_DISK)
 
     df_quarantined = df_quarantined_spark.toPandas().copy()
@@ -527,6 +549,14 @@ def clean_and_validate_311(
     if "closed_at_utc" in df_valid.columns:
         df_valid["closed_at_utc"] = pd.to_datetime(df_valid["closed_at_utc"], utc=True)
     df_valid["unique_key"] = pd.to_numeric(df_valid["unique_key"], errors="coerce").astype("Int64")
+    if "is_burst_duplicate" in df_valid.columns:
+        df_valid["is_burst_duplicate"] = df_valid["is_burst_duplicate"].astype(bool)
+    if "burst_sequence_num" in df_valid.columns:
+        df_valid["burst_sequence_num"] = pd.to_numeric(df_valid["burst_sequence_num"], errors="coerce").fillna(1).astype("int32")
+    if "cluster_size" in df_valid.columns:
+        df_valid["cluster_size"] = pd.to_numeric(df_valid["cluster_size"], errors="coerce").fillna(1).astype("int32")
+    if "incident_first_created_at_utc" in df_valid.columns:
+        df_valid["incident_first_created_at_utc"] = pd.to_datetime(df_valid["incident_first_created_at_utc"], utc=True)
 
     # Standardize clean_incident_zip as a persistent 5-digit zero-padded string (never integer!)
     if "incident_zip" in df_valid.columns:
@@ -784,6 +814,13 @@ def clean_and_validate_311(
     avg_grid_dist = round(float(valid_dist.mean()), 2) if len(valid_dist) > 0 else 0.0
     p95_grid_dist = round(float(valid_dist.quantile(0.95)), 2) if len(valid_dist) > 0 else 0.0
 
+    total_loc = int((df_valid["loc_key"].notna() & (df_valid["loc_key"] != "")).sum()) if "loc_key" in df_valid.columns else 0
+    unloc_cnt = len(df_valid) - total_loc
+    dup_burst_cnt = int(df_valid["is_burst_duplicate"].sum()) if "is_burst_duplicate" in df_valid.columns else 0
+    distinct_inc = len(df_valid) - dup_burst_cnt
+    burst_rate = round((dup_burst_cnt / total_loc * 100.0), 2) if total_loc > 0 else 0.0
+    routes_dict = df_valid["loc_routing_type"].value_counts().to_dict() if "loc_routing_type" in df_valid.columns else {}
+
     return {
         "dataset": "silver_311",
         "input_rows": input_rows,
@@ -797,6 +834,14 @@ def clean_and_validate_311(
         "instant_closure_count": instant_count,
         "quarantined_rows": len(df_quarantined),
         "spatial_resolution_breakdown": spatial_stats,
+        "incident_clustering": {
+            "total_locatable_records": total_loc,
+            "unlocatable_records": unloc_cnt,
+            "duplicate_burst_calls_collapsed": dup_burst_cnt,
+            "burst_collapse_rate_pct": burst_rate,
+            "distinct_physical_incidents": distinct_inc,
+            "route_breakdown": routes_dict,
+        },
         "partitions_written": written_files,
         "duration_seconds": round(elapsed, 2),
         "status": "success",

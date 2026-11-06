@@ -76,10 +76,17 @@ def build_agency_resolution_performance_mart(
 
     # 2. Compute Creation Cohort (Incoming Demand on reporting_date) via PySpark
     logger.info("Computing Creation Cohort (incoming ticket volume) with PySpark...")
+    cols_311 = set(df_311_spark.columns)
+    has_burst_dup = "is_burst_duplicate" in cols_311
+    inc_created_expr = spark_sum(when(col("is_burst_duplicate") == False, 1).otherwise(0)) if has_burst_dup else spark_count("unique_key")
+
     df_created_spark = (
         df_311_spark.withColumn("reporting_date", to_date(col("created_at_utc")))
         .groupBy("reporting_date", "borough", "agency")
-        .agg(spark_count("unique_key").alias("tickets_created_today"))
+        .agg(
+            spark_count("unique_key").alias("tickets_created_today"),
+            inc_created_expr.alias("distinct_incidents_created_today"),
+        )
     )
 
     # 3. Compute Closure Cohort (Agency Output & Resolution Durations on reporting_date) via PySpark
@@ -122,6 +129,8 @@ def build_agency_resolution_performance_mart(
     df_perf_spark.unpersist()
 
     df_perf["tickets_created_today"] = df_perf["tickets_created_today"].fillna(0).astype(int)
+    if "distinct_incidents_created_today" in df_perf.columns:
+        df_perf["distinct_incidents_created_today"] = df_perf["distinct_incidents_created_today"].fillna(0).astype(int)
     df_perf["tickets_closed_today"] = df_perf["tickets_closed_today"].fillna(0).astype(int)
 
     # Convert df_311 to pandas for date-by-date active queue accumulation

@@ -17,10 +17,15 @@ data/*
 # Jupyter Notebook Checkpoints
 .ipynb_checkpoints/
 
-# Virtual environments
+# Virtual environments & Secrets
 venv/
 env/
 .env/
+.env
+*.env
+
+# Temporary scratch scripts
+scratch/
 
 # IDE & OS files
 .vscode/

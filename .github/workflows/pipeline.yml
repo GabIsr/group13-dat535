@@ -1,36 +1,87 @@
-name: Pipeline
+name: Scheduled Incremental Pipeline & Observability
 
 on:
-  workflow_dispatch:
-  #push:
-  #  branches: [ main ]
   schedule:
-    # Alternative intervals (uncomment one and comment out the active line below):
-    #- cron: "0 0 * * *"    # every day at midnight UTC
-    #- cron: '0 * * * *'    # every hour
-    #- cron: '0 */6 * * *'  # every 6 hours
-    - cron: '0 0 1 * *'     # active: monthly, 1st of month at 00:00 UTC
+    # Daily at 03:00 UTC (safely past daily Socrata updates & ECMWF 5-day ERA5-Land publishing lag)
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Ingestion Mode (incremental vs one-time backfill)'
+        required: true
+        default: 'incremental'
+        type: choice
+        options:
+          - incremental
+          - backfill
+      start_date:
+        description: 'Start Date for Backfill (YYYY-MM-DD)'
+        required: false
+        default: '2026-07-15'
+        type: string
+      end_date:
+        description: 'End Date for Backfill (YYYY-MM-DD, leave empty for safe 5-day lag)'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   run-pipeline:
-    name: Run PySpark Pipeline
+    name: Run PySpark Medallion Pipeline
     runs-on: self-hosted
     
     steps:
     - name: Checkout code
       uses: actions/checkout@v7
 
-    - name: Run Pipeline
+    - name: Run Pipeline & Quality Gate
       env:
         SPARK_HOME: /opt/spark
         JAVA_HOME: /usr/lib/jvm/java-8-openjdk-amd64
+        SOCRATA_APP_TOKEN: ${{ secrets.SOCRATA_APP_TOKEN }}
       run: |
-        # Activate the environment
         source ~/spark-env/bin/activate
           
-        # Run the pipeline
-        echo "=== Starting Data Pipeline Execution ==="
-        python $GITHUB_WORKSPACE/run_pipeline.py all
+        echo "=== Executing Automated Test Gate ==="
+        python $GITHUB_WORKSPACE/run_project.py test
 
-        echo ""
-        echo "=== All Pipelines Completed Successfully ==="
+        MODE="${{ github.event.inputs.mode || 'incremental' }}"
+        START_DATE="${{ github.event.inputs.start_date || '' }}"
+        END_DATE="${{ github.event.inputs.end_date || '' }}"
+
+        echo "=== Starting Pipeline Execution (Mode: $MODE) ==="
+
+        if [ "$MODE" = "backfill" ]; then
+          echo "Executing One-Time Historical Backfill..."
+          INGEST_CMD="python $GITHUB_WORKSPACE/run_ingestion.py --dataset all --mode backfill --env dev"
+          if [ -n "$START_DATE" ]; then INGEST_CMD="$INGEST_CMD --start-date $START_DATE"; fi
+          if [ -n "$END_DATE" ]; then INGEST_CMD="$INGEST_CMD --end-date $END_DATE"; fi
+          eval $INGEST_CMD
+          python $GITHUB_WORKSPACE/run_silver.py --stage all --env dev
+          python $GITHUB_WORKSPACE/run_gold.py --env dev
+        else
+          echo "Executing Automated Incremental CDC Pipeline..."
+          python $GITHUB_WORKSPACE/run_project.py all --env dev
+        fi
+
+        echo "=== Publishing Data Quality Scorecard ==="
+        python $GITHUB_WORKSPACE/src/utils/publish_ci_summary.py
+
+        echo "=== Medallion Pipeline Completed Successfully ==="
+
+    - name: Upload Data Quality Ledgers & Sensor Anomalies
+      uses: actions/upload-artifact@v7
+      if: always()
+      with:
+        name: scheduled-quality-reports-${{ github.run_number }}
+        path: data/metadata/quality/
+        retention-days: 30
+        if-no-files-found: ignore
+
+    - name: Upload Gold Analytical Marts
+      uses: actions/upload-artifact@v7
+      with:
+        name: scheduled-gold-marts-${{ github.run_number }}
+        path: data/gold/
+        retention-days: 30
+        if-no-files-found: ignore

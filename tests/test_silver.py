@@ -23,6 +23,20 @@ from src.silver.config import (
 from src.silver.clean_311 import clean_and_validate_311, to_utc_datetime, standardize_string_series, haversine_distance_km, spark_haversine_distance_km
 from src.silver.clean_weather import clean_and_validate_weather
 from src.silver.join_silver import join_silver_datasets
+from src.silver.spatial_cleaning import (
+    canonicalize_street_name_expr,
+    normalize_bbl_and_house_numbers,
+    standardize_cross_streets,
+    normalize_highway_corridors,
+    canonicalize_fallback_addresses,
+    normalize_all_spatial_features,
+)
+from src.silver.incident_clustering import (
+    generate_hierarchical_location_keys,
+    cluster_citizen_call_bursts,
+)
+from src.utils.spark import get_spark_session
+from pyspark.sql.functions import col, lit, to_timestamp
 
 
 class TestSilverLayerPipeline(unittest.TestCase):
@@ -1291,6 +1305,336 @@ class TestSilverLayerPipeline(unittest.TestCase):
             self.assertTrue(df_clean.iloc[0]["is_instant_closure"])
             self.assertIn("created_hour_utc", df_clean.columns)
             self.assertIn("created_hour_local", df_clean.columns)
+
+    def test_spatial_cleaning_bbl_and_house_numbers(self):
+        """Verify BBL normalization and house number extraction from addresses."""
+        spark = get_spark_session("test_spatial_bbl")
+        mock_data = [
+            (1, "1022150225", "100-02 QUEENS BLVD"),
+            (2, "3001234567.0", "350 5 AVENUE"),
+            (3, "123", "12A ELM STREET"),
+            (4, "invalid_bbl", "BROADWAY"),
+            (5, None, None),
+        ]
+        df = spark.createDataFrame(mock_data, ["unique_key", "bbl", "incident_address"])
+        df_clean = normalize_bbl_and_house_numbers(df)
+        pdf = df_clean.toPandas().sort_values("unique_key").reset_index(drop=True)
+
+        self.assertEqual(pdf.loc[0, "clean_bbl"], "1022150225")
+        self.assertEqual(pdf.loc[0, "house_num_extracted"], "100-02")
+
+        self.assertEqual(pdf.loc[1, "clean_bbl"], "3001234567")
+        self.assertEqual(pdf.loc[1, "house_num_extracted"], "350")
+
+        self.assertTrue(pd.isna(pdf.loc[2, "clean_bbl"]))
+        self.assertEqual(pdf.loc[2, "house_num_extracted"], "12A")
+
+        self.assertTrue(pd.isna(pdf.loc[3, "clean_bbl"]))
+        self.assertTrue(pd.isna(pdf.loc[3, "house_num_extracted"]))
+
+        self.assertTrue(pd.isna(pdf.loc[4, "clean_bbl"]))
+        self.assertTrue(pd.isna(pdf.loc[4, "house_num_extracted"]))
+
+    def test_spatial_cleaning_cross_streets_lexicographical_invariance(self):
+        """Verify cross streets canonicalization and order-invariant matching."""
+        spark = get_spark_session("test_cross_streets")
+        mock_data = [
+            (1, "BROADWAY", "WEST 42 STREET"),
+            (2, "W 42 ST", "BROADWAY"),
+        ]
+        df = spark.createDataFrame(mock_data, ["unique_key", "cross_street_1", "cross_street_2"])
+        df_clean = standardize_cross_streets(df)
+        pdf = df_clean.toPandas().sort_values("unique_key").reset_index(drop=True)
+
+        # Both permutations must yield the exact same ordered street pair
+        self.assertEqual(pdf.loc[0, "clean_cross_street_a"], "BROADWAY")
+        self.assertEqual(pdf.loc[0, "clean_cross_street_b"], "W 42 ST")
+        self.assertEqual(pdf.loc[1, "clean_cross_street_a"], "BROADWAY")
+        self.assertEqual(pdf.loc[1, "clean_cross_street_b"], "W 42 ST")
+        self.assertTrue(pdf.loc[0, "has_valid_cross_streets"])
+        self.assertTrue(pdf.loc[1, "has_valid_cross_streets"])
+
+    def test_spatial_cleaning_highway_defensive_filter(self):
+        """Verify highway validation requires both name and valid segment."""
+        spark = get_spark_session("test_highway")
+        mock_data = [
+            (1, "BQE", "10-20", "NORTHBOUND"),
+            (2, "FDR DRIVE", "UNSPECIFIED", "SOUTHBOUND"),
+            (3, None, "10-20", "NB"),
+        ]
+        df = spark.createDataFrame(mock_data, ["unique_key", "bridge_highway_name", "bridge_highway_segment", "bridge_highway_direction"])
+        df_clean = normalize_highway_corridors(df)
+        pdf = df_clean.toPandas().sort_values("unique_key").reset_index(drop=True)
+
+        self.assertTrue(pdf.loc[0, "has_valid_highway"])
+        self.assertEqual(pdf.loc[0, "clean_highway_direction"], "NB")
+
+        self.assertFalse(pdf.loc[1, "has_valid_highway"])
+        self.assertFalse(pdf.loc[2, "has_valid_highway"])
+
+    def test_hierarchical_spatial_routing_precedence(self):
+        """Verify the 6 spatial routes and unlocatable fallback."""
+        spark = get_spark_session("test_routing")
+        mock_data = [
+            # 1. Building
+            (1, "ADDRESS", "1022150225", "100", "MANHATTAN", None, None, None, None, None, None, None, None, None),
+            # 2. Highway
+            (2, "HIGHWAY", None, None, "BROOKLYN", None, None, "BQE", "SEG_A", "NB", None, None, None, None),
+            # 3. Intersection
+            (3, "INTERSECTION", None, None, "MANHATTAN", "BROADWAY", "W 42 ST", None, None, None, None, None, None, None),
+            # 4. Blockface
+            (4, "BLOCKFACE", None, None, "QUEENS", "1 AVE", "2 AVE", None, None, None, None, None, "MAIN ST", None),
+            # 5. Public Place
+            (5, "PLACE", None, None, "MANHATTAN", None, None, None, None, None, "CENTRAL PARK", None, None, None),
+            # 6. Unlocatable
+            (6, "UNKNOWN", None, None, "UNSPECIFIED", None, None, None, None, None, None, None, None, None),
+        ]
+        cols = [
+            "unique_key", "address_type", "clean_bbl", "house_num_extracted", "borough",
+            "clean_cross_street_a", "clean_cross_street_b", "clean_highway_name",
+            "clean_highway_segment", "clean_highway_direction", "clean_landmark",
+            "clean_park_facility_name", "clean_street_name", "clean_incident_address"
+        ]
+        from pyspark.sql.types import StructType, StructField, LongType, StringType
+        schema = StructType([StructField("unique_key", LongType(), True)] + [StructField(c, StringType(), True) for c in cols[1:]])
+        df = spark.createDataFrame(mock_data, schema=schema)
+        df = df.withColumn("has_valid_cross_streets", col("clean_cross_street_a").isNotNull() & col("clean_cross_street_b").isNotNull())
+        df = df.withColumn("has_valid_highway", col("clean_highway_name").isNotNull() & col("clean_highway_segment").isNotNull())
+        df = df.withColumn("clean_incident_zip", lit(None).cast("string"))
+
+        df_routed = generate_hierarchical_location_keys(df)
+        pdf = df_routed.toPandas().sort_values("unique_key").reset_index(drop=True)
+
+        self.assertEqual(pdf.loc[0, "loc_routing_type"], "1. Buildings (BBL + House#)")
+        self.assertEqual(pdf.loc[0, "loc_key"], "BBL_1022150225_HN_100")
+
+        self.assertEqual(pdf.loc[1, "loc_routing_type"], "2. Highway Corridors")
+        self.assertEqual(pdf.loc[1, "loc_key"], "HWY_BQE_NB_SEG_A")
+
+        self.assertEqual(pdf.loc[2, "loc_routing_type"], "3. Intersections (Cross Streets)")
+        self.assertEqual(pdf.loc[2, "loc_key"], "INT_BROADWAY_X_W 42 ST_MANHATTAN")
+
+        self.assertEqual(pdf.loc[3, "loc_routing_type"], "4. Blockfaces (Road Segments)")
+        self.assertEqual(pdf.loc[3, "loc_key"], "BLK_MAIN ST_1 AVE_X_2 AVE_QUEENS")
+
+        self.assertEqual(pdf.loc[4, "loc_routing_type"], "5. Public Places & Parks")
+        self.assertEqual(pdf.loc[4, "loc_key"], "LND_CENTRAL PARK_MANHATTAN")
+
+        self.assertEqual(pdf.loc[5, "loc_routing_type"], "UNLOCATABLE")
+        self.assertTrue(pd.isna(pdf.loc[5, "loc_key"]))
+
+    def test_ticket_1_anchored_adaptive_burst_clustering(self):
+        """Verify Ticket-1 adaptive windowing max(burst_window_hours, ticket_1_closed_date)."""
+        from pyspark.sql.functions import to_timestamp
+        spark = get_spark_session("test_clustering")
+        mock_data = [
+            # Incident 1 at LOC_A: Ticket 101 closed in 2h -> Cutoff is 10:00 + 6h = 16:00
+            (101, "LOC_A", "1. Buildings", "Noise", "2026-05-01 10:00:00", "2026-05-01 12:00:00"),
+            # Ticket 102 arrives at 13:00 <= 16:00 -> duplicate of 101!
+            (102, "LOC_A", "1. Buildings", "Noise", "2026-05-01 13:00:00", None),
+            # Incident 2 (Wave 2) at LOC_A: arrives at 17:00 > 16:00. Closed next day at 10:00 -> Cutoff is next day 10:00!
+            (103, "LOC_A", "1. Buildings", "Noise", "2026-05-01 17:00:00", "2026-05-02 10:00:00"),
+            # Ticket 104 arrives at 23:00 <= next day 10:00 -> duplicate of 103!
+            (104, "LOC_A", "1. Buildings", "Noise", "2026-05-01 23:00:00", None),
+            # Incident 3 (Wave 3) at LOC_A: arrives at next day 12:00 > next day 10:00 -> new Wave!
+            (105, "LOC_A", "1. Buildings", "Noise", "2026-05-02 12:00:00", None),
+            # Unlocatable record: receives isolated cluster without skew
+            (999, None, "UNLOCATABLE", "Noise", "2026-05-01 11:00:00", None),
+        ]
+        cols = ["unique_key", "loc_key", "loc_routing_type", "complaint_type", "created_at_utc", "closed_at_utc"]
+        df = spark.createDataFrame(mock_data, cols)
+        df = df.withColumn("created_at_utc", to_timestamp("created_at_utc")).withColumn("closed_at_utc", to_timestamp("closed_at_utc"))
+
+        df_clustered = cluster_citizen_call_bursts(df, burst_window_hours=6.0, num_partitions=2)
+        pdf = df_clustered.toPandas().sort_values("unique_key").reset_index(drop=True)
+
+        # Ticket 101: Anchor of Incident 1
+        self.assertFalse(pdf.loc[pdf["unique_key"] == 101, "is_burst_duplicate"].iloc[0])
+        self.assertEqual(pdf.loc[pdf["unique_key"] == 101, "burst_sequence_num"].iloc[0], 1)
+        self.assertEqual(pdf.loc[pdf["unique_key"] == 101, "cluster_size"].iloc[0], 2)
+        c101_id = pdf.loc[pdf["unique_key"] == 101, "incident_cluster_id"].iloc[0]
+
+        # Ticket 102: Duplicate of 101
+        self.assertTrue(pdf.loc[pdf["unique_key"] == 102, "is_burst_duplicate"].iloc[0])
+        self.assertEqual(pdf.loc[pdf["unique_key"] == 102, "burst_sequence_num"].iloc[0], 2)
+        self.assertEqual(pdf.loc[pdf["unique_key"] == 102, "incident_cluster_id"].iloc[0], c101_id)
+
+        # Ticket 103: Anchor of Incident 2 (Wave 2)
+        self.assertFalse(pdf.loc[pdf["unique_key"] == 103, "is_burst_duplicate"].iloc[0])
+        self.assertEqual(pdf.loc[pdf["unique_key"] == 103, "burst_sequence_num"].iloc[0], 1)
+        self.assertEqual(pdf.loc[pdf["unique_key"] == 103, "cluster_size"].iloc[0], 2)
+        c103_id = pdf.loc[pdf["unique_key"] == 103, "incident_cluster_id"].iloc[0]
+        self.assertNotEqual(c101_id, c103_id)
+
+        # Ticket 104: Duplicate of 103
+        self.assertTrue(pdf.loc[pdf["unique_key"] == 104, "is_burst_duplicate"].iloc[0])
+        self.assertEqual(pdf.loc[pdf["unique_key"] == 104, "burst_sequence_num"].iloc[0], 2)
+        self.assertEqual(pdf.loc[pdf["unique_key"] == 104, "incident_cluster_id"].iloc[0], c103_id)
+
+        # Ticket 105: Anchor of Incident 3 (Wave 3)
+        self.assertFalse(pdf.loc[pdf["unique_key"] == 105, "is_burst_duplicate"].iloc[0])
+        self.assertEqual(pdf.loc[pdf["unique_key"] == 105, "burst_sequence_num"].iloc[0], 1)
+        self.assertEqual(pdf.loc[pdf["unique_key"] == 105, "cluster_size"].iloc[0], 1)
+
+        # Unlocatable record (999)
+        self.assertFalse(pdf.loc[pdf["unique_key"] == 999, "is_burst_duplicate"].iloc[0])
+        self.assertEqual(pdf.loc[pdf["unique_key"] == 999, "cluster_size"].iloc[0], 1)
+        self.assertEqual(pdf.loc[pdf["unique_key"] == 999, "loc_routing_type"].iloc[0], "UNLOCATABLE")
+        self.assertEqual(pdf.loc[pdf["unique_key"] == 999, "incident_cluster_id"].iloc[0], "INC_UNLOC_999")
+
+    def test_spatial_cleaning_queens_hyphenated_address_and_house_number(self):
+        """Verify Queens hyphenated house numbers (e.g. 100-02) are preserved in both house_num and address."""
+        spark = get_spark_session("test_queens_hyphen")
+        mock_data = [
+            (1, "100-02 QUEENS BLVD"),
+            (2, "100 - 02 QUEENS BLVD"),
+            (3, "14-19 31ST AVE"),
+            (4, "350 5TH AVENUE"),
+        ]
+        df = spark.createDataFrame(mock_data, ["unique_key", "incident_address"])
+        df = normalize_bbl_and_house_numbers(df)
+        df = canonicalize_fallback_addresses(df)
+        pdf = df.toPandas().sort_values("unique_key").reset_index(drop=True)
+
+        # Row 1: 100-02 Queens Blvd
+        self.assertEqual(pdf.loc[0, "house_num_extracted"], "100-02")
+        self.assertEqual(pdf.loc[0, "clean_incident_address"], "100-02 QUEENS BLVD")
+        self.assertTrue(pdf.loc[0, "has_valid_house_number"])
+        self.assertTrue(pdf.loc[0, "has_valid_fallback_address"])
+
+        # Row 2: 100 - 02 Queens Blvd normalizes to 100-02
+        self.assertEqual(pdf.loc[1, "house_num_extracted"], "100-02")
+        self.assertEqual(pdf.loc[1, "clean_incident_address"], "100-02 QUEENS BLVD")
+
+        # Row 3: 14-19 31ST AVE
+        self.assertEqual(pdf.loc[2, "house_num_extracted"], "14-19")
+        self.assertEqual(pdf.loc[2, "clean_incident_address"], "14-19 31ST AVE")
+
+        # Row 4: 350 5TH AVE
+        self.assertEqual(pdf.loc[3, "house_num_extracted"], "350")
+        self.assertEqual(pdf.loc[3, "clean_incident_address"], "350 5TH AVE")
+
+    def test_spatial_cleaning_directional_normalization(self):
+        """Verify leading directional prefixes are normalized while protecting iconic street names like WEST END AVE."""
+        spark = get_spark_session("test_directionals")
+        mock_data = [
+            (1, "NORTH BROADWAY"),
+            (2, "WEST 42ND STREET"),
+            (3, "WEST END AVENUE"),
+            (4, "W END AVE"),
+            (5, "EAST END AVENUE"),
+            (6, "350 WEST 42ND STREET"),
+            (7, "350 WEST END AVENUE"),
+            (8, "SOUTH STREET"),
+            (9, "UNKNOWN"),
+        ]
+        df = spark.createDataFrame(mock_data, ["unique_key", "incident_address"])
+        df = canonicalize_fallback_addresses(df)
+        pdf = df.toPandas().sort_values("unique_key").reset_index(drop=True)
+
+        self.assertEqual(pdf.loc[0, "clean_incident_address"], "N BROADWAY")
+        self.assertEqual(pdf.loc[1, "clean_incident_address"], "W 42ND ST")
+        self.assertEqual(pdf.loc[2, "clean_incident_address"], "WEST END AVE")
+        self.assertEqual(pdf.loc[3, "clean_incident_address"], "WEST END AVE")  # Normalizes W END to WEST END
+        self.assertEqual(pdf.loc[4, "clean_incident_address"], "EAST END AVE")
+        self.assertEqual(pdf.loc[5, "clean_incident_address"], "350 W 42ND ST")
+        self.assertEqual(pdf.loc[6, "clean_incident_address"], "350 WEST END AVE")
+        self.assertEqual(pdf.loc[7, "clean_incident_address"], "S ST")
+        self.assertTrue(pd.isna(pdf.loc[8, "clean_incident_address"]))
+
+    def test_spatial_cleaning_cross_street_placeholder_fallback(self):
+        """Verify invalid placeholders (UNKNOWN, NAN, NONE) do NOT swallow valid fallback cross streets."""
+        spark = get_spark_session("test_cross_street_fallbacks")
+        mock_data = [
+            # Primary street 1 has UNKNOWN, fallback has BROADWAY -> should pick BROADWAY!
+            (1, "UNKNOWN", "BROADWAY", "NAN", "W 42 ST"),
+            # Primary has valid street, fallback has something else -> primary wins
+            (2, "5 AVE", "BROADWAY", "42 ST", "W 42 ST"),
+            # Both primary and fallback are invalid placeholders -> should be None
+            (3, "NULL", "UNSPECIFIED", "NAN", "UNKNOWN"),
+        ]
+        cols = ["unique_key", "intersection_street_1", "cross_street_1", "intersection_street_2", "cross_street_2"]
+        df = spark.createDataFrame(mock_data, cols)
+        df = standardize_cross_streets(df)
+        pdf = df.toPandas().sort_values("unique_key").reset_index(drop=True)
+
+        # Row 1: correctly recovered BROADWAY and W 42 ST
+        self.assertTrue(pdf.loc[0, "has_valid_cross_streets"])
+        self.assertEqual(pdf.loc[0, "clean_cross_street_a"], "BROADWAY")
+        self.assertEqual(pdf.loc[0, "clean_cross_street_b"], "W 42 ST")
+
+        # Row 2: primary streets 5 AVE and 42 ST
+        self.assertTrue(pdf.loc[1, "has_valid_cross_streets"])
+        self.assertEqual(pdf.loc[1, "clean_cross_street_a"], "42 ST")
+        self.assertEqual(pdf.loc[1, "clean_cross_street_b"], "5 AVE")
+
+        # Row 3: both invalid -> has_valid_cross_streets is False
+        self.assertFalse(pdf.loc[2, "has_valid_cross_streets"])
+        self.assertTrue(pd.isna(pdf.loc[2, "clean_cross_street_a"]))
+        self.assertTrue(pd.isna(pdf.loc[2, "clean_cross_street_b"]))
+
+    def test_spatial_cleaning_bbl_and_quality_indicators(self):
+        """Verify BBL validation edge cases (trailing .0, scientific notation, length) and quality indicators."""
+        spark = get_spark_session("test_bbl_indicators")
+        mock_data = [
+            (1, "1008400001", "350 5TH AVE"),       # Valid BBL
+            (2, "1008400001.0", "350 5TH AVE"),     # Trailing .0 float conversion
+            (3, "1.0084E9", "350 5TH AVE"),         # Scientific notation (invalid)
+            (4, "12345", "350 5TH AVE"),            # Short BBL (invalid)
+            (5, "6001234567", "350 5TH AVE"),       # Invalid borough 6
+            (6, None, None),                         # Nulls
+        ]
+        df = spark.createDataFrame(mock_data, ["unique_key", "bbl", "incident_address"])
+        df = normalize_bbl_and_house_numbers(df)
+        df = canonicalize_fallback_addresses(df)
+        pdf = df.toPandas().sort_values("unique_key").reset_index(drop=True)
+
+        self.assertEqual(pdf.loc[0, "clean_bbl"], "1008400001")
+        self.assertTrue(pdf.loc[0, "has_valid_bbl"])
+        self.assertTrue(pdf.loc[0, "has_valid_house_number"])
+
+        self.assertEqual(pdf.loc[1, "clean_bbl"], "1008400001")
+        self.assertTrue(pdf.loc[1, "has_valid_bbl"])
+
+        self.assertTrue(pd.isna(pdf.loc[2, "clean_bbl"]))
+        self.assertFalse(pdf.loc[2, "has_valid_bbl"])
+
+        self.assertTrue(pd.isna(pdf.loc[3, "clean_bbl"]))
+        self.assertFalse(pdf.loc[3, "has_valid_bbl"])
+
+        self.assertTrue(pd.isna(pdf.loc[4, "clean_bbl"]))
+        self.assertFalse(pdf.loc[4, "has_valid_bbl"])
+
+        self.assertTrue(pd.isna(pdf.loc[5, "clean_bbl"]))
+        self.assertFalse(pdf.loc[5, "has_valid_bbl"])
+        self.assertFalse(pdf.loc[5, "has_valid_house_number"])
+        self.assertFalse(pdf.loc[5, "has_valid_fallback_address"])
+
+    def test_spatial_cleaning_highway_segment_formatting(self):
+        """Verify highway segment format normalization and defensive presence requirement."""
+        spark = get_spark_session("test_highway_formatting")
+        mock_data = [
+            (1, "BQE", "SEGMENT-01", "NORTHBOUND"),
+            (2, "BQE", "Segment  01", "NB"),
+            (3, "FDR DRIVE", "UNKNOWN", "SOUTH"),
+            (4, None, "SEGMENT 01", "NB"),
+        ]
+        df = spark.createDataFrame(mock_data, ["unique_key", "bridge_highway_name", "bridge_highway_segment", "bridge_highway_direction"])
+        df = normalize_highway_corridors(df)
+        pdf = df.toPandas().sort_values("unique_key").reset_index(drop=True)
+
+        # Both SEGMENT-01 and Segment 01 normalize to SEGMENT 01
+        self.assertEqual(pdf.loc[0, "clean_highway_segment"], "SEGMENT 01")
+        self.assertEqual(pdf.loc[1, "clean_highway_segment"], "SEGMENT 01")
+        self.assertTrue(pdf.loc[0, "has_valid_highway"])
+        self.assertTrue(pdf.loc[1, "has_valid_highway"])
+
+        # Row 3: UNKNOWN segment is dropped -> has_valid_highway is False
+        self.assertFalse(pdf.loc[2, "has_valid_highway"])
+        self.assertTrue(pd.isna(pdf.loc[2, "clean_highway_segment"]))
+
+        # Row 4: Missing highway name -> has_valid_highway is False
+        self.assertFalse(pdf.loc[3, "has_valid_highway"])
 
 
 if __name__ == "__main__":

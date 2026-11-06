@@ -37,6 +37,7 @@ jobs:
     - name: Run Pipeline & Quality Gate
       env:
         SOCRATA_APP_TOKEN: ${{ secrets.SOCRATA_APP_TOKEN }}
+        PYTHONWARNINGS: "ignore::DeprecationWarning,ignore::FutureWarning,ignore::ResourceWarning"
       run: |
         source ~/spark-env/bin/activate
         if [ -n "$SPARK_HOME" ]; then unset SPARK_HOME; fi

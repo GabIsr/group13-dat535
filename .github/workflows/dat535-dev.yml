@@ -15,6 +15,7 @@ jobs:
     env:
       DAT535_ENV: dev
       SOCRATA_APP_TOKEN: ${{ secrets.SOCRATA_APP_TOKEN }}
+      PYTHONWARNINGS: "ignore::DeprecationWarning,ignore::FutureWarning,ignore::ResourceWarning"
 
     steps:
       - name: Checkout code

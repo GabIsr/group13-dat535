@@ -9,7 +9,16 @@ import logging
 import subprocess
 import sys
 import time
+import warnings
 from pathlib import Path
+
+# Suppress known external library deprecations (Pandas 2/3 and PySpark 3.5 bridge)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=ResourceWarning)
+warnings.filterwarnings("ignore", message=".*copy keyword is deprecated.*")
+warnings.filterwarnings("ignore", message=".*is_datetime64tz_dtype is deprecated.*")
+warnings.filterwarnings("ignore", message=".*distutils Version classes are deprecated.*")
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))

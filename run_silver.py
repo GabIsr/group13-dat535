@@ -65,8 +65,14 @@ def main():
 
     # Stage 3: Unified Fact Join
     if args.stage in ["all", "join"]:
-        logger.info("Executing Silver Stage: Unified Analytical Fact Join...")
-        m_join = join_silver_datasets()
+        if args.stage == "all" and (m_311.get("status") == "skipped" or m_weather.get("status") == "skipped"):
+            logger.warning(
+                f"Skipping Unified Analytical Fact Join because upstream Silver stage was skipped "
+                f"(311 status: {m_311.get('status', 'unknown')}, weather status: {m_weather.get('status', 'unknown')})."
+            )
+        else:
+            logger.info("Executing Silver Stage: Unified Analytical Fact Join...")
+            m_join = join_silver_datasets()
 
     # If full pipeline ran, compile Quality Reconciliation Ledger
     if args.stage == "all" and m_311 and m_weather and m_join:

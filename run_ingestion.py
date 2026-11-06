@@ -7,6 +7,7 @@ Author: Group 13
 
 import argparse
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -126,6 +127,7 @@ def main():
 
     manifests = []
     overall_start = time.time()
+    has_error = False
 
     # 1. NYC 311 Ingestion
     if args.dataset in ["all", "311"]:
@@ -145,8 +147,7 @@ def main():
                 manifests.append(m_311)
         except Exception as e:
             logger.error(f"Failed to execute NYC 311 ingestion: {e}", exc_info=True)
-            if args.dataset == "311":
-                sys.exit(1)
+            has_error = True
 
     # 2. Open-Meteo ERA5-Land Weather Ingestion
     if args.dataset in ["all", "weather"]:
@@ -164,12 +165,15 @@ def main():
                 manifests.append(m_wth)
         except Exception as e:
             logger.error(f"Failed to execute weather ingestion: {e}", exc_info=True)
-            if args.dataset == "weather":
-                sys.exit(1)
+            has_error = True
 
     print_summary_table(manifests)
     total_elapsed = time.time() - overall_start
     logger.info(f"Pipeline run completed in {total_elapsed:.2f} seconds.")
+
+    if has_error:
+        logger.error("Ingestion pipeline encountered critical errors. Halting execution.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

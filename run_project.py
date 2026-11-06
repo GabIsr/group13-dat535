@@ -14,6 +14,10 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# Ensure Spark environment and paths are initialized before any PySpark imports
+from src.utils.spark import _configure_environment
+_configure_environment()
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",

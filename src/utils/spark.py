@@ -14,7 +14,41 @@ logger = logging.getLogger("spark_session_factory")
 
 
 def _configure_environment():
-    """Ensure JAVA_HOME, HADOOP_HOME (for Windows), PATH, and PySpark Python paths are properly configured."""
+    """Ensure JAVA_HOME, SPARK_HOME, HADOOP_HOME (for Windows), PATH, and PySpark Python paths are properly configured."""
+    # 1. Validate & sanitize SPARK_HOME to prevent classpath incompatibilities
+    # If SPARK_HOME points to an external Spark install (e.g. /opt/spark 3.5.0) while Python
+    # has pip-installed PySpark (e.g. 4.x), Py4J fails to load Spark SQL classes:
+    # "TypeError: 'JavaPackage' object is not callable".
+    if "SPARK_HOME" in os.environ:
+        spark_home = Path(os.environ["SPARK_HOME"])
+        spark_home_jars = spark_home / "jars"
+        if not spark_home.exists() or not spark_home_jars.is_dir():
+            logger.warning(f"SPARK_HOME={spark_home} does not exist or lacks jars directory. Unsetting SPARK_HOME.")
+            del os.environ["SPARK_HOME"]
+        else:
+            try:
+                import pyspark
+                pyspark_major = pyspark.__version__.split(".")[0]
+                sql_jars = list(spark_home_jars.glob("spark-core*.jar"))
+                if sql_jars:
+                    jar_ver = sql_jars[0].name.split("-")[-1].replace(".jar", "").split(".")[0]
+                    if pyspark_major != jar_ver:
+                        logger.warning(
+                            f"PySpark major version ({pyspark_major}) clashes with SPARK_HOME jars ({jar_ver} at {spark_home}). "
+                            f"Unsetting SPARK_HOME to use pip-bundled jars."
+                        )
+                        del os.environ["SPARK_HOME"]
+            except Exception:
+                pass
+
+    # 2. Validate JAVA_HOME
+    if "JAVA_HOME" in os.environ:
+        java_home = Path(os.environ["JAVA_HOME"])
+        java_exe = "java.exe" if sys.platform == "win32" else "java"
+        if not (java_home / "bin" / java_exe).exists():
+            logger.warning(f"JAVA_HOME={java_home} does not contain bin/{java_exe}. Removing invalid JAVA_HOME.")
+            del os.environ["JAVA_HOME"]
+
     # If JAVA_HOME is not set, try to locate it within the conda environment
     if "JAVA_HOME" not in os.environ:
         conda_env = sys.prefix
@@ -42,6 +76,10 @@ def _configure_environment():
         lib_bin = str(Path(sys.prefix) / "Library" / "bin")
         if lib_bin not in os.environ.get("PATH", ""):
             os.environ["PATH"] = lib_bin + os.pathsep + os.environ.get("PATH", "")
+
+
+# Run environment configuration on import
+_configure_environment()
 
 
 def get_spark_session(

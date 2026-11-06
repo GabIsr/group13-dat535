@@ -14,8 +14,6 @@ jobs:
     environment: dev
     env:
       DAT535_ENV: dev
-      SPARK_HOME: /opt/spark
-      JAVA_HOME: /usr/lib/jvm/java-8-openjdk-amd64
       SOCRATA_APP_TOKEN: ${{ secrets.SOCRATA_APP_TOKEN }}
 
     steps:
@@ -30,6 +28,10 @@ jobs:
       - name: Execute Automated Test Suite Gate
         run: |
           source ~/spark-env/bin/activate
+          if [ -n "$SPARK_HOME" ]; then unset SPARK_HOME; fi
+          echo "=== PySpark & Java Runtime Verification ==="
+          python -c "import sys, pyspark; print(f'Python: {sys.version.split()[0]} | PySpark: {pyspark.__version__}')"
+          java -version 2>&1 | head -n 2 || true
           echo "=== Running Automated Unit & Integration Tests ==="
           python $GITHUB_WORKSPACE/run_project.py test
 
@@ -38,6 +40,7 @@ jobs:
           DAT535_OUTPUT_DIR: ${{ steps.output-dir.outputs.dir }}
         run: |
           source ~/spark-env/bin/activate
+          if [ -n "$SPARK_HOME" ]; then unset SPARK_HOME; fi
           mkdir -p "$DAT535_OUTPUT_DIR"
           
           echo "=== Running Course Project Medallion Pipeline ==="
@@ -47,6 +50,7 @@ jobs:
         if: always()
         run: |
           source ~/spark-env/bin/activate
+          if [ -n "$SPARK_HOME" ]; then unset SPARK_HOME; fi
           echo "=== Publishing Data Quality Scorecard ==="
           python $GITHUB_WORKSPACE/src/utils/publish_ci_summary.py
 

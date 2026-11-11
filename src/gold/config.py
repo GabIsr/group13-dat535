@@ -4,11 +4,13 @@ Defines storage paths, thresholds for SLA definitions, and business rule constan
 Author: Group 13
 """
 
+import os
 from pathlib import Path
 
-# Base Paths (dynamically resolved to project root)
+# Base Paths (dynamically resolved to project root or overridden by DAT535_OUTPUT_DIR)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
+env_output_dir = os.environ.get("DAT535_OUTPUT_DIR")
+DATA_DIR = Path(env_output_dir).resolve() if env_output_dir else (PROJECT_ROOT / "data")
 SILVER_DIR = DATA_DIR / "silver"
 GOLD_DIR = DATA_DIR / "gold"
 GOLD_MARTS_DIR = GOLD_DIR / "marts"

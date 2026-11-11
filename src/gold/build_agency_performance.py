@@ -12,16 +12,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import numpy as np
-import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 from pyspark.sql.functions import (
+    broadcast,
     col,
     count as spark_count,
+    countDistinct,
+    datediff,
+    dayofweek,
     lit,
     max as spark_max,
     mean as spark_mean,
+    month as spark_month,
     percentile_approx,
     round as spark_round,
     sum as spark_sum,
@@ -29,6 +30,7 @@ from pyspark.sql.functions import (
     trim,
     upper,
     when,
+    year as spark_year,
 )
 from pyspark.storagelevel import StorageLevel
 
@@ -117,71 +119,63 @@ def build_agency_resolution_performance_mart(
             lit(None).cast("double").alias("avg_resolution_duration_hours"),
         )
 
-    # Merge Creation and Closure cohorts
+    # Merge Creation and Closure cohorts in PySpark
     df_perf_spark = df_created_spark.join(
         df_closed_spark,
         on=["reporting_date", "borough", "agency"],
         how="outer",
+    ).fillna(0, subset=["tickets_created_today", "tickets_closed_today"])
+
+    if "distinct_incidents_created_today" in df_perf_spark.columns:
+        df_perf_spark = df_perf_spark.fillna(0, subset=["distinct_incidents_created_today"])
+
+    # 4. Compute Active Backlog & Aging as of each reporting_date in pure PySpark (Zero toPandas)
+    logger.info("Computing Backlog Cohort (active pending tickets and aging share > 7 days) with PySpark...")
+    df_dates_spark = df_perf_spark.select("reporting_date").distinct()
+
+    df_311_backlog = (
+        df_311_spark
+        .select(
+            to_date(col("created_at_utc")).alias("created_date_only"),
+            (to_date(col("closed_at_utc")) if has_closed_date else lit(None).cast("date")).alias("closed_date_only"),
+            col("borough"),
+            col("agency"),
+            col("unique_key"),
+        )
     )
 
-    df_perf_spark.persist(StorageLevel.MEMORY_AND_DISK)
-    df_perf = df_perf_spark.toPandas().copy()
-    df_perf_spark.unpersist()
-
-    df_perf["tickets_created_today"] = df_perf["tickets_created_today"].fillna(0).astype(int)
-    if "distinct_incidents_created_today" in df_perf.columns:
-        df_perf["distinct_incidents_created_today"] = df_perf["distinct_incidents_created_today"].fillna(0).astype(int)
-    df_perf["tickets_closed_today"] = df_perf["tickets_closed_today"].fillna(0).astype(int)
-
-    # Convert df_311 to pandas for date-by-date active queue accumulation
-    df_311 = df_311_spark.toPandas().copy()
-    df_311["created_date_only"] = pd.to_datetime(df_311["created_at_utc"], utc=True).dt.date
-    df_311["closed_date_only"] = (
-        pd.to_datetime(df_311["closed_at_utc"], utc=True).dt.date
-        if "closed_at_utc" in df_311.columns
-        else pd.Series(pd.NaT, index=df_311.index)
+    # Broadcast join reporting dates with active 311 tickets
+    df_active_cross = df_311_backlog.join(
+        broadcast(df_dates_spark),
+        col("created_date_only") <= col("reporting_date"),
+    )
+    df_active_filtered = df_active_cross.filter(
+        col("closed_date_only").isNull() | (col("closed_date_only") > col("reporting_date"))
+    )
+    df_active_with_aging = df_active_filtered.withColumn(
+        "is_long_open",
+        datediff(col("reporting_date"), col("created_date_only")) > lit(long_open_days),
+    )
+    df_backlog_summary = (
+        df_active_with_aging
+        .groupBy("reporting_date", "borough", "agency")
+        .agg(
+            spark_count("unique_key").alias("active_open_backlog_count"),
+            spark_sum(when(col("is_long_open"), 1).otherwise(0)).alias("long_open_backlog_count"),
+        )
     )
 
-    # 4. Compute Active Backlog & Aging as of each reporting_date
-    logger.info("Computing Backlog Cohort (active pending tickets and aging share > 7 days)...")
-    reporting_dates = sorted(df_perf["reporting_date"].unique())
-
-    backlog_records = []
-    for rep_date in reporting_dates:
-        cond_created = df_311["created_date_only"] <= rep_date
-        cond_open = df_311["closed_date_only"].isna() | (df_311["closed_date_only"] > rep_date)
-        active_mask = cond_created & cond_open
-        df_active = df_311[active_mask]
-
-        if df_active.empty:
-            continue
-
-        age_in_days = (rep_date - df_active["created_date_only"]).apply(lambda delta: delta.days)
-        df_active_grouped = df_active.assign(is_long_open=(age_in_days > long_open_days)).groupby(
-            ["borough", "agency"]
-        ).agg(
-            active_open_backlog_count=("unique_key", "count"),
-            long_open_backlog_count=("is_long_open", "sum"),
-        ).reset_index()
-
-        df_active_grouped["reporting_date"] = rep_date
-        backlog_records.append(df_active_grouped)
-
-    if backlog_records:
-        df_backlog_all = pd.concat(backlog_records, ignore_index=True)
-        df_perf = pd.merge(df_perf, df_backlog_all, on=["reporting_date", "borough", "agency"], how="left")
-    else:
-        df_perf["active_open_backlog_count"] = 0
-        df_perf["long_open_backlog_count"] = 0
-
-    df_perf["active_open_backlog_count"] = df_perf["active_open_backlog_count"].fillna(0).astype(int)
-    df_perf["long_open_backlog_count"] = df_perf["long_open_backlog_count"].fillna(0).astype(int)
-
-    # Long-open share %
-    df_perf["long_open_share_pct"] = np.where(
-        df_perf["active_open_backlog_count"] > 0,
-        ((df_perf["long_open_backlog_count"] / df_perf["active_open_backlog_count"]) * 100.0).round(1),
-        0.0,
+    df_perf_spark = (
+        df_perf_spark
+        .join(df_backlog_summary, on=["reporting_date", "borough", "agency"], how="left")
+        .fillna(0, subset=["active_open_backlog_count", "long_open_backlog_count"])
+        .withColumn(
+            "long_open_share_pct",
+            when(
+                col("active_open_backlog_count") > 0,
+                spark_round((col("long_open_backlog_count") / col("active_open_backlog_count")) * 100.0, 1),
+            ).otherwise(lit(0.0)),
+        )
     )
 
     # 5. Load and Aggregate Borough-Level Weather Context via PySpark
@@ -214,69 +208,85 @@ def build_agency_resolution_performance_mart(
                     spark_round(spark_mean("temperature_2m"), 2).alias("borough_avg_temp_c"),
                     spark_max(when(col("is_extreme_weather") == True, lit(True)).otherwise(lit(False))).alias("is_extreme_weather_event"),
                 )
+                .withColumn(
+                    "is_storm_day",
+                    (col("borough_daily_precip_mm") >= lit(STORM_PRECIP_THRESHOLD_MM)) |
+                    (col("borough_max_wind_gust_ms") >= lit(STORM_WIND_THRESHOLD_MS)),
+                )
             )
-            borough_weather = borough_weather_spark.toPandas().copy()
 
-            borough_weather["is_storm_day"] = (
-                (borough_weather["borough_daily_precip_mm"] >= STORM_PRECIP_THRESHOLD_MM) |
-                (borough_weather["borough_max_wind_gust_ms"] >= STORM_WIND_THRESHOLD_MS)
+            df_perf_spark = (
+                df_perf_spark
+                .join(borough_weather_spark, on=["reporting_date", "borough"], how="left")
+                .fillna(False, subset=["is_storm_day"])
             )
-
-            df_perf = pd.merge(df_perf, borough_weather, on=["reporting_date", "borough"], how="left")
         else:
-            df_perf["borough_daily_precip_mm"] = np.nan
-            df_perf["borough_max_wind_gust_ms"] = np.nan
-            df_perf["borough_avg_temp_c"] = np.nan
-            df_perf["is_storm_day"] = False
+            df_perf_spark = (
+                df_perf_spark
+                .withColumn("borough_daily_precip_mm", lit(None).cast("double"))
+                .withColumn("borough_max_wind_gust_ms", lit(None).cast("double"))
+                .withColumn("borough_avg_temp_c", lit(None).cast("double"))
+                .withColumn("is_storm_day", lit(False))
+            )
     else:
-        df_perf["borough_daily_precip_mm"] = np.nan
-        df_perf["borough_max_wind_gust_ms"] = np.nan
-        df_perf["borough_avg_temp_c"] = np.nan
-        df_perf["is_storm_day"] = False
+        df_perf_spark = (
+            df_perf_spark
+            .withColumn("borough_daily_precip_mm", lit(None).cast("double"))
+            .withColumn("borough_max_wind_gust_ms", lit(None).cast("double"))
+            .withColumn("borough_avg_temp_c", lit(None).cast("double"))
+            .withColumn("is_storm_day", lit(False))
+        )
 
-    df_perf["is_storm_day"] = df_perf["is_storm_day"].astype("boolean").fillna(False).astype(bool)
+    # 6. Calendar Context in PySpark
+    df_perf_spark = (
+        df_perf_spark
+        .withColumn("year", spark_year(col("reporting_date")))
+        .withColumn("month", spark_month(col("reporting_date")))
+        .withColumn("day_of_week", (dayofweek(col("reporting_date")) + 5) % 7)
+        .withColumn("is_weekend", col("day_of_week").isin([5, 6]))
+        .withColumn("_gold_built_at_utc", lit(built_at_utc))
+    )
 
-    # 6. Calendar Context
-    dt_series = pd.to_datetime(df_perf["reporting_date"])
-    df_perf["year"] = dt_series.dt.year
-    df_perf["month"] = dt_series.dt.month
-    df_perf["day_of_week"] = dt_series.dt.dayofweek
-    df_perf["is_weekend"] = df_perf["day_of_week"].isin([5, 6])
-    df_perf["_gold_built_at_utc"] = built_at_utc
-
-    # 7. Grain Uniqueness Verification
+    # 7. Grain Uniqueness Verification in PySpark
     grain_cols = ["reporting_date", "borough", "agency"]
-    dup_count = int(df_perf.duplicated(subset=grain_cols).sum())
-    if dup_count > 0:
-        raise ValueError(f"Grain uniqueness violation: {dup_count} duplicate keys on {grain_cols}")
+    df_perf_spark.persist(StorageLevel.MEMORY_AND_DISK)
+    total_perf_rows = df_perf_spark.count()
+    distinct_grain_count = df_perf_spark.select(*grain_cols).distinct().count()
 
-    # 8. Write Parquet Mart
+    if distinct_grain_count != total_perf_rows:
+        df_perf_spark.unpersist()
+        raise ValueError(f"Grain uniqueness violation: {total_perf_rows - distinct_grain_count} duplicate keys on {grain_cols}")
+
+    # 8. Write Parquet Mart using PySpark distributed coalesce(1) write
     output_dir.mkdir(parents=True, exist_ok=True)
     out_file = output_dir / "gold_agency_resolution_performance.parquet"
-    table = pa.Table.from_pandas(df_perf, preserve_index=False)
-    pq.write_table(
-        table,
-        out_file,
-        compression="snappy",
-        coerce_timestamps="us",
-        allow_truncated_timestamps=True,
-    )
+    df_perf_spark.coalesce(1).write.mode("overwrite").parquet(str(out_file))
+
+    # Compute summary metrics natively via PySpark aggregate (1-row tuple over Py4J)
+    summary_metrics = df_perf_spark.select(
+        countDistinct("reporting_date").alias("distinct_dates"),
+        countDistinct("borough").alias("distinct_boroughs"),
+        countDistinct("agency").alias("distinct_agencies"),
+        spark_sum("tickets_created_today").alias("total_created"),
+        spark_sum("tickets_closed_today").alias("total_closed"),
+    ).collect()[0]
+    df_perf_spark.unpersist()
 
     elapsed = time.time() - start_time
     logger.info(
-        f"Built Gold Agency Resolution Performance Mart with PySpark: {len(df_perf):,} rows | "
-        f"{df_perf['reporting_date'].nunique()} dates | {df_perf['agency'].nunique()} agencies | "
+        f"Built Gold Agency Resolution Performance Mart with PySpark: {total_perf_rows:,} rows | "
+        f"{summary_metrics['distinct_dates']} dates | {summary_metrics['distinct_agencies']} agencies | "
         f"{elapsed:.2f}s | Output: {out_file.name}"
     )
 
     return {
         "mart": "gold_agency_resolution_performance",
-        "rows": len(df_perf),
-        "distinct_dates": df_perf["reporting_date"].nunique(),
-        "distinct_boroughs": df_perf["borough"].nunique(),
-        "distinct_agencies": df_perf["agency"].nunique(),
-        "total_tickets_created_tracked": int(df_perf["tickets_created_today"].sum()),
-        "total_tickets_closed_tracked": int(df_perf["tickets_closed_today"].sum()),
+        "rows": total_perf_rows,
+        "distinct_dates": int(summary_metrics["distinct_dates"] or 0),
+        "distinct_boroughs": int(summary_metrics["distinct_boroughs"] or 0),
+        "distinct_agencies": int(summary_metrics["distinct_agencies"] or 0),
+        "total_tickets_created_tracked": int(summary_metrics["total_created"] or 0),
+        "total_tickets_closed_tracked": int(summary_metrics["total_closed"] or 0),
         "output_path": str(out_file),
         "duration_seconds": round(elapsed, 2),
         "status": "success",

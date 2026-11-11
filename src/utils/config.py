@@ -19,7 +19,8 @@ if env_file.exists():
                 k, v = line.split("=", 1)
                 os.environ.setdefault(k.strip(), v.strip().strip("'\""))
 
-DATA_DIR = PROJECT_ROOT / "data"
+env_output_dir = os.environ.get("DAT535_OUTPUT_DIR")
+DATA_DIR = Path(env_output_dir).resolve() if env_output_dir else (PROJECT_ROOT / "data")
 LANDING_DIR = DATA_DIR / "landing"
 BRONZE_DIR = DATA_DIR / "bronze"
 METADATA_DIR = DATA_DIR / "metadata"

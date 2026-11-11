@@ -11,10 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
-from pyspark.sql.functions import broadcast, col
+from pyspark.sql.functions import broadcast, col, date_format, lit, sum as spark_sum, when
 from pyspark.storagelevel import StorageLevel
 
 from src.silver.config import PROJECT_ROOT, SILVER_DIR
@@ -119,25 +116,34 @@ def join_silver_datasets(
             f"Weather dimension contains duplicate (grid_id, timestamp_utc) keys."
         )
 
-    # Convert to Pandas for partitioned Parquet write and audit tracking
-    df_joined = df_joined_spark.toPandas().copy()
-    df_joined_spark.unpersist()
-
-    # Ensure nullable integer types are preserved on merged fact table
+    # 1. Native PySpark nullable type casting (Zero toPandas Anti-Pattern)
     for int16_col in ["weather_code", "relative_humidity_2m", "wind_direction_10m"]:
-        if int16_col in df_joined.columns:
-            df_joined[int16_col] = pd.to_numeric(df_joined[int16_col], errors="coerce").astype("Int16")
+        if int16_col in df_joined_spark.columns:
+            df_joined_spark = df_joined_spark.withColumn(int16_col, col(int16_col).cast("smallint"))
 
     for int32_col in ["cluster_size", "burst_sequence_num"]:
-        if int32_col in df_joined.columns:
-            df_joined[int32_col] = pd.to_numeric(df_joined[int32_col], errors="coerce").astype("Int32")
+        if int32_col in df_joined_spark.columns:
+            df_joined_spark = df_joined_spark.withColumn(int32_col, col(int32_col).cast("integer"))
 
-    if "incident_first_created_at_utc" in df_joined.columns:
-        df_joined["incident_first_created_at_utc"] = pd.to_datetime(df_joined["incident_first_created_at_utc"], utc=True)
+    if "incident_first_created_at_utc" in df_joined_spark.columns:
+        df_joined_spark = df_joined_spark.withColumn(
+            "incident_first_created_at_utc", col("incident_first_created_at_utc").cast("timestamp")
+        )
 
-    # Audit match status
-    df_joined["is_weather_matched"] = df_joined["temperature_2m"].notna()
-    matched_count = int(df_joined["is_weather_matched"].sum())
+    # 2. Add match status, metadata, and partition columns in pure Catalyst expressions
+    df_joined_spark = (
+        df_joined_spark
+        .withColumn("is_weather_matched", col("temperature_2m").isNotNull())
+        .withColumn("_silver_joined_at_utc", lit(joined_at_utc))
+        .withColumn("year", date_format(col("created_at_utc"), "yyyy"))
+        .withColumn("month", date_format(col("created_at_utc"), "MM"))
+    )
+
+    # 3. Audit match status natively in PySpark (1-row summary tuple over Py4J, zero driver data collection)
+    audit_row = df_joined_spark.select(
+        spark_sum(when(col("is_weather_matched"), 1).otherwise(0)).alias("matched_count")
+    ).collect()[0]
+    matched_count = int(audit_row["matched_count"] or 0)
     unmatched_count = total_311 - matched_count
     match_rate = round(matched_count / total_311 * 100.0, 2) if total_311 > 0 else 0.0
 
@@ -145,34 +151,20 @@ def join_silver_datasets(
         f"Join Results: {matched_count:,} matched ({match_rate}%) | {unmatched_count:,} unmatched."
     )
 
-    df_joined["_silver_joined_at_utc"] = joined_at_utc
-
-    # 5. Write Partitioned Fact Table: year=YYYY / month=MM / fact_311_weather.parquet
+    # 4. Write Partitioned Fact Table directly with PySpark distributed write
     output_joined_dir.mkdir(parents=True, exist_ok=True)
-    df_joined["_partition_year"] = pd.to_datetime(df_joined["created_at_utc"], utc=True).dt.strftime("%Y")
-    df_joined["_partition_month"] = pd.to_datetime(df_joined["created_at_utc"], utc=True).dt.strftime("%m")
+    (
+        df_joined_spark.write
+        .mode("overwrite")
+        .partitionBy("year", "month")
+        .parquet(str(output_joined_dir))
+    )
+    df_joined_spark.unpersist()
 
-    written_files = 0
-    for (year, month), sub_df in df_joined.groupby(["_partition_year", "_partition_month"]):
-        partition_dir = output_joined_dir / f"year={year}" / f"month={month}"
-        partition_dir.mkdir(parents=True, exist_ok=True)
-
-        out_path = partition_dir / "fact_311_weather.parquet"
-        save_df = sub_df.drop(columns=["_partition_year", "_partition_month"])
-
-        table = pa.Table.from_pandas(save_df, preserve_index=False)
-        pq.write_table(
-            table,
-            out_path,
-            compression="snappy",
-            coerce_timestamps="us",
-            allow_truncated_timestamps=True,
-        )
-        written_files += 1
-
+    written_files = len(list(output_joined_dir.glob("**/*.parquet")))
     elapsed = time.time() - start_time
     logger.info(
-        f"Saved Unified Fact Table: {len(df_joined):,} rows | "
+        f"Saved Unified Fact Table: {total_311:,} rows | "
         f"{written_files} partition files | {elapsed:.2f}s"
     )
 

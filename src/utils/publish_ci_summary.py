@@ -21,6 +21,9 @@ if hasattr(sys.stdout, "reconfigure"):
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+from src.silver.config import QUALITY_DIR
+from src.gold.config import GOLD_DIR
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("publish_ci_summary")
 
@@ -151,13 +154,13 @@ def main():
     parser.add_argument(
         "--quality-dir",
         type=Path,
-        default=PROJECT_ROOT / "data" / "metadata" / "quality",
+        default=QUALITY_DIR,
         help="Path to directory containing silver_quality_*.json reports",
     )
     parser.add_argument(
         "--gold-dir",
         type=Path,
-        default=PROJECT_ROOT / "data" / "gold",
+        default=GOLD_DIR,
         help="Path to directory containing gold marts",
     )
     parser.add_argument(

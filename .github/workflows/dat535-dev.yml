@@ -20,11 +20,15 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+        with:
+          clean: false
 
       - name: Resolve output directory
         id: output-dir
         # Persistent, non-tmp path: survives runner reboots/tmpfiles cleanup, unlike /tmp
-        run: echo "dir=$HOME/spark-lab-data/dev" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "dir=$HOME/spark-lab-data/dev" >> "$GITHUB_OUTPUT"
+          echo "DAT535_OUTPUT_DIR=$HOME/spark-lab-data/dev" >> "$GITHUB_ENV"
 
       - name: Align PySpark with Course Specification (Spark 3.5.x for Java 8)
         run: |
@@ -71,7 +75,7 @@ jobs:
         if: always()
         with:
           name: dev-quality-reports-${{ github.run_number }}
-          path: data/metadata/quality/
+          path: ${{ steps.output-dir.outputs.dir }}/metadata/quality/
           retention-days: 30
           if-no-files-found: ignore
 
@@ -79,6 +83,6 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: dev-gold-marts-${{ github.run_number }}
-          path: data/gold/
+          path: ${{ steps.output-dir.outputs.dir }}/gold/
           retention-days: 30
           if-no-files-found: ignore

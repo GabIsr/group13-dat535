@@ -3,12 +3,14 @@ Configuration, validation rules, legal boundaries, and spatial reference lookups
 Author: Group 13
 """
 
+import os
 from pathlib import Path
 from typing import Dict, Set, Tuple
 
-# Base Paths (relative to workspace root)
+# Base Paths (relative to workspace root or overridden by DAT535_OUTPUT_DIR)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
+env_output_dir = os.environ.get("DAT535_OUTPUT_DIR")
+DATA_DIR = Path(env_output_dir).resolve() if env_output_dir else (PROJECT_ROOT / "data")
 BRONZE_DIR = DATA_DIR / "bronze"
 SILVER_DIR = DATA_DIR / "silver"
 QUARANTINE_DIR = SILVER_DIR / "quarantine"
@@ -194,5 +196,7 @@ WEATHER_EXTREME_THRESHOLDS = {
     "wind_gust_severe": 22.2,    # 22.2 m/s (80 km/h severe storm threshold)
 }
 
-# Standard Reference Table Path
-ZIP_CENTROIDS_PATH = REFERENCE_DIR / "nyc_zip_centroids.parquet"
+# Standard Reference Table Path (prefers persistent data dir, falls back to repository git-tracked reference)
+repo_ref_path = PROJECT_ROOT / "data" / "reference" / "nyc_zip_centroids.parquet"
+data_ref_path = REFERENCE_DIR / "nyc_zip_centroids.parquet"
+ZIP_CENTROIDS_PATH = data_ref_path if data_ref_path.exists() else repo_ref_path

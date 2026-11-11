@@ -8,6 +8,7 @@ Author: Group 13
 """
 
 import logging
+import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -403,15 +404,15 @@ def deduplicate_311_records(df: DataFrame) -> Tuple[DataFrame, int]:
     return df_dedup, duplicate_rows_removed
 
 
-def impute_spatial_hierarchy_311(
+def impute_spatial_and_canonicalize_routes(
     df: DataFrame,
     spark: SparkSession,
     zip_ref_path: Path = ZIP_CENTROIDS_PATH,
 ) -> DataFrame:
     """
-    Apply 3-level hierarchical spatial imputation (Native GPS -> ZIP Centroid -> Borough Centroid),
+    Phase 1: Apply 3-level hierarchical spatial imputation (Native GPS -> ZIP Centroid -> Borough Centroid),
     quantify spatial distance uncertainty via Catalyst PySpark Haversine,
-    and apply hierarchical routing and citizen call burst clustering.
+    and normalize spatial features & evaluate 6-route hierarchical location keys (loc_key).
     100% pure PySpark.
     """
     cols = set(df.columns)
@@ -529,7 +530,7 @@ def impute_spatial_hierarchy_311(
         ).otherwise(lit(None).cast("double")),
     )
 
-    # PySpark Spatial Feature Normalization, Hierarchical Routing & Adaptive Clustering
+    # PySpark Spatial Feature Normalization, Hierarchical Routing
     logger.info("Executing PySpark Spatial Normalization & Canonicalization...")
     if "complaint_type" in cols:
         df = df.withColumn(
@@ -542,10 +543,21 @@ def impute_spatial_hierarchy_311(
     logger.info("Evaluating 6-Route Hierarchical Spatial Routing in PySpark...")
     df = generate_hierarchical_location_keys(df)
 
-    logger.info("Executing PySpark Ticket-1 Anchored Burst Deduplication Engine (Adaptive Window)...")
-    df = cluster_citizen_call_bursts(df, burst_window_hours=6.0)
-
     return df
+
+
+def impute_spatial_hierarchy_311(
+    df: DataFrame,
+    spark: SparkSession,
+    zip_ref_path: Path = ZIP_CENTROIDS_PATH,
+) -> DataFrame:
+    """
+    Backwards-compatible wrapper executing spatial imputation, canonicalization,
+    and adaptive citizen call burst clustering in PySpark.
+    """
+    df_spatial = impute_spatial_and_canonicalize_routes(df, spark, zip_ref_path)
+    logger.info("Executing PySpark Ticket-1 Anchored Burst Deduplication Engine (Adaptive Window)...")
+    return cluster_citizen_call_bursts(df_spatial, burst_window_hours=6.0)
 
 
 def standardize_categorical_and_administrative_attributes(df: DataFrame) -> DataFrame:
@@ -770,6 +782,7 @@ def clean_and_validate_311(
     bronze_311_dir: Path = BRONZE_DIR / "nyc311",
     silver_311_dir: Path = SILVER_DIR / "nyc311",
     quarantine_dir: Path = QUARANTINE_DIR / "nyc311",
+    staging_dir: Optional[Path] = None,
 ) -> Dict[str, Any]:
     """
     100% pure PySpark Silver Layer 311 Orchestrator:
@@ -785,6 +798,9 @@ def clean_and_validate_311(
     start_time = time.time()
     processed_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     now_epoch = int(datetime.now(timezone.utc).timestamp())
+
+    if staging_dir is None:
+        staging_dir = silver_311_dir.parent / ".staging_311"
 
     bronze_files = sorted(bronze_311_dir.glob("**/*.parquet"))
     if not bronze_files:
@@ -836,119 +852,139 @@ def clean_and_validate_311(
             "status": "success",
         }
 
-    # 3. CDC Deduplication on Valid Candidates
+    # =========================================================================
+    # PHASE 1: Row-Level Normalization, Spatial Imputation & Street Canonicalization
+    # =========================================================================
+    logger.info("Executing Silver 311 Phase 1: Row-level normalization & spatial canonicalization...")
     df_dedup, duplicate_rows_removed = deduplicate_311_records(df_valid_candidates)
+    df_spatial_clean = impute_spatial_and_canonicalize_routes(df_dedup, spark)
 
-    # 4. Hierarchical Spatial Imputation & Burst Clustering
-    df_spatial = impute_spatial_hierarchy_311(df_dedup, spark)
+    # MATERIALIZE PHASE 1 TO TRANSIENT STAGING: Completely truncates Catalyst AST lineage
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    df_spatial_clean.write.mode("overwrite").parquet(str(staging_dir))
+    logger.info(f"Phase 1 materialized to transient staging: {staging_dir}")
 
-    # 5. Categorical, Syntactic & Institutional Standardization
-    df_std = standardize_categorical_and_administrative_attributes(df_spatial)
+    success = False
+    try:
+        # =========================================================================
+        # PHASE 2: Stateful Burst Clustering, Enrichment & Final Partition Write
+        # =========================================================================
+        logger.info("Executing Silver 311 Phase 2: Burst clustering from clean staging...")
+        df_staging = spark.read.parquet(str(staging_dir))
 
-    # 6. Observability Audit Tags & Metadata
-    df_silver = attach_quality_audit_tags(df_std, processed_at_utc)
+        df_clustered = cluster_citizen_call_bursts(df_staging, burst_window_hours=6.0)
+        df_std = standardize_categorical_and_administrative_attributes(df_clustered)
+        df_silver = attach_quality_audit_tags(df_std, processed_at_utc)
 
-    # 7. Pure PySpark Partitioned Parquet Write (streaming distributed write)
-    written_files = write_silver_311(df_silver, silver_311_dir)
+        # Pure PySpark Partitioned Parquet Write (streaming distributed write)
+        written_files = write_silver_311(df_silver, silver_311_dir)
 
-    # 8. Compute Audit Metrics in PySpark directly from written Parquet (avoids driver heap bloat & plan re-eval)
-    written_silver_files = sorted(silver_311_dir.glob("**/*.parquet"))
-    if written_silver_files:
-        df_written = spark.read.parquet(str(silver_311_dir))
-        valid_rows_accepted = df_written.count()
-    else:
-        df_written = None
-        valid_rows_accepted = 0
-
-    if valid_rows_accepted > 0 and df_written is not None:
-        cols_silver = set(df_written.columns)
-        loc_expr = (
-            spark_sum(when(col("loc_key").isNotNull() & (trim(col("loc_key")) != ""), 1).otherwise(0)).alias("total_loc")
-            if "loc_key" in cols_silver
-            else lit(0).alias("total_loc")
-        )
-        dup_burst_expr = (
-            spark_sum(when(col("is_burst_duplicate") == True, 1).otherwise(0)).alias("dup_burst_cnt")
-            if "is_burst_duplicate" in cols_silver
-            else lit(0).alias("dup_burst_cnt")
-        )
-
-        agg = df_written.select(
-            spark_sum(when(col("is_ticket_closed"), 1).otherwise(0)).alias("closed_count"),
-            spark_sum(when(col("is_status_conflict"), 1).otherwise(0)).alias("conflict_count"),
-            spark_sum(when(col("is_instant_closure"), 1).otherwise(0)).alias("instant_count"),
-            avg("grid_distance_km").alias("avg_dist"),
-            percentile_approx("grid_distance_km", 0.95).alias("p95_dist"),
-            loc_expr,
-            dup_burst_expr,
-        ).first()
-
-        closed_count = int(agg["closed_count"] or 0)
-        open_count = valid_rows_accepted - closed_count
-        conflict_count = int(agg["conflict_count"] or 0)
-        instant_count = int(agg["instant_count"] or 0)
-        avg_grid_dist = round(float(agg["avg_dist"]), 2) if agg["avg_dist"] is not None else 0.0
-        p95_grid_dist = round(float(agg["p95_dist"]), 2) if agg["p95_dist"] is not None else 0.0
-        total_loc = int(agg["total_loc"] or 0)
-        unloc_cnt = valid_rows_accepted - total_loc
-        dup_burst_cnt = int(agg["dup_burst_cnt"] or 0)
-        distinct_inc = valid_rows_accepted - dup_burst_cnt
-        burst_rate = round((dup_burst_cnt / total_loc * 100.0), 2) if total_loc > 0 else 0.0
-
-        spatial_rows = df_written.groupBy("spatial_resolution_level").count().collect()
-        spatial_stats = {r["spatial_resolution_level"]: int(r["count"]) for r in spatial_rows}
-
-        if "loc_routing_type" in cols_silver:
-            route_rows = df_written.groupBy("loc_routing_type").count().collect()
-            routes_dict = {r["loc_routing_type"]: int(r["count"]) for r in route_rows}
+        # 8. Compute Audit Metrics in PySpark directly from written Parquet (avoids driver heap bloat & plan re-eval)
+        written_silver_files = sorted(silver_311_dir.glob("**/*.parquet"))
+        if written_silver_files:
+            df_written = spark.read.parquet(str(silver_311_dir))
+            valid_rows_accepted = df_written.count()
         else:
+            df_written = None
+            valid_rows_accepted = 0
+
+        if valid_rows_accepted > 0 and df_written is not None:
+            cols_silver = set(df_written.columns)
+            loc_expr = (
+                spark_sum(when(col("loc_key").isNotNull() & (trim(col("loc_key")) != ""), 1).otherwise(0)).alias("total_loc")
+                if "loc_key" in cols_silver
+                else lit(0).alias("total_loc")
+            )
+            dup_burst_expr = (
+                spark_sum(when(col("is_burst_duplicate") == True, 1).otherwise(0)).alias("dup_burst_cnt")
+                if "is_burst_duplicate" in cols_silver
+                else lit(0).alias("dup_burst_cnt")
+            )
+
+            agg = df_written.select(
+                spark_sum(when(col("is_ticket_closed"), 1).otherwise(0)).alias("closed_count"),
+                spark_sum(when(col("is_status_conflict"), 1).otherwise(0)).alias("conflict_count"),
+                spark_sum(when(col("is_instant_closure"), 1).otherwise(0)).alias("instant_count"),
+                avg("grid_distance_km").alias("avg_dist"),
+                percentile_approx("grid_distance_km", 0.95).alias("p95_dist"),
+                loc_expr,
+                dup_burst_expr,
+            ).first()
+
+            closed_count = int(agg["closed_count"] or 0)
+            open_count = valid_rows_accepted - closed_count
+            conflict_count = int(agg["conflict_count"] or 0)
+            instant_count = int(agg["instant_count"] or 0)
+            avg_grid_dist = round(float(agg["avg_dist"]), 2) if agg["avg_dist"] is not None else 0.0
+            p95_grid_dist = round(float(agg["p95_dist"]), 2) if agg["p95_dist"] is not None else 0.0
+            total_loc = int(agg["total_loc"] or 0)
+            unloc_cnt = valid_rows_accepted - total_loc
+            dup_burst_cnt = int(agg["dup_burst_cnt"] or 0)
+            distinct_inc = valid_rows_accepted - dup_burst_cnt
+            burst_rate = round((dup_burst_cnt / total_loc * 100.0), 2) if total_loc > 0 else 0.0
+
+            spatial_rows = df_written.groupBy("spatial_resolution_level").count().collect()
+            spatial_stats = {r["spatial_resolution_level"]: int(r["count"]) for r in spatial_rows}
+
+            if "loc_routing_type" in cols_silver:
+                route_rows = df_written.groupBy("loc_routing_type").count().collect()
+                routes_dict = {r["loc_routing_type"]: int(r["count"]) for r in route_rows}
+            else:
+                routes_dict = {}
+        else:
+            closed_count = 0
+            open_count = 0
+            conflict_count = 0
+            instant_count = 0
+            avg_grid_dist = 0.0
+            p95_grid_dist = 0.0
+            total_loc = 0
+            unloc_cnt = 0
+            dup_burst_cnt = 0
+            distinct_inc = 0
+            burst_rate = 0.0
+            spatial_stats = {}
             routes_dict = {}
-    else:
-        closed_count = 0
-        open_count = 0
-        conflict_count = 0
-        instant_count = 0
-        avg_grid_dist = 0.0
-        p95_grid_dist = 0.0
-        total_loc = 0
-        unloc_cnt = 0
-        dup_burst_cnt = 0
-        distinct_inc = 0
-        burst_rate = 0.0
-        spatial_stats = {}
-        routes_dict = {}
 
-    elapsed = time.time() - start_time
-    logger.info(
-        f"Completed Silver 311 processing: {valid_rows_accepted:,} valid records | "
-        f"{quarantined_count:,} quarantined | {written_files} partition files written | {elapsed:.2f}s"
-    )
+        elapsed = time.time() - start_time
+        logger.info(
+            f"Completed Silver 311 processing: {valid_rows_accepted:,} valid records | "
+            f"{quarantined_count:,} quarantined | {written_files} partition files written | {elapsed:.2f}s"
+        )
 
-    return {
-        "dataset": "silver_311",
-        "input_rows": input_rows,
-        "duplicate_rows_removed": duplicate_rows_removed,
-        "valid_rows_accepted": valid_rows_accepted,
-        "avg_grid_distance_km": avg_grid_dist,
-        "p95_grid_distance_km": p95_grid_dist,
-        "closed_tickets_count": closed_count,
-        "open_tickets_count": open_count,
-        "status_conflict_count": conflict_count,
-        "instant_closure_count": instant_count,
-        "quarantined_rows": quarantined_count,
-        "spatial_resolution_breakdown": spatial_stats,
-        "incident_clustering": {
-            "total_locatable_records": total_loc,
-            "unlocatable_records": unloc_cnt,
-            "duplicate_burst_calls_collapsed": dup_burst_cnt,
-            "burst_collapse_rate_pct": burst_rate,
-            "distinct_physical_incidents": distinct_inc,
-            "route_breakdown": routes_dict,
-        },
-        "partitions_written": written_files,
-        "duration_seconds": round(elapsed, 2),
-        "status": "success",
-    }
+        success = True
+        return {
+            "dataset": "silver_311",
+            "input_rows": input_rows,
+            "duplicate_rows_removed": duplicate_rows_removed,
+            "valid_rows_accepted": valid_rows_accepted,
+            "avg_grid_distance_km": avg_grid_dist,
+            "p95_grid_distance_km": p95_grid_dist,
+            "closed_tickets_count": closed_count,
+            "open_tickets_count": open_count,
+            "status_conflict_count": conflict_count,
+            "instant_closure_count": instant_count,
+            "quarantined_rows": quarantined_count,
+            "spatial_resolution_breakdown": spatial_stats,
+            "incident_clustering": {
+                "total_locatable_records": total_loc,
+                "unlocatable_records": unloc_cnt,
+                "duplicate_burst_calls_collapsed": dup_burst_cnt,
+                "burst_collapse_rate_pct": burst_rate,
+                "distinct_physical_incidents": distinct_inc,
+                "route_breakdown": routes_dict,
+            },
+            "partitions_written": written_files,
+            "duration_seconds": round(elapsed, 2),
+            "status": "success",
+        }
+    finally:
+        # EPHEMERAL CLEANUP: Intermediate staging scratch directory is cleaned up on success
+        if success and staging_dir.exists():
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            logger.info(f"Ephemeral staging directory cleaned up successfully: {staging_dir}")
+        elif not success and staging_dir.exists():
+            logger.warning(f"Preserving intermediate staging directory for root-cause triage: {staging_dir}")
 
 
 if __name__ == "__main__":

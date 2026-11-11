@@ -296,6 +296,7 @@ def cluster_citizen_call_bursts(
     df_final = df.join(df_clustered_attrs, on="unique_key", how="left")
 
     # 5. Coalesce defaults for unlocated records
+    loc_routing_col = col("loc_routing_type") if "loc_routing_type" in cols else lit(None).cast("string")
     df_final = (
         df_final
         .withColumn("is_burst_duplicate", coalesce(col("is_burst_duplicate"), lit(False)))
@@ -306,7 +307,7 @@ def cluster_citizen_call_bursts(
             coalesce(col("incident_cluster_id"), concat(lit("INC_UNLOC_"), col("unique_key").cast("string"))),
         )
         .withColumn("incident_first_created_at_utc", coalesce(col("incident_first_created_at_utc"), col("created_at_utc")))
-        .withColumn("loc_routing_type", coalesce(col("loc_routing_type"), lit("UNLOCATABLE")))
+        .withColumn("loc_routing_type", coalesce(loc_routing_col, lit("UNLOCATABLE")))
     )
 
     return df_final

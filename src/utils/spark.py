@@ -170,16 +170,19 @@ def get_spark_session(
         builder = builder.master("local[2]")
 
     # Adaptive Query Execution (AQE) & Performance Tuning (taught in Lab 2 & 3)
+    driver_mem = os.environ.get("SPARK_DRIVER_MEMORY", "2g")
     builder = (
         builder.config("spark.sql.adaptive.enabled", "true")
         .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
         .config("spark.sql.adaptive.skewJoin.enabled", "true")
         .config("spark.sql.shuffle.partitions", "8")
-        .config("spark.driver.memory", "2g")
+        .config("spark.driver.memory", driver_mem)
         .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer")
         .config("spark.sql.session.timeZone", "UTC")
         .config("spark.sql.ansi.enabled", "false")
         .config("spark.sql.parquet.outputTimestampType", "TIMESTAMP_MICROS")
+        .config("spark.sql.codegen.maxFields", "100")
+        .config("spark.sql.debug.maxToStringFields", "200")
     )
 
     # Windows specific networking stability

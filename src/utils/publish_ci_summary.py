@@ -105,6 +105,93 @@ def generate_markdown_summary(quality_json: Dict[str, Any], gold_dir: Optional[P
     md.append(f"| Status Contradictions Tagged | `{conflicts_311:,}` | Open status with closed date or vice-versa |")
     md.append("")
 
+    # Section 2B: Unstructured Resolution Text Mining & Phantom Closure Auditing
+    res_mining = m_311.get("resolution_text_mining", {})
+    if res_mining:
+        ver_cnt = res_mining.get("field_verified_remediations", 0)
+        phan_cnt = res_mining.get("phantom_closures", 0)
+        phan_rate = res_mining.get("phantom_closure_rate_pct", 0.0)
+        ver_rate = (ver_cnt / closed_311 * 100.0) if closed_311 > 0 else 0.0
+
+        category_descriptions = {
+            "ACTION_TAKEN_REMEDIED": "Physical repair or enforcement action completed on-site",
+            "NO_VIOLATION_FOUND": "Official on-site inspection found conditions complied with law",
+            "ADMINISTRATIVE_DISMISSAL": "Referred to outside entity, private owner, or dismissed administratively",
+            "ACCESS_DENIED_UNABLE_TO_LOCATE": "Agency unable to gain entry or locate condition after field dispatch",
+            "DEFERRED_PENDING_ACTION": "Referred to capital project, preventive maintenance, or future work",
+            "DUPLICATE_CONSOLIDATED": "Consolidated into previously existing active ticket for same incident",
+            "UNSTATED_OR_EMPTY": "Closed ticket with blank or null resolution description",
+            "UNCLASSIFIED_OR_GENERIC": "Non-empty text not matching known operational patterns (ledgered)",
+        }
+
+        md.append("## Unstructured Resolution Text Mining & Phantom Closure Auditing")
+        md.append("| Audit Metric | Count / Rate | Description |")
+        md.append("| :--- | :--- | :--- |")
+        md.append(f"| **Closed Tickets Evaluated** | `{closed_311:,}` | Closed tickets subject to resolution text classification |")
+        md.append(f"| **True Field Remediations (Verified)** | **`{ver_cnt:,}`** (`{ver_rate:.2f}%`) | Confirmed physical work completed on-site (`is_field_verified_remediation=True`) |")
+        md.append(f"| **Administrative \"Phantom Closures\"** | **`{phan_cnt:,}`** | Tickets closed administratively without remediation (`is_phantom_closure=True`) |")
+        md.append(f"| **Phantom Closure Rate** | **`{phan_rate:.2f}%`** | Share of closed tickets resolved via non-remedial actions |")
+        md.append("")
+
+        breakdown = res_mining.get("outcome_breakdown", {})
+        if breakdown:
+            md.append("### Resolution Outcome Distribution Hierarchy")
+            md.append("| Resolution Outcome Category | Count | Share of Closed | Operational Meaning |")
+            md.append("| :--- | :--- | :--- | :--- |")
+            for cat_name, cat_cnt in sorted(breakdown.items(), key=lambda x: x[1], reverse=True):
+                cat_pct = (cat_cnt / closed_311 * 100.0) if closed_311 > 0 else 0.0
+                desc = category_descriptions.get(cat_name, "Operational resolution outcome")
+                md.append(f"| `{cat_name}` | `{cat_cnt:,}` | `{cat_pct:.2f}%` | {desc} |")
+            md.append("")
+
+    # Section 2C: Categorical Schema Drift & Conformed Semantic Modeling
+    # [TEMPORARILY COMMENTED OUT FOR ISOLATED VERIFICATION OF UNSTRUCTURED TEXT MINING]
+    # sem_conf = m_311.get("semantic_conformance", {})
+    # if sem_conf:
+    #     tot_conf = sem_conf.get("total_records", valid_311)
+    #     conformed_cnt = sem_conf.get("conformed_records", 0)
+    #     unmapped_cnt = sem_conf.get("unmapped_records", 0)
+    #     unmapped_rate = sem_conf.get("unmapped_rate_pct", 0.0)
+    #     legacy_cnt = sem_conf.get("legacy_mapped_records", 0)
+    #     conformed_rate = (conformed_cnt / tot_conf * 100.0) if tot_conf > 0 else 0.0
+    #
+    #     gate_badge = "**`PASS (< 5.0%)`**" if unmapped_rate <= 5.0 else "**`ALERT (> 5.0%)`**"
+    #
+    #     domain_descriptions = {
+    #         "RESIDENTIAL_HABITABILITY": "HPD indoor heat, hot water, mold, and housing code compliance",
+    #         "SOLID_WASTE_SANITATION": "DSNY refuse, recycling, illegal dumping, and street cleanliness",
+    #         "STREET_TRAFFIC_INFRASTRUCTURE": "DOT roadway conditions, potholes, traffic signals, and signage",
+    #         "ACOUSTIC_DISTURBANCE": "NYPD/DEP commercial, residential, vehicular, and environmental noise",
+    #         "PUBLIC_HEALTH_ENVIRONMENT": "DOHMH/DEP pest control, food safety, and environmental hygiene",
+    #         "PARKS_FORESTRY": "DPR hazardous trees, park maintenance, and green spaces",
+    #         "CIVIC_REGULATION_CONSUMER": "DCWP/DOB/TLC consumer protection, licensing, and building structures",
+    #         "WATER_INFRASTRUCTURE": "DEP drinking water mains, hydrant leaks, and water pressure",
+    #         "SEWER_STORMWATER": "DEP catch basins, stormwater flooding, and sewer line backup",
+    #         "SOCIAL_SERVICES_HOMELESSNESS": "DHS encampment outreach, street homeless assistance",
+    #         "OTHER_CIVIC_SERVICES": "Unmapped, novel, or miscellaneous municipal agency services",
+    #     }
+    #
+    #     md.append("## Categorical Schema Drift & Conformed Semantic Modeling")
+    #     md.append("| Metric | Value | Description |")
+    #     md.append("| :--- | :--- | :--- |")
+    #     md.append(f"| **Clean 311 Records Evaluated** | `{tot_conf:,}` | Total Silver records aligned to semantic taxonomy |")
+    #     md.append(f"| **Conformed to Canonical Domains** | **`{conformed_cnt:,}`** (`{conformed_rate:.2f}%`) | Resolved via broadcast reference table (`dim_complaint_taxonomy`) |")
+    #     md.append(f"| Historical Legacy Aliases Conformed | `{legacy_cnt:,}` | Reconciled historical pre-migration category names |")
+    #     md.append(f"| **Unmapped Category Volume** | `{unmapped_cnt:,}` (`{unmapped_rate:.2f}%`) | New/unmapped templates captured in observability ledger |")
+    #     md.append(f"| **Observability Gate Status** | {gate_badge} | Lakehouse schema drift tolerance threshold |")
+    #     md.append("")
+    #
+    #     d_breakdown = sem_conf.get("domain_breakdown", {})
+    #     if d_breakdown:
+    #         md.append("### Conformed Service Domain Distribution Hierarchy")
+    #         md.append("| Canonical Service Domain | Ticket Volume | Share of 311 | Core Municipal Service Scope |")
+    #         md.append("| :--- | :--- | :--- | :--- |")
+    #         for d_name, d_cnt in sorted(d_breakdown.items(), key=lambda x: x[1], reverse=True):
+    #             d_pct = (d_cnt / tot_conf * 100.0) if tot_conf > 0 else 0.0
+    #             d_desc = domain_descriptions.get(d_name, "Standardized municipal domain")
+    #             md.append(f"| `{d_name}` | `{d_cnt:,}` | `{d_pct:.2f}%` | {d_desc} |")
+    #         md.append("")
+
     # Section 3: Weather Reanalysis Quality
     w_in = m_wth.get("input_rows", 0)
     w_dup = m_wth.get("duplicate_rows_dropped", 0)

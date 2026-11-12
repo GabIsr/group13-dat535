@@ -60,6 +60,10 @@ from src.silver.incident_clustering import (
     generate_hierarchical_location_keys,
     cluster_citizen_call_bursts,
 )
+from src.silver.resolution_text_mining import (
+    classify_resolution_outcomes,
+    upsert_unclassified_resolutions_ledger,
+)
 from src.utils.spark import get_spark_session
 from src.silver.config import (
     BOROUGH_CENTROIDS,
@@ -873,7 +877,13 @@ def clean_and_validate_311(
         df_staging = spark.read.parquet(str(staging_dir))
 
         df_clustered = cluster_citizen_call_bursts(df_staging, burst_window_hours=6.0)
-        df_std = standardize_categorical_and_administrative_attributes(df_clustered)
+
+        # Unstructured Resolution Text Mining & Phantom Closure Auditing (Issue #6)
+        logger.info("Executing PySpark Unstructured Resolution Text Mining & Semantic Auditing...")
+        df_resolved = classify_resolution_outcomes(df_clustered)
+        upsert_unclassified_resolutions_ledger(df_resolved, spark)
+
+        df_std = standardize_categorical_and_administrative_attributes(df_resolved)
         df_silver = attach_quality_audit_tags(df_std, processed_at_utc)
 
         # Pure PySpark Partitioned Parquet Write (streaming distributed write)
@@ -900,6 +910,16 @@ def clean_and_validate_311(
                 if "is_burst_duplicate" in cols_silver
                 else lit(0).alias("dup_burst_cnt")
             )
+            field_ver_expr = (
+                spark_sum(when(col("is_field_verified") == True, 1).otherwise(0)).alias("field_ver_cnt")
+                if "is_field_verified" in cols_silver
+                else lit(0).alias("field_ver_cnt")
+            )
+            phantom_expr = (
+                spark_sum(when(col("is_phantom_closure") == True, 1).otherwise(0)).alias("phantom_cnt")
+                if "is_phantom_closure" in cols_silver
+                else lit(0).alias("phantom_cnt")
+            )
 
             agg = df_written.select(
                 spark_sum(when(col("is_ticket_closed"), 1).otherwise(0)).alias("closed_count"),
@@ -909,6 +929,8 @@ def clean_and_validate_311(
                 percentile_approx("grid_distance_km", 0.95).alias("p95_dist"),
                 loc_expr,
                 dup_burst_expr,
+                field_ver_expr,
+                phantom_expr,
             ).first()
 
             closed_count = int(agg["closed_count"] or 0)
@@ -922,6 +944,9 @@ def clean_and_validate_311(
             dup_burst_cnt = int(agg["dup_burst_cnt"] or 0)
             distinct_inc = valid_rows_accepted - dup_burst_cnt
             burst_rate = round((dup_burst_cnt / total_loc * 100.0), 2) if total_loc > 0 else 0.0
+            field_ver_cnt = int(agg["field_ver_cnt"] or 0)
+            phantom_cnt = int(agg["phantom_cnt"] or 0)
+            phantom_rate = round((phantom_cnt / closed_count * 100.0), 2) if closed_count > 0 else 0.0
 
             spatial_rows = df_written.groupBy("spatial_resolution_level").count().collect()
             spatial_stats = {r["spatial_resolution_level"]: int(r["count"]) for r in spatial_rows}
@@ -931,6 +956,12 @@ def clean_and_validate_311(
                 routes_dict = {r["loc_routing_type"]: int(r["count"]) for r in route_rows}
             else:
                 routes_dict = {}
+
+            if "resolution_outcome_category" in cols_silver:
+                res_rows = df_written.groupBy("resolution_outcome_category").count().collect()
+                res_dict = {r["resolution_outcome_category"]: int(r["count"]) for r in res_rows}
+            else:
+                res_dict = {}
         else:
             closed_count = 0
             open_count = 0
@@ -943,8 +974,12 @@ def clean_and_validate_311(
             dup_burst_cnt = 0
             distinct_inc = 0
             burst_rate = 0.0
+            field_ver_cnt = 0
+            phantom_cnt = 0
+            phantom_rate = 0.0
             spatial_stats = {}
             routes_dict = {}
+            res_dict = {}
 
         elapsed = time.time() - start_time
         logger.info(
@@ -973,6 +1008,12 @@ def clean_and_validate_311(
                 "burst_collapse_rate_pct": burst_rate,
                 "distinct_physical_incidents": distinct_inc,
                 "route_breakdown": routes_dict,
+            },
+            "resolution_text_mining": {
+                "field_verified_remediations": field_ver_cnt,
+                "phantom_closures": phantom_cnt,
+                "phantom_closure_rate_pct": phantom_rate,
+                "outcome_breakdown": res_dict,
             },
             "partitions_written": written_files,
             "duration_seconds": round(elapsed, 2),

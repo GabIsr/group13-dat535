@@ -25,6 +25,14 @@ for d in [SILVER_DIR, QUARANTINE_DIR, REFERENCE_DIR, QUALITY_DIR]:
 # Sensor Anomaly Ledger Path (Data Observability & Audit Trail)
 SENSOR_ANOMALY_LEDGER_PATH = QUALITY_DIR / "sensor_anomaly_ledger.parquet"
 
+# Unclassified Resolution Template Ledger Path (Unstructured Text Mining & Vocabulary Drift)
+UNCLASSIFIED_RESOLUTIONS_LEDGER_PATH = QUALITY_DIR / "unclassified_resolutions_ledger.parquet"
+
+# Physical Field Remediation Duration Sanity Bounds (Hours: 0h to 30 days = 720h)
+# Values outside [0, 720] represent negative clock-skew anomalies or non-physical multi-year artifacts.
+MIN_FIELD_REMEDIATION_HOURS = 0.0
+MAX_FIELD_REMEDIATION_HOURS = 720.0
+
 # Geographic Bounds for NYC Region (Filtering invalid 0.0 or out-of-bounds coordinates)
 NYC_LAT_MIN = 40.40
 NYC_LAT_MAX = 41.05

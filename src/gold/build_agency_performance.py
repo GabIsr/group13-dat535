@@ -95,29 +95,71 @@ def build_agency_resolution_performance_mart(
     logger.info("Computing Closure Cohort (median & P90 SLAs via PySpark percentile_approx)...")
     cols_311 = set(df_311_spark.columns)
     has_closed_date = "closed_at_utc" in cols_311
+    has_field_verified = "is_field_verified" in cols_311
+    has_field_hours = "field_remediation_hours" in cols_311
+    has_phantom = "is_phantom_closure" in cols_311
 
     if has_closed_date and "is_ticket_closed" in cols_311:
         df_closed_subset_spark = df_311_spark.filter(
             (col("is_ticket_closed") == True) & col("closed_at_utc").isNotNull()
         ).withColumn("reporting_date", to_date(col("closed_at_utc")))
 
+        closure_aggs = [
+            spark_count("unique_key").alias("tickets_closed_today"),
+            spark_round(percentile_approx(col("resolution_duration_hours"), lit(0.5)), 2).alias("median_resolution_duration_hours"),
+            spark_round(percentile_approx(col("resolution_duration_hours"), lit(0.9)), 2).alias("p90_resolution_duration_hours"),
+            spark_round(spark_mean("resolution_duration_hours"), 2).alias("avg_resolution_duration_hours"),
+        ]
+
+        if has_field_verified:
+            closure_aggs.append(
+                spark_sum(when(col("is_field_verified") == True, 1).otherwise(0)).alias("field_verified_closed_today")
+            )
+        if has_phantom:
+            closure_aggs.append(
+                spark_sum(when(col("is_phantom_closure") == True, 1).otherwise(0)).alias("phantom_closed_today")
+            )
+            closure_aggs.append(
+                spark_round(
+                    spark_sum(when(col("is_phantom_closure") == True, 1).otherwise(0)) /
+                    when(spark_count("unique_key") > 0, spark_count("unique_key")).otherwise(1) * 100.0,
+                    2
+                ).alias("phantom_closure_rate_pct")
+            )
+        if has_field_hours:
+            closure_aggs.append(
+                spark_round(percentile_approx(col("field_remediation_hours"), lit(0.5)), 2).alias("median_field_remediation_hours")
+            )
+            closure_aggs.append(
+                spark_round(percentile_approx(col("field_remediation_hours"), lit(0.9)), 2).alias("p90_field_remediation_hours")
+            )
+            closure_aggs.append(
+                spark_round(spark_mean("field_remediation_hours"), 2).alias("avg_field_remediation_hours")
+            )
+
         df_closed_spark = (
             df_closed_subset_spark.groupBy("reporting_date", "borough", "agency")
-            .agg(
-                spark_count("unique_key").alias("tickets_closed_today"),
-                spark_round(percentile_approx(col("resolution_duration_hours"), lit(0.5)), 2).alias("median_resolution_duration_hours"),
-                spark_round(percentile_approx(col("resolution_duration_hours"), lit(0.9)), 2).alias("p90_resolution_duration_hours"),
-                spark_round(spark_mean("resolution_duration_hours"), 2).alias("avg_resolution_duration_hours"),
-            )
+            .agg(*closure_aggs)
         )
     else:
-        df_closed_spark = df_created_spark.select(
+        select_cols = [
             "reporting_date", "borough", "agency",
             lit(0).alias("tickets_closed_today"),
             lit(None).cast("double").alias("median_resolution_duration_hours"),
             lit(None).cast("double").alias("p90_resolution_duration_hours"),
             lit(None).cast("double").alias("avg_resolution_duration_hours"),
-        )
+        ]
+        if has_field_verified:
+            select_cols.append(lit(0).alias("field_verified_closed_today"))
+        if has_phantom:
+            select_cols.append(lit(0).alias("phantom_closed_today"))
+            select_cols.append(lit(0.0).alias("phantom_closure_rate_pct"))
+        if has_field_hours:
+            select_cols.append(lit(None).cast("double").alias("median_field_remediation_hours"))
+            select_cols.append(lit(None).cast("double").alias("p90_field_remediation_hours"))
+            select_cols.append(lit(None).cast("double").alias("avg_field_remediation_hours"))
+
+        df_closed_spark = df_created_spark.select(*select_cols)
 
     # Merge Creation and Closure cohorts in PySpark
     df_perf_spark = df_created_spark.join(
@@ -125,6 +167,10 @@ def build_agency_resolution_performance_mart(
         on=["reporting_date", "borough", "agency"],
         how="outer",
     ).fillna(0, subset=["tickets_created_today", "tickets_closed_today"])
+
+    zero_fill_cols = [c for c in ["field_verified_closed_today", "phantom_closed_today"] if c in df_perf_spark.columns]
+    if zero_fill_cols:
+        df_perf_spark = df_perf_spark.fillna(0, subset=zero_fill_cols)
 
     if "distinct_incidents_created_today" in df_perf_spark.columns:
         df_perf_spark = df_perf_spark.fillna(0, subset=["distinct_incidents_created_today"])

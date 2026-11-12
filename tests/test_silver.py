@@ -307,10 +307,14 @@ class TestSilverLayerPipeline(unittest.TestCase):
 
             # Hour 0: 3h sum = 2.0 (only 1 period available)
             self.assertEqual(df_w.loc[0, "precip_past_3h_mm"], 2.0)
+            self.assertEqual(df_w.loc[0, "rolling_24h_hours_count"], 1)
+            self.assertTrue(bool(df_w.loc[0, "is_rolling_24h_partial"]))
             # Hour 2: 3h sum = 2.0 + 2.0 + 2.0 = 6.0
             self.assertEqual(df_w.loc[2, "precip_past_3h_mm"], 6.0)
             # Hour 5: max gust in past 6 hours should be 10 + 5 = 15.0
             self.assertEqual(df_w.loc[5, "max_wind_gust_past_6h_ms"], 15.0)
+            self.assertEqual(df_w.loc[5, "rolling_24h_hours_count"], 6)
+            self.assertTrue(bool(df_w.loc[5, "is_rolling_24h_partial"]))
 
 
     def test_string_standardization_null_handling(self):

@@ -66,6 +66,8 @@ def join_silver_datasets(
         "precip_past_3h_mm",
         "precip_past_6h_mm",
         "precip_past_24h_mm",
+        "rolling_24h_hours_count",
+        "is_rolling_24h_partial",
         "rain",
         "snowfall",
         "snow_depth",
@@ -117,7 +119,7 @@ def join_silver_datasets(
         )
 
     # 1. Native PySpark nullable type casting (Zero toPandas Anti-Pattern)
-    for int16_col in ["weather_code", "relative_humidity_2m", "wind_direction_10m"]:
+    for int16_col in ["weather_code", "relative_humidity_2m", "wind_direction_10m", "rolling_24h_hours_count"]:
         if int16_col in df_joined_spark.columns:
             df_joined_spark = df_joined_spark.withColumn(int16_col, col(int16_col).cast("smallint"))
 

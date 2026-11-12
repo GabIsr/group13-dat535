@@ -323,7 +323,7 @@ def run_311_ingestion(
     end_date: Optional[str] = None,
     batch_size: int = 50000,
     max_records: Optional[int] = None,
-    lookback_days: int = 14,
+    lookback_days: int = 7,
     app_token: Optional[str] = None,
     env: str = "dev",
     manifests_dir: Path = MANIFESTS_DIR,
@@ -509,13 +509,22 @@ def run_311_ingestion(
                 where_conditions.append(f":updated_at > '{last_cdc_watermark}'")
                 order_clause = ":updated_at ASC"
             else:
-                last_watermark = get_latest_watermark(DATASET_311, manifests_dir=manifests_dir)
-                if last_watermark:
-                    logger.info(f"Discovered initial created_date watermark: {last_watermark}. Bootstrapping incremental stream up to {effective_end}.")
-                    where_conditions.append(f"created_date >= '{last_watermark}'")
+                if start_date:
+                    logger.info(f"Using explicitly specified start_date for incremental bootstrap: {start_date}")
+                    where_conditions.append(f"created_date >= '{start_date}'")
                 else:
-                    logger.warning(f"No previous watermark found for incremental mode. Ingesting past 7 days up to {effective_end}.")
-                    where_conditions.append("created_date >= '2026-10-15T00:00:00.000'")
+                    last_watermark = get_latest_watermark(DATASET_311, manifests_dir=manifests_dir)
+                    if last_watermark:
+                        logger.info(f"Discovered initial created_date watermark: {last_watermark}. Bootstrapping incremental stream up to {effective_end}.")
+                        where_conditions.append(f"created_date >= '{last_watermark}'")
+                    else:
+                        end_dt = datetime.strptime(effective_end[:10], "%Y-%m-%d")
+                        fallback_days = lookback_days if lookback_days else 7
+                        dynamic_start = (end_dt - timedelta(days=fallback_days)).strftime("%Y-%m-%dT00:00:00.000")
+                        logger.warning(
+                            f"No previous watermark found for incremental mode. Ingesting past {fallback_days} days ({dynamic_start}) up to {effective_end}."
+                        )
+                        where_conditions.append(f"created_date >= '{dynamic_start}'")
                 order_clause = "created_date ASC"
         else:
             # Backfill mode: strictly by created_date, does NOT advance CDC watermark
@@ -660,7 +669,7 @@ if __name__ == "__main__":
     parser.add_argument("--end-date", type=str, help="End date filter")
     parser.add_argument("--batch-size", type=int, default=50000, help="Records per API page")
     parser.add_argument("--max-records", type=int, help="Optional record limit for testing")
-    parser.add_argument("--lookback-days", type=int, default=14, help="Lookback buffer in days for CDC status updates")
+    parser.add_argument("--lookback-days", type=int, default=7, help="Lookback buffer in days when no watermark exists (default: 7)")
     parser.add_argument("--app-token", type=str, help="Optional Socrata App Token")
     parser.add_argument("--env", choices=["dev", "prod"], default="dev", help="Execution environment")
     parser.add_argument("--landing-only", action="store_true", help="Only dump raw API records into Landing zone; skip Bronze conversion")

@@ -2,8 +2,11 @@ name: Scheduled Incremental Pipeline & Observability
 
 on:
   schedule:
-    # Daily at 03:00 UTC (safely past daily Socrata updates & ECMWF 5-day ERA5-Land publishing lag)
-    - cron: '0 3 * * *'
+    # Daily at 14:00 UTC (2:00 PM UTC):
+    # ECMWF publishes daily ERA5T reanalysis (D-5 lag) by 12:00 UTC.
+    # Running at 14:00 UTC gives a 2-hour safety margin for Open-Meteo indexing,
+    # ensuring complete weather reanalysis data before starting 311 join and Gold marts.
+    - cron: '0 14 * * *'
   workflow_dispatch:
     inputs:
       mode:

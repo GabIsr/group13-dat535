@@ -89,6 +89,35 @@ def get_latest_watermark(dataset_name: str, manifests_dir: Path = MANIFESTS_DIR)
     return latest_watermark
 
 
+def get_earliest_watermark(dataset_name: str, manifests_dir: Path = MANIFESTS_DIR) -> Optional[str]:
+    """
+    Inspect existing successful manifests for a dataset to determine the earliest source_data_start.
+    Returns None if no previous successful batches exist.
+    """
+    manifests_dir = Path(manifests_dir)
+    if not manifests_dir.exists():
+        return None
+
+    pattern = f"{dataset_name}_*.json"
+    manifest_files = list(manifests_dir.glob(pattern))
+    if not manifest_files:
+        return None
+
+    earliest_watermark = None
+    for mf in manifest_files:
+        try:
+            with open(mf, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("status") == "success" and data.get("source_data_start") and str(data["source_data_start"]) != "N/A":
+                start_val = str(data["source_data_start"])
+                if earliest_watermark is None or start_val < earliest_watermark:
+                    earliest_watermark = start_val
+        except Exception:
+            continue
+
+    return earliest_watermark
+
+
 def get_latest_cdc_watermark(dataset_name: str, manifests_dir: Path = MANIFESTS_DIR) -> Optional[str]:
     """
     Inspect existing successful manifests for a dataset to determine the highest cdc_updated_at_watermark.

@@ -24,6 +24,7 @@ import pyarrow.parquet as pq
 
 from src.utils.config import (
     BRONZE_DIR,
+    DATASET_311,
     DATASET_WEATHER,
     ERA5_NYC_GRID_POINTS,
     LANDING_DIR,
@@ -40,6 +41,7 @@ from src.utils.manifest import (
     compute_schema_fingerprint,
     create_manifest_dict,
     generate_batch_id,
+    get_earliest_watermark,
     get_git_commit_hash,
     get_latest_watermark,
     is_batch_completed,
@@ -112,6 +114,7 @@ def run_weather_ingestion(
     mode: str = "incremental",
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
+    lookback_days: int = 7,
     env: str = "dev",
     manifests_dir: Path = MANIFESTS_DIR,
 ) -> Optional[Dict[str, Any]]:
@@ -140,11 +143,31 @@ def run_weather_ingestion(
             effective_start = (last_date_obj + timedelta(days=1)).strftime("%Y-%m-%d")
             logger.info(f"Discovered previous weather watermark: {last_watermark}. New start: {effective_start}")
         else:
-            logger.warning("No previous weather watermark found. Defaulting to 311 baseline (2026-07-15).")
-            effective_start = "2026-07-15"
+            # Align with earliest 311 data if available, otherwise default to past lookback_days
+            earliest_311 = get_earliest_watermark(DATASET_311, manifests_dir=manifests_dir)
+            if earliest_311:
+                base_start = datetime.strptime(earliest_311[:10], "%Y-%m-%d")
+                # Include 1-day (24-hour) warm-up buffer so rolling window aggregations in Silver are fully primed
+                warmup_start = (base_start - timedelta(days=1)).strftime("%Y-%m-%d")
+                effective_start = warmup_start
+                logger.info(
+                    f"No previous weather watermark found. Aligning start with 311 baseline ({earliest_311[:10]}) "
+                    f"plus 1-day rolling window warm-up buffer: {effective_start}"
+                )
+            else:
+                end_dt = datetime.strptime(end_date or default_reanalysis_end, "%Y-%m-%d")
+                fallback_days = lookback_days if lookback_days else 7
+                # Include 1-day warm-up buffer
+                effective_start = (end_dt - timedelta(days=fallback_days + 1)).strftime("%Y-%m-%d")
+                logger.warning(
+                    f"No previous weather watermark or 311 data found. Defaulting to past {fallback_days} days "
+                    f"plus 1-day warm-up buffer ({effective_start}) up to {end_date or default_reanalysis_end}."
+                )
         effective_end = end_date or default_reanalysis_end
     else:
-        effective_start = start_date or "2026-07-15"
+        end_dt = datetime.strptime(end_date or default_reanalysis_end, "%Y-%m-%d")
+        fallback_days = lookback_days if lookback_days else 7
+        effective_start = start_date or (end_dt - timedelta(days=fallback_days)).strftime("%Y-%m-%d")
         effective_end = end_date or default_reanalysis_end
 
     # Guard against querying future dates
@@ -292,6 +315,7 @@ if __name__ == "__main__":
     parser.add_argument("--mode", choices=["incremental", "backfill"], default="incremental", help="Ingestion mode")
     parser.add_argument("--start-date", type=str, help="Start date (YYYY-MM-DD)")
     parser.add_argument("--end-date", type=str, help="End date (YYYY-MM-DD)")
+    parser.add_argument("--lookback-days", type=int, default=7, help="Lookback buffer in days when no watermark exists (default: 7)")
     parser.add_argument("--env", choices=["dev", "prod"], default="dev", help="Execution environment")
 
     args = parser.parse_args()
@@ -299,5 +323,6 @@ if __name__ == "__main__":
         mode=args.mode,
         start_date=args.start_date,
         end_date=args.end_date,
+        lookback_days=args.lookback_days,
         env=args.env,
     )

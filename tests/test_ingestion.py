@@ -21,6 +21,7 @@ from src.utils.manifest import (
     compute_schema_fingerprint,
     create_manifest_dict,
     generate_batch_id,
+    get_earliest_watermark,
     get_latest_cdc_watermark,
     get_latest_watermark,
     is_batch_completed,
@@ -125,8 +126,9 @@ class TestIngestionPipeline(unittest.TestCase):
 
             # Batch 1 should be recognized as completed
             self.assertTrue(is_batch_completed(b1_id, "nyc_311", manifests_dir=tmp_path))
-            # Watermark should now be 2026-10-10
+            # Watermark should now be 2026-10-10, earliest should be 2026-10-01
             self.assertEqual(get_latest_watermark("nyc_311", manifests_dir=tmp_path), "2026-10-10")
+            self.assertEqual(get_earliest_watermark("nyc_311", manifests_dir=tmp_path), "2026-10-01")
 
             # Batch 2 sequence should increment
             b2_id = generate_batch_id("311", date_str="20261023", manifests_dir=tmp_path)

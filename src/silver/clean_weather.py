@@ -22,6 +22,7 @@ from pyspark.sql.functions import (
     col,
     concat,
     concat_ws,
+    count as spark_count,
     date_format,
     isnan,
     lit,
@@ -408,6 +409,13 @@ def compute_rolling_weather_windows(df: DataFrame) -> DataFrame:
     w_grid_3 = Window.partitionBy("grid_id").orderBy("_ts_secs").rangeBetween(-2 * 3600, 0)
     w_grid_6 = Window.partitionBy("grid_id").orderBy("_ts_secs").rangeBetween(-5 * 3600, 0)
     w_grid_24 = Window.partitionBy("grid_id").orderBy("_ts_secs").rangeBetween(-23 * 3600, 0)
+
+    # Track rolling window observations count & completeness to flag cold-start / boundary effects
+    df_window = (
+        df_window
+        .withColumn("rolling_24h_hours_count", spark_count("timestamp_utc").over(w_grid_24).cast("smallint"))
+        .withColumn("is_rolling_24h_partial", col("rolling_24h_hours_count") < 24)
+    )
 
     if "precipitation" in df_window.columns:
         df_window = (

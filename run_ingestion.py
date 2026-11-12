@@ -111,8 +111,8 @@ def main():
     parser.add_argument(
         "--lookback-days",
         type=int,
-        default=14,
-        help="Lookback buffer in days for CDC status updates on existing tickets (default: 14)",
+        default=7,
+        help="Lookback buffer in days when no watermark exists (default: 7)",
     )
     parser.add_argument(
         "--app-token",
@@ -158,6 +158,7 @@ def main():
                 mode=weather_mode,
                 start_date=args.start_date,
                 end_date=args.end_date,
+                lookback_days=args.lookback_days,
                 env=args.env,
                 manifests_dir=MANIFESTS_DIR,
             )

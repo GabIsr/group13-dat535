@@ -11,11 +11,9 @@ from pathlib import Path
 from typing import Any, Dict
 
 from src.silver.config import (
-    MAX_UNMAPPED_TAXONOMY_RATE_PCT,
     QUALITY_DIR,
     SENSOR_ANOMALY_LEDGER_PATH,
     UNCLASSIFIED_RESOLUTIONS_LEDGER_PATH,
-    UNMAPPED_TAXONOMY_LEDGER_PATH,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -47,7 +45,6 @@ def generate_quality_reconciliation_report(
         "artifacts": {
             "sensor_anomaly_ledger": str(SENSOR_ANOMALY_LEDGER_PATH),
             "unclassified_resolutions_ledger": str(UNCLASSIFIED_RESOLUTIONS_LEDGER_PATH),
-            "unmapped_complaint_taxonomy_ledger": str(UNMAPPED_TAXONOMY_LEDGER_PATH),
         },
     }
 

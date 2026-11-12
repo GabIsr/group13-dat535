@@ -18,9 +18,9 @@ on:
           - incremental
           - backfill
       start_date:
-        description: 'Start Date for Backfill (YYYY-MM-DD)'
+        description: 'Start Date for Backfill (YYYY-MM-DD, leave empty for dynamic 7-day lookback)'
         required: false
-        default: '2026-07-15'
+        default: ''
         type: string
       end_date:
         description: 'End Date for Backfill (YYYY-MM-DD, leave empty for safe 5-day lag)'

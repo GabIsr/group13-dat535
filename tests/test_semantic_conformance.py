@@ -177,7 +177,7 @@ class TestSemanticConformance(unittest.TestCase):
         ledger_path = Path(self.temp_dir.name) / "test_ledger.parquet"
         cnt1 = upsert_unmapped_taxonomy_ledger(df_b1, self.spark, ledger_path=ledger_path)
         self.assertIsNotNone(cnt1)
-        self.assertEqual(cnt1, 2)
+        self.assertEqual(cnt1, 1)
 
         # Second batch with same unmapped type + a new one
         batch2 = [
@@ -187,7 +187,7 @@ class TestSemanticConformance(unittest.TestCase):
         df_b2 = self.spark.createDataFrame(batch2, schema=schema).withColumn("created_at_utc", to_timestamp("created_at_utc"))
         cnt2 = upsert_unmapped_taxonomy_ledger(df_b2, self.spark, ledger_path=ledger_path)
         self.assertIsNotNone(cnt2)
-        self.assertGreaterEqual(cnt2, 2)
+        self.assertEqual(cnt2, 2)
 
         if ledger_path.exists() and any(ledger_path.glob("*.parquet")):
             try:

@@ -9,6 +9,8 @@ Author: Group 13
 """
 
 import logging
+import shutil
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -359,9 +361,13 @@ def upsert_unmapped_taxonomy_ledger(
     Tracks novel or seasonal complaint types with occurrence_count, first_seen_utc,
     last_seen_utc, and sample descriptors. Incorporates active governance review columns.
 
-    100% pure PySpark aggregation and Parquet persistence.
+    100% pure PySpark aggregation and Parquet persistence with atomic staging swap.
     """
     try:
+        cols_df = set(df.columns)
+        if "is_unmapped_complaint_type" not in cols_df:
+            return 0
+
         # Filter for unmapped records
         df_unmapped = df.filter(col("is_unmapped_complaint_type") == True)
         unmapped_cnt = df_unmapped.count()
@@ -370,8 +376,13 @@ def upsert_unmapped_taxonomy_ledger(
             logger.info("Zero unmapped complaint taxonomy types found in current batch.")
             return 0
 
-        # Determine available columns for audit sampling
-        cols = set(df.columns)
+        # Defensive handling for missing attributes in synthetic unit test DataFrames
+        cols = set(df_unmapped.columns)
+        if "agency" not in cols:
+            df_unmapped = df_unmapped.withColumn("agency", lit("UNKNOWN"))
+        if "complaint_type" not in cols:
+            df_unmapped = df_unmapped.withColumn("complaint_type", lit("UNKNOWN"))
+
         key_col = col("unique_key") if "unique_key" in cols else lit(None).cast("long")
         desc_col = col("descriptor") if "descriptor" in cols else lit(None).cast("string")
         time_col = col("created_at_utc") if "created_at_utc" in cols else lit(None).cast("timestamp")
@@ -394,7 +405,7 @@ def upsert_unmapped_taxonomy_ledger(
 
         ledger_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if ledger_path.exists():
+        if ledger_path.exists() and any(ledger_path.glob("*.parquet")):
             try:
                 df_existing = spark.read.parquet(str(ledger_path))
 
@@ -468,15 +479,33 @@ def upsert_unmapped_taxonomy_ledger(
                 col("reviewed_at_utc"),
             ).orderBy(col("occurrence_count").desc())
 
-        # Write merged catalog to Parquet
+        # Calculate total distinct categories before persistence
+        total_distinct = df_merged.count()
+
+        # Atomic staging swap pattern for Parquet persistence:
+        # Prevents SparkFileNotFoundException when lazily reading from ledger_path while overwriting
+        staging_dir = ledger_path.parent / f".tmp_{ledger_path.stem}_{int(time.time() * 1000)}"
         try:
-            df_merged.write.mode("overwrite").parquet(str(ledger_path))
-            total_distinct = df_merged.count()
+            df_merged.write.mode("overwrite").parquet(str(staging_dir))
+            if ledger_path.exists():
+                if ledger_path.is_dir():
+                    shutil.rmtree(ledger_path)
+                else:
+                    ledger_path.unlink()
+            staging_dir.rename(ledger_path)
             logger.info(f"Upserted unmapped taxonomy ledger ({total_distinct} distinct categories) at {ledger_path}")
             return total_distinct
         except Exception as write_err:
+            if staging_dir.exists():
+                try:
+                    if staging_dir.is_dir():
+                        shutil.rmtree(staging_dir)
+                    else:
+                        staging_dir.unlink()
+                except Exception:
+                    pass
             logger.warning(f"Note: Local Parquet write skipped (e.g. Windows file permissions): {write_err}")
-            return unmapped_cnt
+            return total_distinct
 
     except Exception as e:
         logger.warning(f"Unmapped taxonomy ledger upsert encountered non-blocking notice: {e}")

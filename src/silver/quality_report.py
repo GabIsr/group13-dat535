@@ -117,15 +117,21 @@ def generate_quality_reconciliation_report(
     if res_mining:
         print("\n  STAGE 1C: UNSTRUCTURED RESOLUTION TEXT MINING & PHANTOM CLOSURES:")
         ver_cnt = res_mining.get("field_verified_remediations", 0)
+        ver_rate = res_mining.get("field_verified_rate_pct", (ver_cnt / b_311_closed * 100.0) if b_311_closed > 0 else 0.0)
         phan_cnt = res_mining.get("phantom_closures", 0)
-        phan_rate = res_mining.get("phantom_closure_rate_pct", 0.0)
-        ver_rate = (ver_cnt / b_311_closed * 100.0) if b_311_closed > 0 else 0.0
+        phan_rate = res_mining.get("phantom_closure_rate_pct", (phan_cnt / b_311_closed * 100.0) if b_311_closed > 0 else 0.0)
+        unclass_cnt = res_mining.get("unclassified_resolutions", 0)
+        unclass_rate = res_mining.get("unclassified_rate_pct", (unclass_cnt / b_311_closed * 100.0) if b_311_closed > 0 else 0.0)
+
         print(f"    - True Field Remediations (Verified)  : {ver_cnt:,} ({ver_rate:.2f}% of closed)")
         print(f"    - Administrative Phantom Closures     : {phan_cnt:,} ({phan_rate:.2f}% of closed)")
+        print(f"    - Unclassified Vocabulary (Cataloged) : {unclass_cnt:,} ({unclass_rate:.2f}% of closed)")
         breakdown = res_mining.get("outcome_breakdown", {})
         if breakdown:
             print("    Resolution Outcome Distribution:")
             for cat_name, cat_cnt in sorted(breakdown.items(), key=lambda x: x[1], reverse=True):
+                if cat_name == "OPEN_TICKET":
+                    continue
                 cat_pct = (cat_cnt / b_311_closed * 100.0) if b_311_closed > 0 else 0.0
                 print(f"      * {cat_name:<34}: {cat_cnt:,} ({cat_pct:.2f}%)")
 

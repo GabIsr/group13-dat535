@@ -126,6 +126,11 @@ def build_agency_resolution_performance_mart(
                     2
                 ).alias("phantom_closure_rate_pct")
             )
+        has_unclass = "is_unclassified_resolution" in cols_311
+        if has_unclass:
+            closure_aggs.append(
+                spark_sum(when(col("is_unclassified_resolution") == True, 1).otherwise(0)).alias("unclassified_closed_today")
+            )
         if has_field_hours:
             closure_aggs.append(
                 spark_round(percentile_approx(col("field_remediation_hours"), lit(0.5)), 2).alias("median_field_remediation_hours")

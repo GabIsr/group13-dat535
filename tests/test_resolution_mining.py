@@ -256,6 +256,84 @@ class TestResolutionTextMining(unittest.TestCase):
             self.assertFalse(row["is_field_verified"])
             self.assertIsNone(row["field_remediation_hours"])
 
+    def test_top_15_enterprise_cad_boilerplates(self):
+        """Verify 100% precision on the dominant NYC 311 CAD and agency dispatch templates."""
+        from pyspark.sql.functions import lit
+
+        schema = StructType([
+            StructField("resolution_description", StringType(), True),
+            StructField("expected_category", StringType(), True),
+            StructField("expected_phantom", BooleanType(), True),
+            StructField("expected_verified", BooleanType(), True),
+        ])
+
+        top_15_cases = [
+            # 1. NYPD #1 most common
+            ("The Police Department responded to the complaint and took action to fix the condition.", "ACTION_TAKEN_REMEDIED", False, True),
+            # 2. NYPD no evidence
+            ("The Police Department responded to the complaint and with the information available observed no evidence of the violation at that time.", "NO_VIOLATION_FOUND", False, True),
+            # 3. DSNY took action
+            ("The Department of Sanitation investigated the items and took action to remedy the condition.", "ACTION_TAKEN_REMEDIED", False, True),
+            # 4. HPD managing agent
+            ("The Department of Housing Preservation and Development contacted the managing agent regarding the condition.", "ADMINISTRATIVE_DISMISSAL", True, False),
+            # 5. DSNY cleaned location
+            ("The Department of Sanitation cleaned the location.", "ACTION_TAKEN_REMEDIED", False, True),
+            # 6. DSNY found no condition
+            ("The Department of Sanitation investigated this complaint and found no condition at the location.", "NO_VIOLATION_FOUND", False, True),
+            # 7. HPD did not violate
+            ("The Department of Housing Preservation and Development inspected the following conditions. The conditions observed by the inspector did not violate city housing standards.", "NO_VIOLATION_FOUND", False, True),
+            # 8. NYPD no criminal violation
+            ("The New York City Police Department responded to the complaint and with the information available observed no criminal violation upon arrival.", "NO_VIOLATION_FOUND", False, True),
+            # 9. DOT repaired pothole
+            ("The Department of Transportation repaired the pothole at the specified location.", "ACTION_TAKEN_REMEDIED", False, True),
+            # 10. DEP temporary condition
+            ("The Department of Environmental Protection investigated this complaint and found it to be a temporary condition.", "ADMINISTRATIVE_DISMISSAL", True, False),
+            # 11. DOB no violation warranted
+            ("The Department of Buildings reviewed this complaint and determined that no violation was warranted.", "NO_VIOLATION_FOUND", False, True),
+            # 12. NYPD action not necessary
+            ("The Police Department determined that Police action was not necessary.", "ADMINISTRATIVE_DISMISSAL", True, False),
+            # 13. DHS individual did not accept
+            ("The mobile outreach response team offered services to the individual, but the individual did not accept assistance.", "ADMINISTRATIVE_DISMISSAL", True, False),
+            # 14. DPR completed work order
+            ("NYC Parks has completed the requested work order and corrected the problem.", "ACTION_TAKEN_REMEDIED", False, True),
+            # 15. DOT website redirect
+            ("Service Request status for this request is available on the Department of Transportation website. Please click the link for details.", "ADMINISTRATIVE_DISMISSAL", True, False),
+        ]
+
+        df_in = self.spark.createDataFrame(top_15_cases, schema=schema).withColumn("is_ticket_closed", lit(True))
+        df_out = classify_resolution_outcomes(df_in)
+
+        for row in df_out.collect():
+            desc = row["resolution_description"]
+            self.assertEqual(row["expected_category"], row["resolution_outcome_category"], f"Category mismatch for: {desc}")
+            self.assertEqual(row["expected_phantom"], row["is_phantom_closure"], f"Phantom flag mismatch for: {desc}")
+            self.assertEqual(row["expected_verified"], row["is_field_verified"], f"Verified flag mismatch for: {desc}")
+
+    def test_affirmative_phantom_identification_and_unclassified_isolation(self):
+        """Verify Affirmative Identification: novel/unclassified templates are NOT convicted as phantom closures."""
+        from pyspark.sql.functions import lit
+
+        schema = StructType([
+            StructField("resolution_description", StringType(), True),
+            StructField("is_ticket_closed", BooleanType(), True),
+        ])
+
+        # Novel boilerplate that does not match known remedial or dismissal rules
+        novel_cases = [
+            ("Quantum cryptographic handshake timeout on smart city sensor array.", True),
+            ("Autonomous robotics delivery pod recalibrated telemetry settings.", True),
+        ]
+
+        df_in = self.spark.createDataFrame(novel_cases, schema=schema)
+        df_out = classify_resolution_outcomes(df_in)
+
+        for row in df_out.collect():
+            self.assertEqual(row["resolution_outcome_category"], "UNCLASSIFIED_OR_GENERIC")
+            self.assertFalse(row["is_field_verified"], "Unclassified text must not be field verified")
+            # CRUCIAL AFFIRMATIVE IDENTIFICATION CHECK:
+            self.assertFalse(row["is_phantom_closure"], "Unclassified text must NOT be falsely convicted as a phantom closure!")
+            self.assertTrue(row["is_unclassified_resolution"], "Must be flagged as unclassified for ledger cataloging")
+
 
 if __name__ == "__main__":
     unittest.main()

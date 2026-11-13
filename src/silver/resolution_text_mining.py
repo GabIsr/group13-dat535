@@ -72,21 +72,28 @@ REGEX_NEGATED_ACTION = (
 
 # 5. Administrative Dismissal (General lack of jurisdiction, unfounded, condition cleared before arrival)
 REGEX_ADMIN_DISMISSAL = (
-    r"\b(?:NO ACTION|NOT WITHIN JURISDICTION|OUTSIDE (?:NYC )?(?:MUNICIPAL )?JURISDICTION|"
-    r"NOT RESPONSIBLE|RESOLVED PRIOR|UNFOUNDED|NO CITY AGENCY ACTION|ACTION NOT NECESSARY|"
-    r"OUT OF JURISDICTION|NOT REQUIRED)\b"
+    r"\b(?:NO\s+ACTION|NOT\s+WITHIN\s+JURISDICTION|OUTSIDE\s+(?:NYC\s+)?(?:MUNICIPAL\s+)?JURISDICTION|"
+    r"NOT\s+RESPONSIBLE|RESOLVED\s+PRIOR|UNFOUNDED|NO\s+CITY\s+AGENCY\s+ACTION|ACTION\s+(?:WAS\s+)?NOT\s+NECESSARY|"
+    r"OUT\s+OF\s+JURISDICTION|NOT\s+REQUIRED|AVAILABLE\s+ON\s+(?:THE\s+)?(?:DEPARTMENT|WEBSITE)|"
+    r"SEE\s+NOTES|TEMP(?:ORARY)?\s+CONDITION|CONTACTED\s+THE\s+MANAGING\s+AGENT|"
+    r"DID\s+NOT\s+ACCEPT\s+ASSISTANCE|POLICE\s+ACTION\s+WAS\s+NOT\s+NECESSARY)\b"
 )
 
 # 6. Negative Inspection / Code Compliance (Official inspection verified code compliance)
 REGEX_NO_VIOLATION = (
-    r"\b(?:DIDN'?T OBSERVE|DID NOT OBSERVE|NO VIOLATION(?:S)?|NOT OBSERVED|OBSERVED NO EVIDENCE|"
-    r"NO EVIDENCE|NOT FOUND|NOT IN VIOLATION|NO CONDITION(?:S)? OBSERVED|FOUND COMPLIANT)\b"
+    r"\b(?:DIDN'?T\s+OBSERVE|DID\s+NOT\s+OBSERVE|NO\s+(?:[A-Z]+\s+)?VIOLATION(?:S)?|NOT\s+OBSERVED|"
+    r"OBSERVED\s+NO\s+(?:EVIDENCE|[A-Z]+\s+VIOLATION)|NO\s+EVIDENCE|NOT\s+FOUND|NOT\s+IN\s+VIOLATION|"
+    r"NO\s+CONDITION(?:S)?\s+OBSERVED|FOUND\s+COMPLIANT|FOUND\s+NO\s+CONDITION|DID\s+NOT\s+VIOLATE|"
+    r"NO\s+VIOLATION\s+WAS\s+WARRANTED|CONDITION\s+WAS\s+NOT\s+FOUND)\b"
 )
 
 # 7. Affirmative Action Remediation (Requires non-negated physical or enforcement action)
 REGEX_ACTION_TAKEN = (
     r"\b(?:(?:SUMMONS|VIOLATION|TICKET)\s+(?:WAS\s+)?ISSUED|ISSUED\s+(?:A\s+)?(?:SUMMONS|VIOLATION|TICKET)|"
-    r"REPAIRED|CORRECTED|CLEANED|REMOVED|SERVICED|SATISFIED|REMEDIED|ARREST(?:ED)?|WORK\s+COMPLETED)\b"
+    r"REPAIRED|CORRECTED|CLEANED|REMOVED|SERVICED|SATISFIED|REMEDIED|ARREST(?:ED)?|WORK\s+COMPLETED|"
+    r"(?:TOOK|TAKEN)\s+ACTION(?:\s+TO\s+(?:FIX|REMEDY))?|ACTION\s+WAS\s+TAKEN|FIX(?:ED|ING)?|"
+    r"CLEANED\s+(?:THE\s+)?LOCATION|COMPLETED\s+THE\s+REQUESTED\s+WORK\s+ORDER|"
+    r"REPAIRED\s+THE\s+POTHOLE|REMEDY\s+THE\s+CONDITION)\b"
 )
 
 
@@ -165,13 +172,34 @@ def classify_resolution_outcomes(df: DataFrame) -> DataFrame:
         "resolution_outcome_category", category_expr
     )
 
-    # 4. Attach Field Verification and Phantom Closure Flags
-    df_classified = df_classified.withColumn(
-        "is_field_verified",
-        col("resolution_outcome_category").isin("ACTION_TAKEN_REMEDIED", "NO_VIOLATION_FOUND")
-    ).withColumn(
-        "is_phantom_closure",
-        is_closed & (~col("is_field_verified")) & (~col("resolution_outcome_category").isin("OPEN_TICKET", "UNSTATED_OR_EMPTY"))
+    # 4. Attach Field Verification, Affirmative Phantom Closure, and Unclassified Flags
+    # Strict Affirmative Semantic Identification (Guaranteed Statistical Purity):
+    # Only explicit administrative non-remedial dismissals count as phantom closures.
+    PHANTOM_CATEGORIES = [
+        "ADMINISTRATIVE_DISMISSAL",
+        "DUPLICATE_CONSOLIDATED",
+        "DEFERRED_PENDING_ACTION",
+        "ACCESS_DENIED_UNABLE_TO_LOCATE",
+    ]
+    VERIFIED_CATEGORIES = [
+        "ACTION_TAKEN_REMEDIED",
+        "NO_VIOLATION_FOUND",
+    ]
+
+    df_classified = (
+        df_classified
+        .withColumn(
+            "is_field_verified",
+            col("resolution_outcome_category").isin(VERIFIED_CATEGORIES)
+        )
+        .withColumn(
+            "is_phantom_closure",
+            is_closed & col("resolution_outcome_category").isin(PHANTOM_CATEGORIES)
+        )
+        .withColumn(
+            "is_unclassified_resolution",
+            is_closed & (col("resolution_outcome_category") == "UNCLASSIFIED_OR_GENERIC")
+        )
     )
 
     # 5. Attach Bounded Field Remediation Duration (filtering clock-skew anomalies)
@@ -235,6 +263,10 @@ def upsert_unclassified_resolutions_ledger(
                 spark_max("created_at_utc").alias("last_seen_utc"),
                 spark_first("unique_key").alias("sample_unique_key"),
             )
+            .withColumn("review_status", lit("NEEDS_REVIEW"))
+            .withColumn("suggested_category", lit(None).cast("string"))
+            .withColumn("review_notes", lit(None).cast("string"))
+            .withColumn("reviewed_at_utc", lit(None).cast("timestamp"))
         )
 
         ledger_path.parent.mkdir(parents=True, exist_ok=True)
@@ -251,6 +283,16 @@ def upsert_unclassified_resolutions_ledger(
                         .withColumnRenamed("last_created_utc", "last_seen_utc")
                     )
 
+                # Add workflow governance columns if missing in historical ledger
+                if "review_status" not in df_existing.columns:
+                    df_existing = df_existing.withColumn("review_status", lit("NEEDS_REVIEW"))
+                if "suggested_category" not in df_existing.columns:
+                    df_existing = df_existing.withColumn("suggested_category", lit(None).cast("string"))
+                if "review_notes" not in df_existing.columns:
+                    df_existing = df_existing.withColumn("review_notes", lit(None).cast("string"))
+                if "reviewed_at_utc" not in df_existing.columns:
+                    df_existing = df_existing.withColumn("reviewed_at_utc", lit(None).cast("timestamp"))
+
                 df_merged = (
                     df_existing.join(
                         df_batch_catalog,
@@ -261,8 +303,8 @@ def upsert_unclassified_resolutions_ledger(
                         col("agency"),
                         col("clean_resolution_text"),
                         (
-                            F.coalesce(col("occurrence_count"), lit(0)) +
-                            F.coalesce(col("batch_count"), lit(0))
+                            F.coalesce(df_existing["occurrence_count"], lit(0)) +
+                            F.coalesce(df_batch_catalog["batch_count"], lit(0))
                         ).cast("integer").alias("occurrence_count"),
                         F.coalesce(
                             df_batch_catalog["sample_unique_key"],
@@ -276,6 +318,11 @@ def upsert_unclassified_resolutions_ledger(
                             F.coalesce(df_existing["last_seen_utc"], df_batch_catalog["last_seen_utc"]),
                             F.coalesce(df_batch_catalog["last_seen_utc"], df_existing["last_seen_utc"]),
                         ).alias("last_seen_utc"),
+                        # Active Governance: preserve engineer review_status or default to NEEDS_REVIEW
+                        F.coalesce(df_existing["review_status"], lit("NEEDS_REVIEW")).alias("review_status"),
+                        df_existing["suggested_category"].alias("suggested_category"),
+                        df_existing["review_notes"].alias("review_notes"),
+                        df_existing["reviewed_at_utc"].alias("reviewed_at_utc"),
                     )
                     .orderBy(col("occurrence_count").desc())
                 )
@@ -288,6 +335,10 @@ def upsert_unclassified_resolutions_ledger(
                     col("sample_unique_key"),
                     col("first_seen_utc"),
                     col("last_seen_utc"),
+                    col("review_status"),
+                    col("suggested_category"),
+                    col("review_notes"),
+                    col("reviewed_at_utc"),
                 ).orderBy(col("occurrence_count").desc())
         else:
             df_merged = df_batch_catalog.select(
@@ -297,6 +348,10 @@ def upsert_unclassified_resolutions_ledger(
                 col("sample_unique_key"),
                 col("first_seen_utc"),
                 col("last_seen_utc"),
+                col("review_status"),
+                col("suggested_category"),
+                col("review_notes"),
+                col("reviewed_at_utc"),
             ).orderBy(col("occurrence_count").desc())
 
         # Write merged catalog to Parquet

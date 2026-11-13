@@ -109,9 +109,11 @@ def generate_markdown_summary(quality_json: Dict[str, Any], gold_dir: Optional[P
     res_mining = m_311.get("resolution_text_mining", {})
     if res_mining:
         ver_cnt = res_mining.get("field_verified_remediations", 0)
+        ver_rate = res_mining.get("field_verified_rate_pct", (ver_cnt / closed_311 * 100.0) if closed_311 > 0 else 0.0)
         phan_cnt = res_mining.get("phantom_closures", 0)
-        phan_rate = res_mining.get("phantom_closure_rate_pct", 0.0)
-        ver_rate = (ver_cnt / closed_311 * 100.0) if closed_311 > 0 else 0.0
+        phan_rate = res_mining.get("phantom_closure_rate_pct", (phan_cnt / closed_311 * 100.0) if closed_311 > 0 else 0.0)
+        unclass_cnt = res_mining.get("unclassified_resolutions", 0)
+        unclass_rate = res_mining.get("unclassified_rate_pct", (unclass_cnt / closed_311 * 100.0) if closed_311 > 0 else 0.0)
 
         category_descriptions = {
             "ACTION_TAKEN_REMEDIED": "Physical repair or enforcement action completed on-site",
@@ -128,9 +130,9 @@ def generate_markdown_summary(quality_json: Dict[str, Any], gold_dir: Optional[P
         md.append("| Audit Metric | Count / Rate | Description |")
         md.append("| :--- | :--- | :--- |")
         md.append(f"| **Closed Tickets Evaluated** | `{closed_311:,}` | Closed tickets subject to resolution text classification |")
-        md.append(f"| **True Field Remediations (Verified)** | **`{ver_cnt:,}`** (`{ver_rate:.2f}%`) | Confirmed physical work completed on-site (`is_field_verified_remediation=True`) |")
-        md.append(f"| **Administrative \"Phantom Closures\"** | **`{phan_cnt:,}`** | Tickets closed administratively without remediation (`is_phantom_closure=True`) |")
-        md.append(f"| **Phantom Closure Rate** | **`{phan_rate:.2f}%`** | Share of closed tickets resolved via non-remedial actions |")
+        md.append(f"| **True Field Remediations (Verified)** | **`{ver_cnt:,}`** (`{ver_rate:.2f}%`) | Confirmed physical work completed on-site (`is_field_verified=True`) |")
+        md.append(f"| **Administrative \"Phantom Closures\"** | **`{phan_cnt:,}`** (`{phan_rate:.2f}%`) | Closed administratively without remediation (`is_phantom_closure=True`) |")
+        md.append(f"| Unclassified Vocabulary (Cataloged) | `{unclass_cnt:,}` (`{unclass_rate:.2f}%`) | Novel boilerplates routed to Active Governance Catalog |")
         md.append("")
 
         breakdown = res_mining.get("outcome_breakdown", {})
@@ -139,6 +141,8 @@ def generate_markdown_summary(quality_json: Dict[str, Any], gold_dir: Optional[P
             md.append("| Resolution Outcome Category | Count | Share of Closed | Operational Meaning |")
             md.append("| :--- | :--- | :--- | :--- |")
             for cat_name, cat_cnt in sorted(breakdown.items(), key=lambda x: x[1], reverse=True):
+                if cat_name == "OPEN_TICKET":
+                    continue
                 cat_pct = (cat_cnt / closed_311 * 100.0) if closed_311 > 0 else 0.0
                 desc = category_descriptions.get(cat_name, "Operational resolution outcome")
                 md.append(f"| `{cat_name}` | `{cat_cnt:,}` | `{cat_pct:.2f}%` | {desc} |")

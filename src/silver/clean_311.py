@@ -920,6 +920,11 @@ def clean_and_validate_311(
                 if "is_phantom_closure" in cols_silver
                 else lit(0).alias("phantom_cnt")
             )
+            unclass_expr = (
+                spark_sum(when(col("is_unclassified_resolution") == True, 1).otherwise(0)).alias("unclass_cnt")
+                if "is_unclassified_resolution" in cols_silver
+                else lit(0).alias("unclass_cnt")
+            )
 
             agg = df_written.select(
                 spark_sum(when(col("is_ticket_closed"), 1).otherwise(0)).alias("closed_count"),
@@ -931,6 +936,7 @@ def clean_and_validate_311(
                 dup_burst_expr,
                 field_ver_expr,
                 phantom_expr,
+                unclass_expr,
             ).first()
 
             closed_count = int(agg["closed_count"] or 0)
@@ -946,7 +952,10 @@ def clean_and_validate_311(
             burst_rate = round((dup_burst_cnt / total_loc * 100.0), 2) if total_loc > 0 else 0.0
             field_ver_cnt = int(agg["field_ver_cnt"] or 0)
             phantom_cnt = int(agg["phantom_cnt"] or 0)
+            unclass_cnt = int(agg["unclass_cnt"] or 0)
+            field_ver_rate = round((field_ver_cnt / closed_count * 100.0), 2) if closed_count > 0 else 0.0
             phantom_rate = round((phantom_cnt / closed_count * 100.0), 2) if closed_count > 0 else 0.0
+            unclass_rate = round((unclass_cnt / closed_count * 100.0), 2) if closed_count > 0 else 0.0
 
             spatial_rows = df_written.groupBy("spatial_resolution_level").count().collect()
             spatial_stats = {r["spatial_resolution_level"]: int(r["count"]) for r in spatial_rows}
@@ -1011,8 +1020,11 @@ def clean_and_validate_311(
             },
             "resolution_text_mining": {
                 "field_verified_remediations": field_ver_cnt,
+                "field_verified_rate_pct": field_ver_rate,
                 "phantom_closures": phantom_cnt,
                 "phantom_closure_rate_pct": phantom_rate,
+                "unclassified_resolutions": unclass_cnt,
+                "unclassified_rate_pct": unclass_rate,
                 "outcome_breakdown": res_dict,
             },
             "partitions_written": written_files,

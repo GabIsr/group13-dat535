@@ -110,9 +110,14 @@ def build_daily_service_demand_mart(
     inc_count_expr = spark_sum(when(col("is_burst_duplicate") == False, 1).otherwise(0)) if has_burst_dup else spark_count("unique_key")
     dup_burst_expr = spark_sum(when(col("is_burst_duplicate") == True, 1).otherwise(0)) if has_burst_dup else lit(0)
 
+    daily_group_cols = ["date", "grid_id", "borough"]
+    if "canonical_service_domain" in cols_311:
+        daily_group_cols.append("canonical_service_domain")
+    daily_group_cols.append("complaint_type")
+
     daily_311_spark = (
         df_311_spark.withColumn("date", to_date(col("created_at_utc")))
-        .groupBy("date", "grid_id", "borough", "complaint_type")
+        .groupBy(*daily_group_cols)
         .agg(
             spark_count("unique_key").alias("complaint_count"),
             inc_count_expr.alias("distinct_incidents_count"),
@@ -166,7 +171,7 @@ def build_daily_service_demand_mart(
         )
 
     # 7. Verification: Ensure Grain Uniqueness in PySpark
-    distinct_grains = mart_spark.select("date", "grid_id", "borough", "complaint_type").distinct().count()
+    distinct_grains = mart_spark.select(*daily_group_cols).distinct().count()
     if distinct_grains != mart_rows:
         mart_spark.unpersist()
         raise ValueError(f"Grain uniqueness violation: {mart_rows - distinct_grains} duplicate keys on grain")

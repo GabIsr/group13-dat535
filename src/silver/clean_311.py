@@ -64,12 +64,17 @@ from src.silver.resolution_text_mining import (
     classify_resolution_outcomes,
     upsert_unclassified_resolutions_ledger,
 )
+from src.silver.semantic_conformance import (
+    conform_complaint_taxonomy,
+    upsert_unmapped_taxonomy_ledger,
+)
 from src.utils.spark import get_spark_session
 from src.silver.config import (
     BOROUGH_CENTROIDS,
     BRONZE_DIR,
     KNOWN_311_STATUSES,
     KNOWN_NYC_AGENCIES,
+    MAX_UNMAPPED_TAXONOMY_RATE_PCT,
     NYC_311_LAUNCH_DATE,
     NYC_COUNCIL_DISTRICT_MAX,
     NYC_COUNCIL_DISTRICT_MIN,
@@ -82,6 +87,8 @@ from src.silver.config import (
     PROJECT_ROOT,
     QUARANTINE_DIR,
     SILVER_DIR,
+    TAXONOMY_REFERENCE_PATH,
+    UNMAPPED_TAXONOMY_LEDGER_PATH,
     VALID_NYC_BOROUGHS,
     VALID_OPEN_DATA_CHANNELS,
     ZIP_CENTROIDS_PATH,
@@ -878,9 +885,14 @@ def clean_and_validate_311(
 
         df_clustered = cluster_citizen_call_bursts(df_staging, burst_window_hours=6.0)
 
+        # Categorical Schema Drift & Semantic Conformance (Issue #8)
+        logger.info("Executing PySpark Categorical Schema Drift & Semantic Conformance...")
+        df_conformed = conform_complaint_taxonomy(df_clustered, spark=spark, reference_path=TAXONOMY_REFERENCE_PATH)
+        upsert_unmapped_taxonomy_ledger(df_conformed, spark, ledger_path=UNMAPPED_TAXONOMY_LEDGER_PATH)
+
         # Unstructured Resolution Text Mining & Phantom Closure Auditing (Issue #6)
         logger.info("Executing PySpark Unstructured Resolution Text Mining & Semantic Auditing...")
-        df_resolved = classify_resolution_outcomes(df_clustered)
+        df_resolved = classify_resolution_outcomes(df_conformed)
         upsert_unclassified_resolutions_ledger(df_resolved, spark)
 
         df_std = standardize_categorical_and_administrative_attributes(df_resolved)
@@ -925,6 +937,16 @@ def clean_and_validate_311(
                 if "is_unclassified_resolution" in cols_silver
                 else lit(0).alias("unclass_cnt")
             )
+            unmapped_expr = (
+                spark_sum(when(col("is_unmapped_complaint_type") == True, 1).otherwise(0)).alias("unmapped_cnt")
+                if "is_unmapped_complaint_type" in cols_silver
+                else lit(0).alias("unmapped_cnt")
+            )
+            legacy_expr = (
+                spark_sum(when(col("is_legacy_complaint_name") == True, 1).otherwise(0)).alias("legacy_cnt")
+                if "is_legacy_complaint_name" in cols_silver
+                else lit(0).alias("legacy_cnt")
+            )
 
             agg = df_written.select(
                 spark_sum(when(col("is_ticket_closed"), 1).otherwise(0)).alias("closed_count"),
@@ -937,6 +959,8 @@ def clean_and_validate_311(
                 field_ver_expr,
                 phantom_expr,
                 unclass_expr,
+                unmapped_expr,
+                legacy_expr,
             ).first()
 
             closed_count = int(agg["closed_count"] or 0)
@@ -957,6 +981,12 @@ def clean_and_validate_311(
             phantom_rate = round((phantom_cnt / closed_count * 100.0), 2) if closed_count > 0 else 0.0
             unclass_rate = round((unclass_cnt / closed_count * 100.0), 2) if closed_count > 0 else 0.0
 
+            unmapped_cnt = int(agg["unmapped_cnt"] or 0)
+            legacy_cnt = int(agg["legacy_cnt"] or 0)
+            conformed_cnt = valid_rows_accepted - unmapped_cnt
+            unmapped_rate = round((unmapped_cnt / valid_rows_accepted * 100.0), 2) if valid_rows_accepted > 0 else 0.0
+            conformed_rate = round((conformed_cnt / valid_rows_accepted * 100.0), 2) if valid_rows_accepted > 0 else 0.0
+
             spatial_rows = df_written.groupBy("spatial_resolution_level").count().collect()
             spatial_stats = {r["spatial_resolution_level"]: int(r["count"]) for r in spatial_rows}
 
@@ -971,6 +1001,12 @@ def clean_and_validate_311(
                 res_dict = {r["resolution_outcome_category"]: int(r["count"]) for r in res_rows}
             else:
                 res_dict = {}
+
+            if "canonical_service_domain" in cols_silver:
+                domain_rows = df_written.groupBy("canonical_service_domain").count().collect()
+                domain_dict = {r["canonical_service_domain"]: int(r["count"]) for r in domain_rows}
+            else:
+                domain_dict = {}
         else:
             closed_count = 0
             open_count = 0
@@ -986,9 +1022,15 @@ def clean_and_validate_311(
             field_ver_cnt = 0
             phantom_cnt = 0
             phantom_rate = 0.0
+            unmapped_cnt = 0
+            legacy_cnt = 0
+            conformed_cnt = 0
+            unmapped_rate = 0.0
+            conformed_rate = 0.0
             spatial_stats = {}
             routes_dict = {}
             res_dict = {}
+            domain_dict = {}
 
         elapsed = time.time() - start_time
         logger.info(
@@ -1026,6 +1068,15 @@ def clean_and_validate_311(
                 "unclassified_resolutions": unclass_cnt,
                 "unclassified_rate_pct": unclass_rate,
                 "outcome_breakdown": res_dict,
+            },
+            "semantic_conformance": {
+                "total_records": valid_rows_accepted,
+                "conformed_records": conformed_cnt,
+                "conformed_rate_pct": conformed_rate,
+                "unmapped_records": unmapped_cnt,
+                "unmapped_rate_pct": unmapped_rate,
+                "legacy_mapped_records": legacy_cnt,
+                "domain_breakdown": domain_dict,
             },
             "partitions_written": written_files,
             "duration_seconds": round(elapsed, 2),

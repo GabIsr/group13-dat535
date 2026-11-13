@@ -28,6 +28,15 @@ SENSOR_ANOMALY_LEDGER_PATH = QUALITY_DIR / "sensor_anomaly_ledger.parquet"
 # Unclassified Resolution Template Ledger Path (Unstructured Text Mining & Vocabulary Drift)
 UNCLASSIFIED_RESOLUTIONS_LEDGER_PATH = QUALITY_DIR / "unclassified_resolutions_ledger.parquet"
 
+# Conformed Complaint Taxonomy Reference Table (Schema Drift & Semantic Conformance)
+TAXONOMY_REFERENCE_PATH = REFERENCE_DIR / "dim_complaint_taxonomy.parquet"
+
+# Unmapped Complaint Taxonomy Ledger Path (Lakehouse Schema Observability)
+UNMAPPED_TAXONOMY_LEDGER_PATH = QUALITY_DIR / "unmapped_complaint_taxonomy_ledger.parquet"
+
+# Alert Threshold for Batch Unmapped Categories Percentage (Soft warning trigger)
+MAX_UNMAPPED_TAXONOMY_RATE_PCT = 5.0
+
 # Physical Field Remediation Duration Sanity Bounds (Hours: 0h to 30 days = 720h)
 # Values outside [0, 720] represent negative clock-skew anomalies or non-physical multi-year artifacts.
 MIN_FIELD_REMEDIATION_HOURS = 0.0

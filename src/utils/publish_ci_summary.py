@@ -149,52 +149,51 @@ def generate_markdown_summary(quality_json: Dict[str, Any], gold_dir: Optional[P
             md.append("")
 
     # Section 2C: Categorical Schema Drift & Conformed Semantic Modeling
-    # [TEMPORARILY COMMENTED OUT FOR ISOLATED VERIFICATION OF UNSTRUCTURED TEXT MINING]
-    # sem_conf = m_311.get("semantic_conformance", {})
-    # if sem_conf:
-    #     tot_conf = sem_conf.get("total_records", valid_311)
-    #     conformed_cnt = sem_conf.get("conformed_records", 0)
-    #     unmapped_cnt = sem_conf.get("unmapped_records", 0)
-    #     unmapped_rate = sem_conf.get("unmapped_rate_pct", 0.0)
-    #     legacy_cnt = sem_conf.get("legacy_mapped_records", 0)
-    #     conformed_rate = (conformed_cnt / tot_conf * 100.0) if tot_conf > 0 else 0.0
-    #
-    #     gate_badge = "**`PASS (< 5.0%)`**" if unmapped_rate <= 5.0 else "**`ALERT (> 5.0%)`**"
-    #
-    #     domain_descriptions = {
-    #         "RESIDENTIAL_HABITABILITY": "HPD indoor heat, hot water, mold, and housing code compliance",
-    #         "SOLID_WASTE_SANITATION": "DSNY refuse, recycling, illegal dumping, and street cleanliness",
-    #         "STREET_TRAFFIC_INFRASTRUCTURE": "DOT roadway conditions, potholes, traffic signals, and signage",
-    #         "ACOUSTIC_DISTURBANCE": "NYPD/DEP commercial, residential, vehicular, and environmental noise",
-    #         "PUBLIC_HEALTH_ENVIRONMENT": "DOHMH/DEP pest control, food safety, and environmental hygiene",
-    #         "PARKS_FORESTRY": "DPR hazardous trees, park maintenance, and green spaces",
-    #         "CIVIC_REGULATION_CONSUMER": "DCWP/DOB/TLC consumer protection, licensing, and building structures",
-    #         "WATER_INFRASTRUCTURE": "DEP drinking water mains, hydrant leaks, and water pressure",
-    #         "SEWER_STORMWATER": "DEP catch basins, stormwater flooding, and sewer line backup",
-    #         "SOCIAL_SERVICES_HOMELESSNESS": "DHS encampment outreach, street homeless assistance",
-    #         "OTHER_CIVIC_SERVICES": "Unmapped, novel, or miscellaneous municipal agency services",
-    #     }
-    #
-    #     md.append("## Categorical Schema Drift & Conformed Semantic Modeling")
-    #     md.append("| Metric | Value | Description |")
-    #     md.append("| :--- | :--- | :--- |")
-    #     md.append(f"| **Clean 311 Records Evaluated** | `{tot_conf:,}` | Total Silver records aligned to semantic taxonomy |")
-    #     md.append(f"| **Conformed to Canonical Domains** | **`{conformed_cnt:,}`** (`{conformed_rate:.2f}%`) | Resolved via broadcast reference table (`dim_complaint_taxonomy`) |")
-    #     md.append(f"| Historical Legacy Aliases Conformed | `{legacy_cnt:,}` | Reconciled historical pre-migration category names |")
-    #     md.append(f"| **Unmapped Category Volume** | `{unmapped_cnt:,}` (`{unmapped_rate:.2f}%`) | New/unmapped templates captured in observability ledger |")
-    #     md.append(f"| **Observability Gate Status** | {gate_badge} | Lakehouse schema drift tolerance threshold |")
-    #     md.append("")
-    #
-    #     d_breakdown = sem_conf.get("domain_breakdown", {})
-    #     if d_breakdown:
-    #         md.append("### Conformed Service Domain Distribution Hierarchy")
-    #         md.append("| Canonical Service Domain | Ticket Volume | Share of 311 | Core Municipal Service Scope |")
-    #         md.append("| :--- | :--- | :--- | :--- |")
-    #         for d_name, d_cnt in sorted(d_breakdown.items(), key=lambda x: x[1], reverse=True):
-    #             d_pct = (d_cnt / tot_conf * 100.0) if tot_conf > 0 else 0.0
-    #             d_desc = domain_descriptions.get(d_name, "Standardized municipal domain")
-    #             md.append(f"| `{d_name}` | `{d_cnt:,}` | `{d_pct:.2f}%` | {d_desc} |")
-    #         md.append("")
+    sem_conf = m_311.get("semantic_conformance", {})
+    if sem_conf:
+        tot_conf = sem_conf.get("total_records", valid_311)
+        conformed_cnt = sem_conf.get("conformed_records", 0)
+        unmapped_cnt = sem_conf.get("unmapped_records", 0)
+        unmapped_rate = sem_conf.get("unmapped_rate_pct", 0.0)
+        legacy_cnt = sem_conf.get("legacy_mapped_records", 0)
+        conformed_rate = (conformed_cnt / tot_conf * 100.0) if tot_conf > 0 else 0.0
+
+        gate_badge = "**`PASS (< 5.0%)`**" if unmapped_rate <= 5.0 else "**`ALERT (> 5.0%)`**"
+
+        domain_descriptions = {
+            "RESIDENTIAL_HABITABILITY": "HPD indoor heat, hot water, mold, and housing code compliance",
+            "SOLID_WASTE_SANITATION": "DSNY refuse, recycling, illegal dumping, and street cleanliness",
+            "STREET_TRAFFIC_INFRASTRUCTURE": "DOT roadway conditions, potholes, traffic signals, and signage",
+            "ACOUSTIC_DISTURBANCE": "NYPD/DEP commercial, residential, vehicular, and environmental noise",
+            "PUBLIC_HEALTH_ENVIRONMENT": "DOHMH/DEP pest control, food safety, and environmental hygiene",
+            "PARKS_FORESTRY": "DPR hazardous trees, park maintenance, and green spaces",
+            "CIVIC_REGULATION_CONSUMER": "DCWP/DOB/TLC consumer protection, licensing, and building structures",
+            "WATER_INFRASTRUCTURE": "DEP drinking water mains, hydrant leaks, and water pressure",
+            "SEWER_STORMWATER": "DEP catch basins, stormwater flooding, and sewer line backup",
+            "SOCIAL_SERVICES_HOMELESSNESS": "DHS encampment outreach, street homeless assistance",
+            "OTHER_CIVIC_SERVICES": "Unmapped, novel, or miscellaneous municipal agency services",
+        }
+
+        md.append("## Categorical Schema Drift & Conformed Semantic Modeling")
+        md.append("| Metric | Value | Description |")
+        md.append("| :--- | :--- | :--- |")
+        md.append(f"| **Clean 311 Records Evaluated** | `{tot_conf:,}` | Total Silver records aligned to semantic taxonomy |")
+        md.append(f"| **Conformed to Canonical Domains** | **`{conformed_cnt:,}`** (`{conformed_rate:.2f}%`) | Resolved via broadcast reference table (`dim_complaint_taxonomy`) |")
+        md.append(f"| Historical Legacy Aliases Conformed | `{legacy_cnt:,}` | Reconciled historical pre-migration category names |")
+        md.append(f"| **Unmapped Category Volume** | `{unmapped_cnt:,}` (`{unmapped_rate:.2f}%`) | New/unmapped templates captured in observability ledger |")
+        md.append(f"| **Observability Gate Status** | {gate_badge} | Lakehouse schema drift tolerance threshold |")
+        md.append("")
+
+        d_breakdown = sem_conf.get("domain_breakdown", {})
+        if d_breakdown:
+            md.append("### Conformed Service Domain Distribution Hierarchy")
+            md.append("| Canonical Service Domain | Ticket Volume | Share of 311 | Core Municipal Service Scope |")
+            md.append("| :--- | :--- | :--- | :--- |")
+            for d_name, d_cnt in sorted(d_breakdown.items(), key=lambda x: x[1], reverse=True):
+                d_pct = (d_cnt / tot_conf * 100.0) if tot_conf > 0 else 0.0
+                d_desc = domain_descriptions.get(d_name, "Standardized municipal domain")
+                md.append(f"| `{d_name}` | `{d_cnt:,}` | `{d_pct:.2f}%` | {d_desc} |")
+            md.append("")
 
     # Section 3: Weather Reanalysis Quality
     w_in = m_wth.get("input_rows", 0)

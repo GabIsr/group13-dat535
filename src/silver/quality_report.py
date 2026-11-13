@@ -11,9 +11,11 @@ from pathlib import Path
 from typing import Any, Dict
 
 from src.silver.config import (
+    MAX_UNMAPPED_TAXONOMY_RATE_PCT,
     QUALITY_DIR,
     SENSOR_ANOMALY_LEDGER_PATH,
     UNCLASSIFIED_RESOLUTIONS_LEDGER_PATH,
+    UNMAPPED_TAXONOMY_LEDGER_PATH,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -45,6 +47,7 @@ def generate_quality_reconciliation_report(
         "artifacts": {
             "sensor_anomaly_ledger": str(SENSOR_ANOMALY_LEDGER_PATH),
             "unclassified_resolutions_ledger": str(UNCLASSIFIED_RESOLUTIONS_LEDGER_PATH),
+            "unmapped_taxonomy_ledger": str(UNMAPPED_TAXONOMY_LEDGER_PATH),
         },
     }
 
@@ -136,30 +139,29 @@ def generate_quality_reconciliation_report(
                 print(f"      * {cat_name:<34}: {cat_cnt:,} ({cat_pct:.2f}%)")
 
     # Categorical Schema Drift & Semantic Conformance Breakdown
-    # [TEMPORARILY COMMENTED OUT FOR ISOLATED VERIFICATION OF UNSTRUCTURED TEXT MINING]
-    # sem_conf = clean_311_metrics.get("semantic_conformance", {})
-    # if sem_conf:
-    #     print("\n  STAGE 1D: CATEGORICAL SCHEMA DRIFT & CONFORMED TAXONOMY:")
-    #     conf_cnt = sem_conf.get("conformed_records", 0)
-    #     unmap_cnt = sem_conf.get("unmapped_records", 0)
-    #     unmap_rate = sem_conf.get("unmapped_rate_pct", 0.0)
-    #     legacy_cnt = sem_conf.get("legacy_mapped_records", 0)
-    #     conf_rate = (conf_cnt / b_311_valid * 100.0) if b_311_valid > 0 else 0.0
-    #
-    #     print(f"    - Conformed to Canonical Domains      : {conf_cnt:,} ({conf_rate:.2f}%)")
-    #     print(f"    - Historical Legacy Aliases Conformed : {legacy_cnt:,}")
-    #     print(f"    - Unmapped Category Volume (Ledgered) : {unmap_cnt:,} ({unmap_rate:.2f}%)")
-    #     if unmap_rate > MAX_UNMAPPED_TAXONOMY_RATE_PCT:
-    #         print(f"    - [OBSERVABILITY ALERT] Unmapped rate ({unmap_rate}%) exceeds threshold ({MAX_UNMAPPED_TAXONOMY_RATE_PCT}%)!")
-    #     else:
-    #         print(f"    - [OBSERVABILITY GATE] Conformance within acceptable threshold (< {MAX_UNMAPPED_TAXONOMY_RATE_PCT}%)")
-    #
-    #     d_breakdown = sem_conf.get("domain_breakdown", {})
-    #     if d_breakdown:
-    #         print("    Canonical Service Domain Distribution:")
-    #         for d_name, d_cnt in sorted(d_breakdown.items(), key=lambda x: x[1], reverse=True):
-    #             d_pct = (d_cnt / b_311_valid * 100.0) if b_311_valid > 0 else 0.0
-    #             print(f"      * {d_name:<34}: {d_cnt:,} ({d_pct:.2f}%)") # 
+    sem_conf = clean_311_metrics.get("semantic_conformance", {})
+    if sem_conf:
+        print("\n  STAGE 1D: CATEGORICAL SCHEMA DRIFT & CONFORMED TAXONOMY:")
+        conf_cnt = sem_conf.get("conformed_records", 0)
+        unmap_cnt = sem_conf.get("unmapped_records", 0)
+        unmap_rate = sem_conf.get("unmapped_rate_pct", 0.0)
+        legacy_cnt = sem_conf.get("legacy_mapped_records", 0)
+        conf_rate = (conf_cnt / b_311_valid * 100.0) if b_311_valid > 0 else 0.0
+
+        print(f"    - Conformed to Canonical Domains      : {conf_cnt:,} ({conf_rate:.2f}%)")
+        print(f"    - Historical Legacy Aliases Conformed : {legacy_cnt:,}")
+        print(f"    - Unmapped Category Volume (Ledgered) : {unmap_cnt:,} ({unmap_rate:.2f}%)")
+        if unmap_rate > MAX_UNMAPPED_TAXONOMY_RATE_PCT:
+            print(f"    - [OBSERVABILITY ALERT] Unmapped rate ({unmap_rate}%) exceeds threshold ({MAX_UNMAPPED_TAXONOMY_RATE_PCT}%)!")
+        else:
+            print(f"    - [OBSERVABILITY GATE] Conformance within acceptable threshold (< {MAX_UNMAPPED_TAXONOMY_RATE_PCT}%)")
+
+        d_breakdown = sem_conf.get("domain_breakdown", {})
+        if d_breakdown:
+            print("    Canonical Service Domain Distribution:")
+            for d_name, d_cnt in sorted(d_breakdown.items(), key=lambda x: x[1], reverse=True):
+                d_pct = (d_cnt / b_311_valid * 100.0) if b_311_valid > 0 else 0.0
+                print(f"      * {d_name:<34}: {d_cnt:,} ({d_pct:.2f}%)") 
 
     # Weather Reconciliation
     print("\n" + "-" * 90)

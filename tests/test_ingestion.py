@@ -23,6 +23,7 @@ from src.utils.manifest import (
     generate_batch_id,
     get_earliest_watermark,
     get_latest_cdc_watermark,
+    get_latest_pipeline_run_timestamp,
     get_latest_watermark,
     is_batch_completed,
     save_manifest,
@@ -256,6 +257,57 @@ class TestIngestionPipeline(unittest.TestCase):
             # Both watermarks exist cleanly separated!
             self.assertEqual(get_latest_cdc_watermark("nyc_311", manifests_dir=tmp_path), "2026-10-30T10:45:00.000")
             self.assertEqual(get_latest_watermark("nyc_311", manifests_dir=tmp_path), "2026-10-30")
+            # Pipeline execution watermark tracks the latest retrieved_at_utc run timestamp!
+            self.assertEqual(get_latest_pipeline_run_timestamp("nyc_311", manifests_dir=tmp_path), "2026-10-30T11:00:00Z")
+
+    def test_business_mutation_window_clauses(self):
+        """Verify that the 3-Clause Business Mutation Window anchors queries to project start date."""
+        from src.utils.config import PROJECT_START_DATE
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+
+            # Create an existing manifest to establish watermarks
+            m = create_manifest_dict(
+                batch_id="311_20261028_001",
+                dataset_name="nyc_311",
+                source_name="nyc_open_data",
+                source_dataset_id="erm2-nwe9",
+                source_url="https://data.cityofnewyork.us/resource/erm2-nwe9.json",
+                retrieved_at_utc="2026-10-28T14:00:00Z",
+                source_data_start="2026-10-20",
+                source_data_end="2026-10-28T00:00:00.000",
+                extraction_mode="incremental",
+                environment="dev",
+                code_version="git_test",
+                duration_seconds=1.0,
+                byte_size=1000,
+                row_count=100,
+                schema_fingerprint="sha256:test",
+                status="success",
+                files=[],
+            )
+            save_manifest(m, output_dir=tmp_path)
+
+            last_ceiling = get_latest_watermark("nyc_311", manifests_dir=tmp_path)
+            last_run = get_latest_pipeline_run_timestamp("nyc_311", manifests_dir=tmp_path)
+
+            self.assertEqual(last_ceiling, "2026-10-28T00:00:00.000")
+            self.assertEqual(last_run, "2026-10-28T14:00:00Z")
+
+            # Verify 3-clause formulation
+            effective_end = "2026-11-01T23:59:59.000"
+            proj_floor = PROJECT_START_DATE
+            intake_clause = f"(created_date >= '{last_ceiling}' AND created_date <= '{effective_end}')"
+            mutation_clause = f"(resolution_action_updated_date >= '{last_run}' AND created_date >= '{proj_floor}')"
+            closure_clause = f"(closed_date >= '{last_run}' AND created_date >= '{proj_floor}')"
+
+            query = f"({intake_clause} OR {mutation_clause} OR {closure_clause})"
+
+            self.assertIn(f"created_date >= '{last_ceiling}'", query)
+            self.assertIn(f"resolution_action_updated_date >= '{last_run}'", query)
+            self.assertIn(f"created_date >= '{proj_floor}'", query)
+            self.assertIn(f"closed_date >= '{last_run}'", query)
 
 
 if __name__ == "__main__":

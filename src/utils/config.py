@@ -46,6 +46,10 @@ SOURCE_NAME_WEATHER = "open_meteo"
 
 SCHEMA_VERSION = "v1.0"
 
+# Project Universe / Ingestion Floor Boundaries
+# Configurable via DAT535_PROJECT_START_DATE in .env or shell environment
+PROJECT_START_DATE = os.environ.get("DAT535_PROJECT_START_DATE", "2026-07-15T00:00:00.000")
+
 # Open-Meteo Hourly Meteorological Variables
 WEATHER_HOURLY_VARIABLES = [
     "temperature_2m",

@@ -147,6 +147,37 @@ def get_latest_cdc_watermark(dataset_name: str, manifests_dir: Path = MANIFESTS_
     return latest_cdc_watermark
 
 
+def get_latest_pipeline_run_timestamp(dataset_name: str, manifests_dir: Path = MANIFESTS_DIR) -> Optional[str]:
+    """
+    Inspect existing successful manifests for a dataset to determine the highest retrieved_at_utc execution timestamp.
+    Used as the lower bound for mutation stream CDC queries (resolution_action_updated_date >= last_run_timestamp
+    and closed_date >= last_run_timestamp).
+    Returns None if no previous successful batches exist.
+    """
+    manifests_dir = Path(manifests_dir)
+    if not manifests_dir.exists():
+        return None
+
+    pattern = f"{dataset_name}_*.json"
+    manifest_files = list(manifests_dir.glob(pattern))
+    if not manifest_files:
+        return None
+
+    latest_run_ts = None
+    for mf in manifest_files:
+        try:
+            with open(mf, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("status") == "success" and data.get("retrieved_at_utc"):
+                val = str(data["retrieved_at_utc"])
+                if latest_run_ts is None or val > latest_run_ts:
+                    latest_run_ts = val
+        except Exception:
+            continue
+
+    return latest_run_ts
+
+
 def is_batch_completed(batch_id: str, dataset_name: str, manifests_dir: Path = MANIFESTS_DIR) -> bool:
     """Check if an ingestion batch manifest already exists with status 'success' (idempotency check)."""
     manifest_path = Path(manifests_dir) / f"{dataset_name}_{batch_id}.json"
@@ -179,6 +210,7 @@ def create_manifest_dict(
     status: str,
     files: List[Dict[str, Any]],
     cdc_updated_at_watermark: Optional[str] = None,
+    target_coverage_end: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Construct a Tier 1 manifest dictionary complying strictly with specification."""
     d = {
@@ -200,6 +232,8 @@ def create_manifest_dict(
         "status": status,
         "files": files,
     }
+    if target_coverage_end:
+        d["target_coverage_end"] = target_coverage_end
     if cdc_updated_at_watermark:
         d["cdc_updated_at_watermark"] = cdc_updated_at_watermark
     return d

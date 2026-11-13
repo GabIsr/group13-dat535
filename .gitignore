@@ -11,8 +11,11 @@ data/*
 # Parquet & compressed archives (allow reference lookup tables)
 *.parquet
 !data/reference/*.parquet
+!data/reference/**/*.parquet
 *.json.gz
 *.csv.gz
+*.crc
+.*.crc
 
 # Jupyter Notebook Checkpoints
 .ipynb_checkpoints/

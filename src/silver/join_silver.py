@@ -136,6 +136,7 @@ def join_silver_datasets(
     df_joined_spark = (
         df_joined_spark
         .withColumn("is_weather_matched", col("temperature_2m").isNotNull())
+        .withColumn("is_weather_pending", col("temperature_2m").isNull())
         .withColumn("_silver_joined_at_utc", lit(joined_at_utc))
         .withColumn("year", date_format(col("created_at_utc"), "yyyy"))
         .withColumn("month", date_format(col("created_at_utc"), "MM"))

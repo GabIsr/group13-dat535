@@ -6,6 +6,7 @@ Author: Group 13
 """
 
 import argparse
+from datetime import datetime, timedelta, timezone
 import logging
 import os
 import sys
@@ -18,7 +19,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.ingestion.ingest_311 import run_311_ingestion
 from src.ingestion.ingest_weather import run_weather_ingestion
-from src.utils.config import MANIFESTS_DIR
+from src.utils.config import MANIFESTS_DIR, PROJECT_START_DATE
 
 logging.basicConfig(
     level=logging.INFO,
@@ -115,6 +116,24 @@ def main():
         help="Lookback buffer in days when no watermark exists (default: 7)",
     )
     parser.add_argument(
+        "--lag-311",
+        type=int,
+        default=1,
+        help="Target ingestion lag buffer for NYC 311 in days (default: 1 day, D-1)",
+    )
+    parser.add_argument(
+        "--lag-weather",
+        type=int,
+        default=5,
+        help="Target ingestion lag buffer for ECMWF Weather in days (default: 5 days, D-5)",
+    )
+    parser.add_argument(
+        "--project-start-date",
+        type=str,
+        default=PROJECT_START_DATE,
+        help="Project study universe start date (default: from .env or 2026-07-15)",
+    )
+    parser.add_argument(
         "--app-token",
         type=str,
         help="Optional Socrata App Token to avoid public rate throttling",
@@ -129,16 +148,23 @@ def main():
     overall_start = time.time()
     has_error = False
 
+    # Ingestion Latency Decoupling: Calculate independent default ceilings if --end-date is not supplied
+    now_utc = datetime.now(timezone.utc)
+    end_311 = args.end_date or (now_utc - timedelta(days=args.lag_311)).strftime("%Y-%m-%dT23:59:59.000")
+    end_weather = args.end_date or (now_utc - timedelta(days=args.lag_weather)).strftime("%Y-%m-%d")
+
     # 1. NYC 311 Ingestion
     if args.dataset in ["all", "311"]:
         try:
+            logger.info(f"Targeting NYC 311 End Ceiling: {end_311} (Lag: {args.lag_311}d)")
             m_311 = run_311_ingestion(
                 mode=args.mode,
                 start_date=args.start_date,
-                end_date=args.end_date,
+                end_date=end_311,
                 batch_size=args.batch_size,
                 max_records=args.max_records,
                 lookback_days=args.lookback_days,
+                project_start_date=args.project_start_date,
                 app_token=args.app_token or os.environ.get("SOCRATA_APP_TOKEN"),
                 env=args.env,
                 manifests_dir=MANIFESTS_DIR,
@@ -152,12 +178,13 @@ def main():
     # 2. Open-Meteo ERA5-Land Weather Ingestion
     if args.dataset in ["all", "weather"]:
         try:
+            logger.info(f"Targeting Weather End Ceiling: {end_weather} (Lag: {args.lag_weather}d)")
             # Weather mode does not use "bootstrap" directly; maps to "incremental" or "backfill"
             weather_mode = "backfill" if args.mode == "backfill" else "incremental"
             m_wth = run_weather_ingestion(
                 mode=weather_mode,
                 start_date=args.start_date,
-                end_date=args.end_date,
+                end_date=end_weather,
                 lookback_days=args.lookback_days,
                 env=args.env,
                 manifests_dir=MANIFESTS_DIR,

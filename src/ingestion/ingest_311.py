@@ -33,6 +33,7 @@ from src.utils.config import (
     LANDING_DIR,
     MANIFESTS_DIR,
     PROJECT_ROOT,
+    PROJECT_START_DATE,
     SCHEMA_VERSION,
     SOCRATA_311_ENDPOINT,
     SOCRATA_DATASET_ID,
@@ -45,6 +46,7 @@ from src.utils.manifest import (
     generate_batch_id,
     get_git_commit_hash,
     get_latest_cdc_watermark,
+    get_latest_pipeline_run_timestamp,
     get_latest_watermark,
     is_batch_completed,
     save_manifest,
@@ -324,6 +326,7 @@ def run_311_ingestion(
     batch_size: int = 50000,
     max_records: Optional[int] = None,
     lookback_days: int = 7,
+    project_start_date: Optional[str] = None,
     app_token: Optional[str] = None,
     env: str = "dev",
     manifests_dir: Path = MANIFESTS_DIR,
@@ -498,33 +501,50 @@ def run_311_ingestion(
         order_clause = "created_date ASC"
 
         if mode == "incremental":
-            # Guard against pulling 311 tickets ahead of available ERA5-Land weather reanalysis (5-day ECMWF lag)
-            safe_weather_ceiling = (datetime.now(timezone.utc) - timedelta(days=5)).strftime("%Y-%m-%d")
-            effective_end = end_date or f"{safe_weather_ceiling}T23:59:59.000"
-            where_conditions.append(f"created_date <= '{effective_end}'")
+            # Default target ceiling: 1-day municipal lag (D-1) unless end_date is provided
+            default_311_ceiling = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+            effective_end = end_date or f"{default_311_ceiling}T23:59:59.000"
 
-            last_cdc_watermark = get_latest_cdc_watermark(DATASET_311, manifests_dir=manifests_dir)
-            if last_cdc_watermark:
-                logger.info(f"Incremental CDC Strategy: Querying :updated_at > '{last_cdc_watermark}' up to {effective_end}")
-                where_conditions.append(f":updated_at > '{last_cdc_watermark}'")
-                order_clause = ":updated_at ASC"
+            project_start = project_start_date or PROJECT_START_DATE
+            if len(project_start) == 10:
+                project_start = f"{project_start}T00:00:00.000"
+
+            last_created_ceiling = get_latest_watermark(DATASET_311, manifests_dir=manifests_dir)
+            last_run_ts = get_latest_pipeline_run_timestamp(DATASET_311, manifests_dir=manifests_dir)
+
+            if last_created_ceiling and last_run_ts:
+                # Production Hardened: 3-Clause Business Mutation Window
+                logger.info(
+                    f"Incremental CDC Strategy (Business Mutation Window): "
+                    f"Intake [{last_created_ceiling} -> {effective_end}] | "
+                    f"Mutations & Closures >= {last_run_ts} (Project Floor: {project_start})"
+                )
+                intake_clause = f"(created_date >= '{last_created_ceiling}' AND created_date <= '{effective_end}')"
+                mutation_clause = f"(resolution_action_updated_date >= '{last_run_ts}' AND created_date >= '{project_start}')"
+                closure_clause = f"(closed_date >= '{last_run_ts}' AND created_date >= '{project_start}')"
+
+                combined_where = f"({intake_clause} OR {mutation_clause} OR {closure_clause})"
+                where_conditions.append(combined_where)
+                order_clause = "created_date ASC"
+            elif last_created_ceiling:
+                logger.info(f"Discovered initial created_date watermark: {last_created_ceiling}. Bootstrapping incremental stream up to {effective_end}.")
+                where_conditions.append(f"created_date >= '{last_created_ceiling}'")
+                where_conditions.append(f"created_date <= '{effective_end}'")
+                order_clause = "created_date ASC"
             else:
                 if start_date:
                     logger.info(f"Using explicitly specified start_date for incremental bootstrap: {start_date}")
                     where_conditions.append(f"created_date >= '{start_date}'")
+                    where_conditions.append(f"created_date <= '{effective_end}'")
                 else:
-                    last_watermark = get_latest_watermark(DATASET_311, manifests_dir=manifests_dir)
-                    if last_watermark:
-                        logger.info(f"Discovered initial created_date watermark: {last_watermark}. Bootstrapping incremental stream up to {effective_end}.")
-                        where_conditions.append(f"created_date >= '{last_watermark}'")
-                    else:
-                        end_dt = datetime.strptime(effective_end[:10], "%Y-%m-%d")
-                        fallback_days = lookback_days if lookback_days else 7
-                        dynamic_start = (end_dt - timedelta(days=fallback_days)).strftime("%Y-%m-%dT00:00:00.000")
-                        logger.warning(
-                            f"No previous watermark found for incremental mode. Ingesting past {fallback_days} days ({dynamic_start}) up to {effective_end}."
-                        )
-                        where_conditions.append(f"created_date >= '{dynamic_start}'")
+                    end_dt = datetime.strptime(effective_end[:10], "%Y-%m-%d")
+                    fallback_days = lookback_days if lookback_days else 7
+                    dynamic_start = (end_dt - timedelta(days=fallback_days)).strftime("%Y-%m-%dT00:00:00.000")
+                    logger.warning(
+                        f"No previous watermark found for incremental mode. Ingesting past {fallback_days} days ({dynamic_start}) up to {effective_end}."
+                    )
+                    where_conditions.append(f"created_date >= '{dynamic_start}'")
+                    where_conditions.append(f"created_date <= '{effective_end}'")
                 order_clause = "created_date ASC"
         else:
             # Backfill mode: strictly by created_date, does NOT advance CDC watermark
@@ -652,6 +672,7 @@ def run_311_ingestion(
         status="success" if total_rows > 0 else "partial",
         files=manifest_files_list,
         cdc_updated_at_watermark=source_max_updated_at if mode == "incremental" else None,
+        target_coverage_end=effective_end if mode != "bootstrap" else None,
     )
 
     manifest_path = save_manifest(manifest_dict, manifests_dir=manifests_dir)
@@ -670,6 +691,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=50000, help="Records per API page")
     parser.add_argument("--max-records", type=int, help="Optional record limit for testing")
     parser.add_argument("--lookback-days", type=int, default=7, help="Lookback buffer in days when no watermark exists (default: 7)")
+    parser.add_argument("--project-start-date", type=str, default=PROJECT_START_DATE, help="Project study universe start date (default: from .env/config)")
     parser.add_argument("--app-token", type=str, help="Optional Socrata App Token")
     parser.add_argument("--env", choices=["dev", "prod"], default="dev", help="Execution environment")
     parser.add_argument("--landing-only", action="store_true", help="Only dump raw API records into Landing zone; skip Bronze conversion")
@@ -684,6 +706,7 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         max_records=args.max_records,
         lookback_days=args.lookback_days,
+        project_start_date=args.project_start_date,
         app_token=args.app_token,
         env=args.env,
         landing_only=args.landing_only,

@@ -123,7 +123,7 @@ def run_weather_ingestion(
     Writes uncorrupted raw JSON to landing/ and partitioned Parquet to bronze/.
     """
     start_time = time.time()
-    retrieved_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    retrieved_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     batch_id = generate_batch_id("wth", manifests_dir=manifests_dir)
 
     logger.info(f"Starting Weather Ingestion | Batch ID: {batch_id} | Mode: {mode} | Env: {env}")

@@ -341,7 +341,7 @@ def run_311_ingestion(
     Includes --landing-only (dump raw API payloads) and --from-landing-only (PySpark Lakehouse conversion).
     """
     start_time = time.time()
-    retrieved_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    retrieved_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     bronze_311_dir = BRONZE_DIR / "nyc311"
     app_token = app_token or os.environ.get("SOCRATA_APP_TOKEN")
     if app_token:
@@ -511,6 +511,8 @@ def run_311_ingestion(
 
             last_created_ceiling = get_latest_watermark(DATASET_311, manifests_dir=manifests_dir)
             last_run_ts = get_latest_pipeline_run_timestamp(DATASET_311, manifests_dir=manifests_dir)
+            if last_run_ts:
+                last_run_ts = last_run_ts.rstrip("Z")
 
             if last_created_ceiling and last_run_ts:
                 # Production Hardened: 3-Clause Business Mutation Window

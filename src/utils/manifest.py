@@ -169,7 +169,7 @@ def get_latest_pipeline_run_timestamp(dataset_name: str, manifests_dir: Path = M
             with open(mf, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if data.get("status") == "success" and data.get("retrieved_at_utc"):
-                val = str(data["retrieved_at_utc"])
+                val = str(data["retrieved_at_utc"]).rstrip("Z")
                 if latest_run_ts is None or val > latest_run_ts:
                     latest_run_ts = val
         except Exception:

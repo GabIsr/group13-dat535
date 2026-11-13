@@ -257,17 +257,17 @@ class TestIngestionPipeline(unittest.TestCase):
             # Both watermarks exist cleanly separated!
             self.assertEqual(get_latest_cdc_watermark("nyc_311", manifests_dir=tmp_path), "2026-10-30T10:45:00.000")
             self.assertEqual(get_latest_watermark("nyc_311", manifests_dir=tmp_path), "2026-10-30")
-            # Pipeline execution watermark tracks the latest retrieved_at_utc run timestamp!
-            self.assertEqual(get_latest_pipeline_run_timestamp("nyc_311", manifests_dir=tmp_path), "2026-10-30T11:00:00Z")
+            # Pipeline execution watermark tracks the latest retrieved_at_utc run timestamp (stripped of any Z for Socrata floating timestamp compliance)!
+            self.assertEqual(get_latest_pipeline_run_timestamp("nyc_311", manifests_dir=tmp_path), "2026-10-30T11:00:00")
 
     def test_business_mutation_window_clauses(self):
-        """Verify that the 3-Clause Business Mutation Window anchors queries to project start date."""
+        """Verify that the 3-Clause Business Mutation Window anchors queries to project start date and strips trailing Z."""
         from src.utils.config import PROJECT_START_DATE
 
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
 
-            # Create an existing manifest to establish watermarks
+            # Create an existing manifest to establish watermarks (testing legacy 'Z' stripping)
             m = create_manifest_dict(
                 batch_id="311_20261028_001",
                 dataset_name="nyc_311",
@@ -293,7 +293,8 @@ class TestIngestionPipeline(unittest.TestCase):
             last_run = get_latest_pipeline_run_timestamp("nyc_311", manifests_dir=tmp_path)
 
             self.assertEqual(last_ceiling, "2026-10-28T00:00:00.000")
-            self.assertEqual(last_run, "2026-10-28T14:00:00Z")
+            # Must be cleanly stripped of 'Z' for Socrata floating timestamp compliance
+            self.assertEqual(last_run, "2026-10-28T14:00:00")
 
             # Verify 3-clause formulation
             effective_end = "2026-11-01T23:59:59.000"

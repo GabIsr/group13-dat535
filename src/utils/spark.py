@@ -188,7 +188,7 @@ def get_spark_session(
         .config("spark.sql.parquet.dictionary.enabled", "true")
         .config("spark.hadoop.parquet.block.size", "134217728")
         .config("spark.sql.execution.arrow.maxRecordsPerBatch", "50000")
-        .config("spark.sql.codegen.maxFields", "100")
+        .config("spark.sql.codegen.maxFields", "30")
         .config("spark.sql.codegen.splitExpressions", "true")
         .config("spark.sql.codegen.methodSplitThreshold", "512")
         .config("spark.sql.debug.maxToStringFields", "200")
@@ -205,6 +205,25 @@ def get_spark_session(
 
     spark = builder.getOrCreate()
     spark.sparkContext.setLogLevel(log_level)
+
+    # Always enforce runtime SQL configs even when reusing an active SparkSession
+    runtime_sql_configs = {
+        "spark.sql.codegen.maxFields": "30",
+        "spark.sql.codegen.splitExpressions": "true",
+        "spark.sql.codegen.methodSplitThreshold": "512",
+        "spark.sql.adaptive.enabled": "true",
+        "spark.sql.adaptive.coalescePartitions.enabled": "true",
+        "spark.sql.adaptive.skewJoin.enabled": "true",
+        "spark.sql.adaptive.skewJoin.skewedPartitionFactor": "3",
+        "spark.sql.adaptive.skewJoin.skewedPartitionThresholdInBytes": "67108864",
+        "spark.sql.sources.partitionOverwriteMode": "dynamic",
+        "spark.sql.execution.arrow.maxRecordsPerBatch": "50000",
+    }
+    for k, v in runtime_sql_configs.items():
+        try:
+            spark.conf.set(k, v)
+        except Exception:
+            pass
 
     logger.debug(f"SparkSession '{app_name}' active (Spark v{spark.version})")
     return spark

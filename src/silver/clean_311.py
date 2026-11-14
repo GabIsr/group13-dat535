@@ -565,6 +565,8 @@ def impute_spatial_and_canonicalize_routes(
             .otherwise(initcap(trim(col("complaint_type")))),
         )
     df = normalize_all_spatial_features(df)
+    # Truncate Catalyst AST lineage between regex cleaning and 6-route routing to keep WholeStageCodegen JVM bytecode < 30 KB
+    df = df.localCheckpoint(eager=True)
 
     logger.info("Evaluating 6-Route Hierarchical Spatial Routing in PySpark...")
     df = generate_hierarchical_location_keys(df)
@@ -828,7 +830,7 @@ def clean_and_validate_311(
     now_epoch = int(datetime.now(timezone.utc).timestamp())
 
     if staging_dir is None:
-        staging_dir = silver_311_dir.parent / ".staging_311"
+        staging_dir = silver_311_dir.parent / "staging_311"
 
     bronze_files = sorted(bronze_311_dir.glob("**/*.parquet"))
     if not bronze_files:
@@ -927,7 +929,7 @@ def clean_and_validate_311(
             df_clustered.write.mode("overwrite").parquet(str(staging_clustered_dir))
             step_cluster.set_output_rows(candidate_count - duplicate_rows_removed)
 
-        # Truncate AST lineage from clustering so downstream stages never re-trigger applyInPandas
+        # Truncate AST lineage from clustering so downstream stages never re-trigger
         df_clustered_persisted = spark.read.parquet(str(staging_clustered_dir))
 
         # Step 2B: Categorical Schema Drift & Semantic Conformance (Issue #8)

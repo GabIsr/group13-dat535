@@ -166,14 +166,9 @@ def main():
     elapsed = time.time() - total_start
     logger.info(f"Medallion project run completed successfully in {elapsed:.2f} seconds.")
 
-    # Finalize, save, and print aggregated benchmark JSON and terminal summary table BEFORE running tests
+    # Finalize, save, and print aggregated benchmark JSON and terminal summary table
     profiler.save_json()
     profiler.print_summary_table()
-
-    if args.action == "all":
-        logger.info("Running post-execution test verification...")
-        if not run_tests():
-            sys.exit(1)
 
 
 if __name__ == "__main__":

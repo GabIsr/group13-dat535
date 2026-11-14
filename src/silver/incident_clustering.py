@@ -7,10 +7,11 @@ Author: Group 13
 """
 
 import logging
+from datetime import datetime, timedelta
 from typing import Dict, Any, Optional
 import numpy as np
 import pandas as pd
-from pyspark.sql import DataFrame
+from pyspark.sql import DataFrame, Row
 from pyspark.sql.functions import (
     coalesce,
     col,
@@ -241,12 +242,13 @@ def cluster_citizen_call_bursts(
     num_partitions: int = 100,
 ) -> DataFrame:
     """
-    Applies adaptive burst deduplication using PySpark applyInPandas on locatable records.
+    Applies adaptive burst deduplication using pure PySpark mapPartitions on locatable records.
     Safeguards:
       1. Isolates unlocatable records (loc_key is null) before clustering to eliminate shuffle skew.
-      2. Groups only by loc_key and complaint_type (never loc_env) to prevent false splits.
+      2. Groups and repartitions by (loc_key, complaint_type) to isolate failure domains.
       3. Uses Ticket-1 anchored window cutoff: max(T_0 + burst_window_hours, Ticket_1_closed_at_utc).
       4. Left-joins cluster attributes back on unique_key and coalesces unlocated records.
+      5. Operates on pure Python iterators over RDD partitions without PyArrow/Pandas deserialization bottlenecks.
     """
     cols = set(df.columns)
     if "complaint_type" not in cols:
@@ -262,8 +264,63 @@ def cluster_citizen_call_bursts(
         .select("unique_key", "loc_key", "complaint_type", "created_at_utc", "closed_at_utc")
     )
 
-    # 2. Add deterministic partition bucket for distributed Spark executors
-    df_locatable = df_locatable.withColumn("_cluster_bucket", pmod(spark_hash(col("loc_key")), lit(num_partitions)))
+    # 2. Deterministic repartitioning by (loc_key, complaint_type)
+    rdd_partitioned = df_locatable.repartition(num_partitions, col("loc_key"), col("complaint_type")).rdd
+    window_delta = timedelta(seconds=burst_window_hours * 3600)
+
+    def partition_worker(iterator):
+        rows = list(iterator)
+        if not rows:
+            return []
+
+        rows.sort(key=lambda r: (r.loc_key or "", r.complaint_type or "", r.created_at_utc or datetime.min, r.unique_key))
+
+        result_items = []
+        cluster_sizes = {}
+
+        curr_k = None
+        curr_c = None
+        anchor_cr = None
+        anchor_cutoff = None
+        curr_cluster_id = None
+        curr_seq = 1
+
+        for r in rows:
+            k = r.loc_key
+            c = r.complaint_type
+            cr = r.created_at_utc
+            cl = r.closed_at_utc
+            uk = r.unique_key
+
+            if (k != curr_k) or (c != curr_c) or (anchor_cutoff is None) or (cr > anchor_cutoff):
+                curr_k = k
+                curr_c = c
+                anchor_cr = cr
+                min_cutoff = cr + window_delta if cr else None
+                if cl is not None and min_cutoff is not None and cl > min_cutoff:
+                    anchor_cutoff = cl
+                else:
+                    anchor_cutoff = min_cutoff
+                curr_cluster_id = uk
+                curr_seq = 1
+                cluster_sizes[curr_cluster_id] = 1
+                result_items.append((uk, False, 1, f"INC_{curr_cluster_id}", anchor_cr, curr_cluster_id))
+            else:
+                curr_seq += 1
+                cluster_sizes[curr_cluster_id] += 1
+                result_items.append((uk, True, curr_seq, f"INC_{curr_cluster_id}", anchor_cr, curr_cluster_id))
+
+        output_rows = []
+        for uk, is_dup, seq, cid_str, first_ts, cid in result_items:
+            output_rows.append(Row(
+                unique_key=uk,
+                is_burst_duplicate=is_dup,
+                burst_sequence_num=seq,
+                incident_cluster_id=cid_str,
+                incident_first_created_at_utc=first_ts,
+                cluster_size=cluster_sizes[cid]
+            ))
+        return output_rows
 
     cluster_schema = StructType([
         StructField("unique_key", LongType(), True),
@@ -271,19 +328,12 @@ def cluster_citizen_call_bursts(
         StructField("burst_sequence_num", IntegerType(), True),
         StructField("incident_cluster_id", StringType(), True),
         StructField("incident_first_created_at_utc", TimestampType(), True),
-        StructField("_cluster_bucket", IntegerType(), True),
         StructField("cluster_size", IntegerType(), True),
     ])
 
-    def sessionize_wrapper(pdf: pd.DataFrame) -> pd.DataFrame:
-        return _sessionize_partition_udf(pdf, burst_window_hours=burst_window_hours)
-
-    # 3. Distributed sessionization
-    df_clustered_attrs = (
-        df_locatable.groupBy("_cluster_bucket")
-        .applyInPandas(sessionize_wrapper, schema=cluster_schema)
-        .drop("_cluster_bucket")
-    )
+    spark_sess = df.sparkSession
+    rdd_out = rdd_partitioned.mapPartitions(partition_worker)
+    df_clustered_attrs = spark_sess.createDataFrame(rdd_out, schema=cluster_schema)
 
     # 4. Left Join back to the full dataset on unique_key
     df_final = df.join(df_clustered_attrs, on="unique_key", how="left")

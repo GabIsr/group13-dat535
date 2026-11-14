@@ -498,25 +498,16 @@ def enrich_weather_attributes(df: DataFrame, processed_at_utc: str) -> DataFrame
 def write_silver_weather(df_silver: DataFrame, silver_weather_dir: Path) -> int:
     """
     Write partitioned Parquet dataset to disk structured by grid_id and year.
-    Uses pure PySpark with directory partitioning, keeping grid_id and year in Parquet schema.
+    Uses pure PySpark with distributed directory partitioning, keeping grid_id and year in Parquet schema.
     """
     silver_weather_dir.mkdir(parents=True, exist_ok=True)
-    partitions = df_silver.select("grid_id", "year").distinct().collect()
-    written_files = 0
-    for row in partitions:
-        g_id = row["grid_id"]
-        yr = row["year"]
-        part_dir = silver_weather_dir / f"grid_id={g_id}" / f"year={yr}"
-        part_dir.mkdir(parents=True, exist_ok=True)
-        (
-            df_silver.filter((col("grid_id") == g_id) & (col("year") == yr))
-            .coalesce(1)
-            .write.mode("overwrite")
-            .parquet(str(part_dir))
-        )
-        written_files += 1
-
-    return written_files
+    (
+        df_silver.write
+        .mode("overwrite")
+        .partitionBy("grid_id", "year")
+        .parquet(str(silver_weather_dir))
+    )
+    return len(list(silver_weather_dir.glob("**/*.parquet")))
 
 
 def clean_and_validate_weather(

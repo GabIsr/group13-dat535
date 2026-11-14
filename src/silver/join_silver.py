@@ -62,8 +62,7 @@ def join_silver_datasets(
         logger.info("Initializing PySpark session for Silver Broadcast Join...")
         spark = get_spark_session("DAT535-Silver-Join")
 
-        file_paths_311 = [str(f.resolve()) for f in files_311]
-        df_311_spark = spark.read.parquet(*file_paths_311)
+        df_311_spark = spark.read.parquet(str(silver_311_dir))
 
         # Optional partition pruning if date range is specified
         if start_date:
@@ -76,8 +75,7 @@ def join_silver_datasets(
         total_311 = df_311_spark.count()
         logger.info(f"Loaded {total_311:,} clean 311 records into PySpark.")
 
-        file_paths_weather = [str(f.resolve()) for f in files_weather]
-        df_weather_spark = spark.read.parquet(*file_paths_weather)
+        df_weather_spark = spark.read.parquet(str(silver_weather_dir))
 
         if start_date:
             df_weather_spark = df_weather_spark.filter(col("timestamp_utc") >= lit(start_date))

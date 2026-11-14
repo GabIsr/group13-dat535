@@ -840,10 +840,9 @@ def clean_and_validate_311(
     profiler = get_profiler()
 
     with profiler.measure_step("silver_311", "bronze_scan_and_pruning") as step_scan:
-        logger.info(f"Loading {len(bronze_files)} Bronze 311 partition files into PySpark...")
+        logger.info(f"Loading Bronze 311 partition data into PySpark from {bronze_311_dir}...")
         spark = get_spark_session("DAT535-Silver-Clean-311")
-        file_paths = [str(f.resolve()) for f in bronze_files]
-        df_raw = spark.read.parquet(*file_paths)
+        df_raw = spark.read.parquet(str(bronze_311_dir))
 
         # Optional partition pruning if date range is specified
         if start_date:
@@ -905,37 +904,27 @@ def clean_and_validate_311(
         df_dedup, duplicate_rows_removed = deduplicate_311_records(df_valid_candidates)
         step_dedup.set_output_rows(candidate_count - duplicate_rows_removed)
 
-    with profiler.measure_step("silver_311", "spatial_imputation_and_staging_write", input_rows=candidate_count - duplicate_rows_removed) as step_spat:
+    with profiler.measure_step("silver_311", "spatial_imputation_and_canonicalization", input_rows=candidate_count - duplicate_rows_removed) as step_spat:
         df_spatial_clean = impute_spatial_and_canonicalize_routes(df_dedup, spark)
-        # MATERIALIZE PHASE 1 TO TRANSIENT STAGING: Completely truncates Catalyst AST lineage
-        staging_dir.mkdir(parents=True, exist_ok=True)
-        df_spatial_clean.write.mode("overwrite").parquet(str(staging_dir))
         step_spat.set_output_rows(candidate_count - duplicate_rows_removed)
-    logger.info(f"Phase 1 materialized to transient staging: {staging_dir}")
 
     success = False
-    staging_clustered_dir = staging_dir.parent / f"{staging_dir.name}_clustered"
     try:
         # =========================================================================
         # PHASE 2: Stateful Burst Clustering, Enrichment & Final Partition Write
         # =========================================================================
-        logger.info("Executing Silver 311 Phase 2: Burst clustering from clean staging...")
+        logger.info("Executing Silver 311 Phase 2: Zero-copy Arrow burst clustering & enrichment...")
 
         # Step 2A: Stateful Citizen Call Burst Clustering Sessionization
-        df_staging = spark.read.parquet(str(staging_dir))
         with profiler.measure_step("silver_311", "burst_clustering_sessionization", input_rows=candidate_count - duplicate_rows_removed) as step_cluster:
-            df_clustered = cluster_citizen_call_bursts(df_staging, burst_window_hours=6.0)
-            staging_clustered_dir.mkdir(parents=True, exist_ok=True)
-            df_clustered.write.mode("overwrite").parquet(str(staging_clustered_dir))
+            df_clustered = cluster_citizen_call_bursts(df_spatial_clean, burst_window_hours=6.0)
+            df_clustered = df_clustered.localCheckpoint(eager=True)
             step_cluster.set_output_rows(candidate_count - duplicate_rows_removed)
-
-        # Truncate AST lineage from clustering so downstream stages never re-trigger
-        df_clustered_persisted = spark.read.parquet(str(staging_clustered_dir))
 
         # Step 2B: Categorical Schema Drift & Semantic Conformance (Issue #8)
         logger.info("Executing PySpark Categorical Schema Drift & Semantic Conformance...")
         with profiler.measure_step("silver_311", "taxonomy_conformance_and_ledger", input_rows=candidate_count - duplicate_rows_removed) as step_tax:
-            df_conformed = conform_complaint_taxonomy(df_clustered_persisted, spark=spark, reference_path=TAXONOMY_REFERENCE_PATH)
+            df_conformed = conform_complaint_taxonomy(df_clustered, spark=spark, reference_path=TAXONOMY_REFERENCE_PATH)
             upsert_unmapped_taxonomy_ledger(df_conformed, spark, ledger_path=UNMAPPED_TAXONOMY_LEDGER_PATH)
             step_tax.set_output_rows(candidate_count - duplicate_rows_removed)
 
@@ -1051,26 +1040,22 @@ def clean_and_validate_311(
             unmapped_rate = round((unmapped_cnt / valid_rows_accepted * 100.0), 2) if valid_rows_accepted > 0 else 0.0
             conformed_rate = round((conformed_cnt / valid_rows_accepted * 100.0), 2) if valid_rows_accepted > 0 else 0.0
 
-            spatial_rows = df_written.groupBy("spatial_resolution_level").count().collect()
-            spatial_stats = {r["spatial_resolution_level"]: int(r["count"]) for r in spatial_rows}
-
-            if "loc_routing_type" in cols_silver:
-                route_rows = df_written.groupBy("loc_routing_type").count().collect()
-                routes_dict = {r["loc_routing_type"]: int(r["count"]) for r in route_rows}
-            else:
-                routes_dict = {}
-
-            if "resolution_outcome_category" in cols_silver:
-                res_rows = df_written.groupBy("resolution_outcome_category").count().collect()
-                res_dict = {r["resolution_outcome_category"]: int(r["count"]) for r in res_rows}
-            else:
-                res_dict = {}
-
-            if "canonical_service_domain" in cols_silver:
-                domain_rows = df_written.groupBy("canonical_service_domain").count().collect()
-                domain_dict = {r["canonical_service_domain"]: int(r["count"]) for r in domain_rows}
-            else:
-                domain_dict = {}
+            breakdown_cols = [c for c in ["spatial_resolution_level", "loc_routing_type", "resolution_outcome_category", "canonical_service_domain"] if c in cols_silver]
+            df_grouped = df_written.groupBy(*breakdown_cols).count().collect()
+            spatial_stats = {}
+            routes_dict = {}
+            res_dict = {}
+            domain_dict = {}
+            for r in df_grouped:
+                c = int(r["count"])
+                s = r["spatial_resolution_level"] if "spatial_resolution_level" in r else None
+                if s: spatial_stats[s] = spatial_stats.get(s, 0) + c
+                rt = r["loc_routing_type"] if "loc_routing_type" in r else None
+                if rt: routes_dict[rt] = routes_dict.get(rt, 0) + c
+                res = r["resolution_outcome_category"] if "resolution_outcome_category" in r else None
+                if res: res_dict[res] = res_dict.get(res, 0) + c
+                dom = r["canonical_service_domain"] if "canonical_service_domain" in r else None
+                if dom: domain_dict[dom] = domain_dict.get(dom, 0) + c
         else:
             closed_count = 0
             open_count = 0
@@ -1147,18 +1132,8 @@ def clean_and_validate_311(
             "status": "success",
         }
     finally:
-        # EPHEMERAL CLEANUP: Intermediate staging scratch directories are cleaned up on success
-        if success and staging_dir.exists():
+        if staging_dir and staging_dir.exists():
             shutil.rmtree(staging_dir, ignore_errors=True)
-            logger.info(f"Ephemeral staging directory cleaned up successfully: {staging_dir}")
-        elif not success and staging_dir.exists():
-            logger.warning(f"Preserving intermediate staging directory for root-cause triage: {staging_dir}")
-
-        if success and staging_clustered_dir.exists():
-            shutil.rmtree(staging_clustered_dir, ignore_errors=True)
-            logger.info(f"Ephemeral clustered staging directory cleaned up successfully: {staging_clustered_dir}")
-        elif not success and staging_clustered_dir.exists():
-            logger.warning(f"Preserving intermediate clustered staging directory for triage: {staging_clustered_dir}")
 
 
 if __name__ == "__main__":

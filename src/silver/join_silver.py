@@ -181,11 +181,35 @@ def join_silver_datasets(
         f"Join Results: {matched_count:,} matched ({match_rate}%) | {unmatched_count:,} unmatched."
     )
 
-    # 4. Write Partitioned Fact Table directly with PySpark distributed write
+    # 4. Column Pruning: Drop internal bronze metadata, raw regex artifacts, and intermediate flags
+    # before writing to disk, cutting serialization footprint by ~40% (P3 Optimization)
+    cols_to_drop = [
+        "_batch_id", "_ingested_at_utc", "_source_file", "_source_name",
+        "_extraction_mode", "_schema_version", "_raw_row_hash", "_bronze_status",
+        "source_created_at", "source_updated_at", "created_date", "closed_date",
+        "due_date", "resolution_action_updated_date", "due_date_utc",
+        "resolution_action_updated_date_utc", "x_coordinate_state_plane",
+        "y_coordinate_state_plane", "taxi_company_borough", "taxi_pick_up_location",
+        "vehicle_type", "road_ramp", "facility_type", "descriptor_2",
+        "clean_resolution_text", "quality_audit_notes",
+        "bridge_highway_direction", "bridge_highway_name", "bridge_highway_segment",
+        "intersection_street_1", "intersection_street_2", "cross_street_1", "cross_street_2",
+        "s1_raw", "s2_raw", "has_valid_cross_streets", "has_valid_highway",
+        "has_valid_fallback_address", "has_valid_bbl", "has_valid_house_number",
+        "is_out_of_state_zip", "is_valid_borough", "is_known_agency",
+        "clean_police_precinct", "is_status_conflict", "is_extreme_duration",
+        "clean_bbl", "house_num_extracted", "clean_street_name",
+        "clean_cross_street_a", "clean_cross_street_b", "clean_highway_name",
+        "clean_highway_segment", "clean_highway_direction", "clean_incident_address",
+        "clean_landmark", "clean_park_facility_name",
+    ]
+    df_joined_pruned = df_joined_spark.drop(*[c for c in cols_to_drop if c in df_joined_spark.columns])
+
+    # 5. Write Partitioned Fact Table directly with PySpark distributed write
     with profiler.measure_step("unified_fact_join", "fact_table_partition_write", input_rows=total_311) as step_write:
         output_joined_dir.mkdir(parents=True, exist_ok=True)
         (
-            df_joined_spark.write
+            df_joined_pruned.write
             .mode("overwrite")
             .partitionBy("year", "month")
             .parquet(str(output_joined_dir))

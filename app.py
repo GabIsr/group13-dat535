@@ -102,9 +102,29 @@ def load_gold_data() -> Tuple[
     """Load pre-aggregated Gold marts and spatial reference data."""
     demand_df, perf_df, vuln_df, centroids_df = None, None, None, None
 
-    p_demand = GOLD_MARTS_DIR / "daily_service_demand.parquet"
-    p_perf = GOLD_MARTS_DIR / "agency_resolution_performance.parquet"
-    p_vuln = GOLD_MARTS_DIR / "zip_infrastructure_vulnerability.parquet"
+    cand_demand = [
+        GOLD_MARTS_DIR / "gold_daily_service_demand.parquet",
+        GOLD_MARTS_DIR / "gold_daily_service_demand",
+        GOLD_MARTS_DIR / "daily_service_demand.parquet",
+        GOLD_MARTS_DIR / "daily_service_demand",
+    ]
+    p_demand = next((p for p in cand_demand if p.exists()), cand_demand[0])
+
+    cand_perf = [
+        GOLD_MARTS_DIR / "gold_agency_resolution_performance.parquet",
+        GOLD_MARTS_DIR / "gold_agency_resolution_performance",
+        GOLD_MARTS_DIR / "agency_resolution_performance.parquet",
+        GOLD_MARTS_DIR / "agency_resolution_performance",
+    ]
+    p_perf = next((p for p in cand_perf if p.exists()), cand_perf[0])
+
+    cand_vuln = [
+        GOLD_MARTS_DIR / "gold_zip_infrastructure_vulnerability.parquet",
+        GOLD_MARTS_DIR / "gold_zip_infrastructure_vulnerability",
+        GOLD_MARTS_DIR / "zip_infrastructure_vulnerability.parquet",
+        GOLD_MARTS_DIR / "zip_infrastructure_vulnerability",
+    ]
+    p_vuln = next((p for p in cand_vuln if p.exists()), cand_vuln[0])
     p_centroids = REF_DIR / "nyc_zip_centroids.parquet"
 
     if p_demand.exists():

@@ -30,21 +30,36 @@ def _is_valid_street_expr(col_expr: Column) -> Column:
     return col_expr.isNotNull() & ~s.isin(INVALID_PLACEHOLDERS)
 
 
+def clean_simple_name_expr(col_or_name: Union[str, Column]) -> Column:
+    """
+    Lighter normalization for landmarks and public parks:
+    Strips non-semantic punctuation, collapses redundant whitespace, converts to uppercase.
+    """
+    c = col(col_or_name) if isinstance(col_or_name, str) else col_or_name
+    raw_s = upper(trim(c.cast("string")))
+    is_valid = raw_s.isNotNull() & ~raw_s.isin(INVALID_PLACEHOLDERS)
+    c = regexp_replace(raw_s, r"[.,\/#;\"\']", " ")
+    c = trim(regexp_replace(c, r"\s+", " "))
+    return when(is_valid & (c != ""), c).otherwise(lit(None).cast("string"))
+
+
 def canonicalize_street_name_expr(col_or_name: Union[str, Column]) -> Column:
     """
     Construct a PySpark Column expression that canonicalizes a street name or address string:
-    1. Trims, converts to uppercase.
+    1. Trims, converts to uppercase, pre-checks valid placeholder status.
     2. Preserves Queens hyphenated house numbers (e.g., '100-02', '14-19') while standardizing spacing.
     3. Removes non-semantic punctuation (periods, commas, quotes, slashes, hash signs).
     4. Replaces isolated hyphens while leaving digit-hyphen-digit numbers intact.
     5. Preserves distinct street names containing directionals (e.g. 'WEST END AVE', 'EAST END AVE').
-    6. Canonicalizes leading directional prefixes (NORTH -> N, SOUTH -> S, EAST -> E, WEST -> W).
+    6. Canonicalizes leading directional prefixes (NORTH -> N, SOUTH -> S, EAST -> E, WEST -> W) via collapsed regexes.
     7. Canonicalizes standard NYC street suffixes (AVENUE -> AVE, STREET -> ST, etc.).
-    8. Collapses redundant whitespace and maps invalid placeholders to SQL NULL.
+    8. Collapses redundant whitespace and maps invalid placeholders to SQL NULL without expression duplication.
     """
     c = col(col_or_name) if isinstance(col_or_name, str) else col_or_name
-    c = upper(trim(c.cast("string")))
+    raw_s = upper(trim(c.cast("string")))
+    is_valid = raw_s.isNotNull() & ~raw_s.isin(INVALID_PLACEHOLDERS)
 
+    c = raw_s
     # 1. Normalize spaces around hyphens in Queens-style house numbers: '100 - 02' -> '100-02'
     c = regexp_replace(c, r"(\d+)\s*-\s*(\d+)", "$1-$2")
 
@@ -59,17 +74,11 @@ def canonicalize_street_name_expr(col_or_name: Union[str, Column]) -> Column:
     c = regexp_replace(c, r"\b(W|WEST)\s+END\b", "WEST END")
     c = regexp_replace(c, r"\b(E|EAST)\s+END\b", "EAST END")
 
-    # 5. Canonicalize leading directional prefixes (at start of string or immediately after house number)
-    # E.g. 'NORTH BROADWAY' -> 'N BROADWAY', '350 WEST 42ND ST' -> '350 W 42ND ST'
-    c = regexp_replace(c, r"^NORTH\b", "N")
-    c = regexp_replace(c, r"^SOUTH\b", "S")
-    c = regexp_replace(c, r"^EAST\b(?!\s+END\b)", "E")
-    c = regexp_replace(c, r"^WEST\b(?!\s+END\b)", "W")
-
-    c = regexp_replace(c, r"^(\d+[\w\-]*\s+)NORTH\b", "$1N")
-    c = regexp_replace(c, r"^(\d+[\w\-]*\s+)SOUTH\b", "$1S")
-    c = regexp_replace(c, r"^(\d+[\w\-]*\s+)EAST\b(?!\s+END\b)", "$1E")
-    c = regexp_replace(c, r"^(\d+[\w\-]*\s+)WEST\b(?!\s+END\b)", "$1W")
+    # 5. Collapsed directional regexes (4 regexes instead of 8, preserving $1 house prefix)
+    c = regexp_replace(c, r"^((?:\d+[\w\-]*\s+)?)NORTH\b", "$1N")
+    c = regexp_replace(c, r"^((?:\d+[\w\-]*\s+)?)SOUTH\b", "$1S")
+    c = regexp_replace(c, r"^((?:\d+[\w\-]*\s+)?)EAST\b(?!\s+END\b)", "$1E")
+    c = regexp_replace(c, r"^((?:\d+[\w\-]*\s+)?)WEST\b(?!\s+END\b)", "$1W")
 
     # 6. Canonicalize standard NYC street suffix variants
     c = regexp_replace(c, r"\b(AVENUE|AV)\b", "AVE")
@@ -87,10 +96,10 @@ def canonicalize_street_name_expr(col_or_name: Union[str, Column]) -> Column:
     c = regexp_replace(c, r"\b(TURNPIKE)\b", "TPKE")
 
     # 7. Collapse multiple spaces into one space and trim
-    c = regexp_replace(c, r"\s+", " ")
-    c = trim(c)
+    c = trim(regexp_replace(c, r"\s+", " "))
 
-    return when(c.isin(INVALID_PLACEHOLDERS), lit(None).cast("string")).otherwise(c)
+    # Return NULL if invalid placeholder or collapsed to empty string (Zero duplicate evaluation of regex tree)
+    return when(is_valid & (c != ""), c).otherwise(lit(None).cast("string"))
 
 
 def normalize_bbl_and_house_numbers(df: DataFrame) -> DataFrame:
@@ -186,9 +195,9 @@ def standardize_cross_streets(df: DataFrame) -> DataFrame:
     else:
         s2_raw = lit(None).cast("string")
 
-    # 3. Canonicalize candidate street expressions directly (Zero temporary column collision)
-    s1_clean = canonicalize_street_name_expr(s1_raw)
-    s2_clean = canonicalize_street_name_expr(s2_raw)
+    # 3. Canonicalize candidate street expressions via temporary projection (avoids 6x Catalyst AST duplication)
+    df = df.withColumn("_s1_clean", canonicalize_street_name_expr(s1_raw))
+    df = df.withColumn("_s2_clean", canonicalize_street_name_expr(s2_raw))
 
     # 4. Canonicalize raw street_name (used for Blockface route)
     if "street_name" in cols:
@@ -198,20 +207,20 @@ def standardize_cross_streets(df: DataFrame) -> DataFrame:
 
     # 5. Lexicographical sorting: street_a = least, street_b = greatest
     valid_intersection = (
-        s1_clean.isNotNull()
-        & s2_clean.isNotNull()
-        & (s1_clean != s2_clean)
+        col("_s1_clean").isNotNull()
+        & col("_s2_clean").isNotNull()
+        & (col("_s1_clean") != col("_s2_clean"))
     )
 
     df = df.withColumn(
         "clean_cross_street_a",
-        when(valid_intersection, least(s1_clean, s2_clean)).otherwise(lit(None).cast("string")),
+        when(valid_intersection, least(col("_s1_clean"), col("_s2_clean"))).otherwise(lit(None).cast("string")),
     )
     df = df.withColumn(
         "clean_cross_street_b",
-        when(valid_intersection, greatest(s1_clean, s2_clean)).otherwise(lit(None).cast("string")),
+        when(valid_intersection, greatest(col("_s1_clean"), col("_s2_clean"))).otherwise(lit(None).cast("string")),
     )
-    df = df.withColumn("has_valid_cross_streets", valid_intersection)
+    df = df.withColumn("has_valid_cross_streets", valid_intersection).drop("_s1_clean", "_s2_clean")
 
     return df
 
@@ -280,12 +289,12 @@ def canonicalize_fallback_addresses(df: DataFrame) -> DataFrame:
         df = df.withColumn("clean_incident_address", lit(None).cast("string"))
 
     if "landmark" in cols:
-        df = df.withColumn("clean_landmark", canonicalize_street_name_expr("landmark"))
+        df = df.withColumn("clean_landmark", clean_simple_name_expr("landmark"))
     else:
         df = df.withColumn("clean_landmark", lit(None).cast("string"))
 
     if "park_facility_name" in cols:
-        df = df.withColumn("clean_park_facility_name", canonicalize_street_name_expr("park_facility_name"))
+        df = df.withColumn("clean_park_facility_name", clean_simple_name_expr("park_facility_name"))
     else:
         df = df.withColumn("clean_park_facility_name", lit(None).cast("string"))
 
@@ -297,10 +306,17 @@ def canonicalize_fallback_addresses(df: DataFrame) -> DataFrame:
 
 def normalize_all_spatial_features(df: DataFrame) -> DataFrame:
     """
-    Pipeline orchestrator that applies all prerequisite spatial cleaning functions in sequence.
+    Pipeline orchestrator that applies spatial cleaning in two discrete projection phases
+    with a localCheckpoint boundary to guarantee WholeStageCodegen JVM method size < 35 KB.
     """
+    # Phase A: BBL Tax Lots, Highway Corridors, and Fallback Addresses
     df = normalize_bbl_and_house_numbers(df)
-    df = standardize_cross_streets(df)
     df = normalize_highway_corridors(df)
     df = canonicalize_fallback_addresses(df)
+
+    # Lineage truncation / WholeStageCodegen split boundary (JVM bytecode < 35 KB)
+    df = df.localCheckpoint(eager=True)
+
+    # Phase B: Cross-street intersection canonicalization & ordering
+    df = standardize_cross_streets(df)
     return df

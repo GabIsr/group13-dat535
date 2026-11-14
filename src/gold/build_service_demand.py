@@ -18,6 +18,7 @@ from pyspark.sql.functions import (
     col,
     count as spark_count,
     countDistinct,
+    date_format,
     dayofweek,
     lit,
     max as spark_max,
@@ -169,8 +170,8 @@ def build_daily_service_demand_mart(
         .withColumn("is_extreme_weather_day", coalesce(col("is_extreme_weather_day"), lit(False)))
         .withColumn("hours_of_precipitation", coalesce(col("hours_of_precipitation"), lit(0)))
         .withColumn("closed_complaint_count", coalesce(col("closed_complaint_count"), lit(0)))
-        .withColumn("year", spark_year(col("date")))
-        .withColumn("month", spark_month(col("date")))
+        .withColumn("year", date_format(col("date"), "yyyy"))
+        .withColumn("month", date_format(col("date"), "MM"))
         .withColumn("day_of_week", (dayofweek(col("date")) + 5) % 7)
         .withColumn("is_weekend", col("day_of_week").isin([5, 6]))
         .withColumn("_gold_built_at_utc", lit(built_at_utc))
@@ -190,10 +191,20 @@ def build_daily_service_demand_mart(
     if distinct_grains != mart_rows:
         raise ValueError(f"Grain uniqueness violation: {mart_rows - distinct_grains} duplicate keys on grain")
 
-    # 8. Write Parquet Mart using PySpark distributed write
+    # 8. Write Parquet Mart using PySpark distributed write partitioned by year and month
     output_dir.mkdir(parents=True, exist_ok=True)
     out_file = output_dir / "gold_daily_service_demand.parquet"
-    mart_spark.coalesce(1).write.mode("overwrite").parquet(str(out_file))
+    if out_file.exists():
+        direct_files = [f for f in out_file.iterdir() if f.is_file() and f.name.endswith(".parquet")]
+        if direct_files and not list(out_file.glob("year=*")):
+            import shutil
+            shutil.rmtree(out_file)
+    (
+        mart_spark.write
+        .mode("overwrite")
+        .partitionBy("year", "month")
+        .parquet(str(out_file))
+    )
 
     distinct_dates = mart_spark.select("date").distinct().count()
     distinct_grid_cells = mart_spark.select("grid_id").distinct().count()

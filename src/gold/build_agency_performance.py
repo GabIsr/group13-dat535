@@ -17,6 +17,7 @@ from pyspark.sql.functions import (
     col,
     count as spark_count,
     countDistinct,
+    date_format,
     datediff,
     dayofweek,
     lit,
@@ -302,8 +303,8 @@ def build_agency_resolution_performance_mart(
     # 6. Calendar Context in PySpark
     df_perf_spark = (
         df_perf_spark
-        .withColumn("year", spark_year(col("reporting_date")))
-        .withColumn("month", spark_month(col("reporting_date")))
+        .withColumn("year", date_format(col("reporting_date"), "yyyy"))
+        .withColumn("month", date_format(col("reporting_date"), "MM"))
         .withColumn("day_of_week", (dayofweek(col("reporting_date")) + 5) % 7)
         .withColumn("is_weekend", col("day_of_week").isin([5, 6]))
         .withColumn("_gold_built_at_utc", lit(built_at_utc))
@@ -317,10 +318,20 @@ def build_agency_resolution_performance_mart(
     if distinct_grain_count != total_perf_rows:
         raise ValueError(f"Grain uniqueness violation: {total_perf_rows - distinct_grain_count} duplicate keys on {grain_cols}")
 
-    # 8. Write Parquet Mart using PySpark distributed coalesce(1) write
+    # 8. Write Parquet Mart using PySpark distributed write partitioned by year and month
     output_dir.mkdir(parents=True, exist_ok=True)
     out_file = output_dir / "gold_agency_resolution_performance.parquet"
-    df_perf_spark.coalesce(1).write.mode("overwrite").parquet(str(out_file))
+    if out_file.exists():
+        direct_files = [f for f in out_file.iterdir() if f.is_file() and f.name.endswith(".parquet")]
+        if direct_files and not list(out_file.glob("year=*")):
+            import shutil
+            shutil.rmtree(out_file)
+    (
+        df_perf_spark.write
+        .mode("overwrite")
+        .partitionBy("year", "month")
+        .parquet(str(out_file))
+    )
 
     # Compute summary metrics natively via PySpark aggregate (1-row tuple over Py4J)
     summary_metrics = df_perf_spark.select(

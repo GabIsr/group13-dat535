@@ -292,6 +292,101 @@ class TestGoldLayerPipeline(unittest.TestCase):
             row_unspec = df_vuln[df_vuln["incident_zip"] == "UNSPECIFIED"].iloc[0]
             self.assertEqual(row_unspec["total_complaints"], 1)
 
+    def test_gold_incremental_partition_preservation(self):
+        """Verify that running Gold for an incremental month does NOT overwrite previous historical months."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            silver_311 = tmp_path / "silver_311"
+            silver_weather = tmp_path / "silver_weather"
+            gold_marts = tmp_path / "gold_marts"
+
+            silver_311.mkdir()
+            silver_weather.mkdir()
+            gold_marts.mkdir()
+
+            # Month 1: October 2026 record
+            m1_data = [{
+                "unique_key": "1001",
+                "created_at_utc": "2026-10-15T12:00:00Z",
+                "closed_at_utc": "2026-10-15T14:00:00Z",
+                "is_ticket_closed": True,
+                "resolution_duration_hours": 2.0,
+                "grid_id": "GRID_40.7_-74.0",
+                "borough": "MANHATTAN",
+                "complaint_type": "Noise",
+                "agency": "NYPD",
+            }]
+            # Month 2: November 2026 record
+            m2_data = [{
+                "unique_key": "1002",
+                "created_at_utc": "2026-11-05T12:00:00Z",
+                "closed_at_utc": "2026-11-05T15:00:00Z",
+                "is_ticket_closed": True,
+                "resolution_duration_hours": 3.0,
+                "grid_id": "GRID_40.7_-74.0",
+                "borough": "MANHATTAN",
+                "complaint_type": "Noise",
+                "agency": "NYPD",
+            }]
+            pd.DataFrame(m1_data + m2_data).to_parquet(silver_311 / "clean_311.parquet", index=False)
+
+            weather_data = [
+                {
+                    "grid_id": "GRID_40.7_-74.0",
+                    "timestamp_utc": "2026-10-15T12:00:00Z",
+                    "temperature_2m": 15.0,
+                    "precipitation": 0.0,
+                    "wind_gusts_10m": 5.0,
+                    "is_extreme_weather": False,
+                },
+                {
+                    "grid_id": "GRID_40.7_-74.0",
+                    "timestamp_utc": "2026-11-05T12:00:00Z",
+                    "temperature_2m": 10.0,
+                    "precipitation": 0.0,
+                    "wind_gusts_10m": 8.0,
+                    "is_extreme_weather": False,
+                },
+            ]
+            pd.DataFrame(weather_data).to_parquet(silver_weather / "clean_weather.parquet", index=False)
+
+            # Step 1: Run for Month 1 (October)
+            res1 = build_daily_service_demand_mart(
+                silver_311_dir=silver_311,
+                silver_weather_dir=silver_weather,
+                output_dir=gold_marts,
+                start_date="2026-10-01",
+                end_date="2026-10-31",
+            )
+            df_after_m1 = pd.read_parquet(res1["output_path"])
+            self.assertEqual(len(df_after_m1), 1)
+            self.assertEqual(str(df_after_m1.iloc[0]["date"]), "2026-10-15")
+
+            # Step 2: Run incrementally for Month 2 (November)
+            res2 = build_daily_service_demand_mart(
+                silver_311_dir=silver_311,
+                silver_weather_dir=silver_weather,
+                output_dir=gold_marts,
+                start_date="2026-11-01",
+                end_date="2026-11-30",
+            )
+
+            # Step 3: Verify that BOTH October and November exist on disk!
+            df_combined = pd.read_parquet(res2["output_path"])
+            self.assertEqual(len(df_combined), 2, "Historical Month 1 was erased during Month 2 incremental write!")
+            dates_present = {str(d) for d in df_combined["date"]}
+            self.assertIn("2026-10-15", dates_present)
+            self.assertIn("2026-11-05", dates_present)
+
+    def test_partitioning_windows_utility(self):
+        """Verify month-by-month partitioning window calculation."""
+        from src.utils.partitioning import get_monthly_execution_windows
+        windows = get_monthly_execution_windows("2026-01-15", "2026-03-10")
+        self.assertEqual(len(windows), 3)
+        self.assertEqual(windows[0], ("2026-01-15", "2026-01-31"))
+        self.assertEqual(windows[1], ("2026-02-01", "2026-02-28"))
+        self.assertEqual(windows[2], ("2026-03-01", "2026-03-10"))
+
 
 if __name__ == "__main__":
     unittest.main()

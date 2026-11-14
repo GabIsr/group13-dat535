@@ -143,8 +143,9 @@ def generate_hierarchical_location_keys(df: DataFrame) -> DataFrame:
 
 def _sessionize_partition_udf(pdf: pd.DataFrame, burst_window_hours: float = 6.0) -> pd.DataFrame:
     """
-    Stateful vectorized partition worker:
-    Groups citizen calls by (loc_key, complaint_type) and applies Ticket-1 anchored clustering.
+    Optimized vectorized partition worker:
+    Groups citizen calls by (loc_key, complaint_type) and applies Ticket-1 anchored clustering
+    using contiguous pre-allocated NumPy arrays and zero Copy-on-Write / iloc mutation overhead.
     Window Cutoff = max(Ticket_1_created + burst_window_hours, Ticket_1_closed_at_utc).
     """
     pdf = pdf.sort_values(["loc_key", "complaint_type", "created_at_utc", "unique_key"]).reset_index(drop=True)
@@ -156,16 +157,16 @@ def _sessionize_partition_udf(pdf: pd.DataFrame, burst_window_hours: float = 6.0
                 "is_burst_duplicate",
                 "burst_sequence_num",
                 "incident_cluster_id",
-                "cluster_size",
                 "incident_first_created_at_utc",
                 "_cluster_bucket",
+                "cluster_size",
             ]
         )
 
     is_dup = np.zeros(n, dtype=bool)
     seq_num = np.ones(n, dtype=np.int32)
-    cluster_first_ts = pdf["created_at_utc"].copy()
-    cluster_id_arr = np.zeros(n, dtype=np.int64)
+    first_ts_arr = np.empty(n, dtype="datetime64[ns]")
+    cluster_id_arr = np.empty(n, dtype=np.int64)
 
     k_arr = pdf["loc_key"].to_numpy()
     c_arr = pdf["complaint_type"].to_numpy()
@@ -185,6 +186,7 @@ def _sessionize_partition_udf(pdf: pd.DataFrame, burst_window_hours: float = 6.0
     curr_seq = 1
 
     window_delta = np.timedelta64(int(burst_window_hours * 3600), "s")
+    cluster_sizes_map = {}
 
     for i in range(n):
         k = k_arr[i]
@@ -193,8 +195,8 @@ def _sessionize_partition_udf(pdf: pd.DataFrame, burst_window_hours: float = 6.0
         cl = cl_arr[i]
         uk = uk_arr[i]
 
-        # New partition group: (loc_key, complaint_type)
-        if (k != curr_k) or (c != curr_c):
+        # New partition group: (loc_key, complaint_type) or wave break (cr > anchor_cutoff)
+        if (k != curr_k) or (c != curr_c) or (cr > anchor_cutoff):
             curr_k = k
             curr_c = c
             anchor_cr = cr
@@ -204,40 +206,31 @@ def _sessionize_partition_udf(pdf: pd.DataFrame, burst_window_hours: float = 6.0
             curr_seq = 1
             is_dup[i] = False
             seq_num[i] = 1
-            cluster_first_ts.iloc[i] = anchor_cr
+            first_ts_arr[i] = anchor_cr
             cluster_id_arr[i] = curr_cluster_id
+            cluster_sizes_map[curr_cluster_id] = 1
         # Arrived within Ticket 1's active window cutoff
-        elif cr <= anchor_cutoff:
+        else:
             curr_seq += 1
             is_dup[i] = True
             seq_num[i] = curr_seq
-            cluster_first_ts.iloc[i] = anchor_cr
+            first_ts_arr[i] = anchor_cr
             cluster_id_arr[i] = curr_cluster_id
-        # Arrived past Ticket 1's cutoff -> Spawns new wave / new incident
-        else:
-            anchor_cr = cr
-            min_cutoff = cr + window_delta
-            anchor_cutoff = max(min_cutoff, cl) if (pd.notna(cl) and cl > min_cutoff) else min_cutoff
-            curr_cluster_id = uk
-            curr_seq = 1
-            is_dup[i] = False
-            seq_num[i] = 1
-            cluster_first_ts.iloc[i] = anchor_cr
-            cluster_id_arr[i] = curr_cluster_id
+            cluster_sizes_map[curr_cluster_id] += 1
 
-    # Format output DataFrame
+    # Vectorized size mapping via numpy
+    cluster_size_arr = np.fromiter((cluster_sizes_map[cid] for cid in cluster_id_arr), dtype=np.int32, count=n)
+
+    # Format output DataFrame with zero Pandas groupby.transform overhead
     out_df = pd.DataFrame({
-        "unique_key": pdf["unique_key"],
+        "unique_key": uk_arr,
         "is_burst_duplicate": is_dup,
         "burst_sequence_num": seq_num,
         "incident_cluster_id": ["INC_" + str(cid) for cid in cluster_id_arr],
-        "incident_first_created_at_utc": cluster_first_ts,
+        "incident_first_created_at_utc": first_ts_arr,
         "_cluster_bucket": pdf["_cluster_bucket"],
+        "cluster_size": cluster_size_arr,
     })
-
-    # Compute cluster size
-    cluster_sizes = out_df.groupby("incident_cluster_id")["unique_key"].transform("count").astype(np.int32)
-    out_df["cluster_size"] = cluster_sizes
 
     return out_df
 

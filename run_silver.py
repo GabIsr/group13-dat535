@@ -20,6 +20,7 @@ from src.silver.clean_weather import clean_and_validate_weather
 from src.silver.join_silver import join_silver_datasets
 from src.silver.quality_report import generate_quality_reconciliation_report
 from src.utils.benchmark import get_profiler
+from src.utils.partitioning import get_monthly_execution_windows
 
 logging.basicConfig(
     level=logging.INFO,
@@ -65,30 +66,76 @@ def main():
     )
     overall_start = time.time()
 
+    bronze_311_dir = PROJECT_ROOT / "data" / "bronze" / "nyc311"
+    windows = get_monthly_execution_windows(
+        start_date=args.start_date,
+        end_date=args.end_date,
+        bronze_dir=bronze_311_dir,
+    )
+
+    if not windows:
+        logger.warning("No execution windows found matching the specified date bounds. Exiting.")
+        return
+
+    logger.info(
+        f"Partition-Batching Plan: {len(windows)} sequential monthly slice(s): "
+        f"{', '.join([f'[{w[0]} -> {w[1]}]' for w in windows])}"
+    )
+
     m_weather = {}
     m_311 = {}
     m_join = {}
 
-    # Stage 1: Clean Weather
-    if args.stage in ["all", "weather"]:
-        logger.info("Executing Silver Stage: Clean Weather Reanalysis...")
-        m_weather = clean_and_validate_weather(start_date=args.start_date, end_date=args.end_date)
+    for idx, (w_start, w_end) in enumerate(windows, 1):
+        logger.info(f"=== Processing Partition Slice {idx}/{len(windows)}: [{w_start} -> {w_end}] ===")
 
-    # Stage 2: Clean NYC 311
-    if args.stage in ["all", "311"]:
-        logger.info("Executing Silver Stage: Clean NYC 311 Service Requests...")
-        m_311 = clean_and_validate_311(start_date=args.start_date, end_date=args.end_date)
+        # Stage 1: Clean Weather
+        if args.stage in ["all", "weather"]:
+            logger.info(f"[{w_start} -> {w_end}] Executing Silver Stage: Clean Weather Reanalysis...")
+            curr_weather = clean_and_validate_weather(start_date=w_start, end_date=w_end)
+            if not m_weather:
+                m_weather = curr_weather.copy()
+            else:
+                for k in ["raw_rows", "clean_rows", "anomalies_quarantined"]:
+                    if k in curr_weather and k in m_weather:
+                        m_weather[k] += curr_weather[k]
 
-    # Stage 3: Unified Fact Join
-    if args.stage in ["all", "join"]:
-        if args.stage == "all" and (m_311.get("status") == "skipped" or m_weather.get("status") == "skipped"):
-            logger.warning(
-                f"Skipping Unified Analytical Fact Join because upstream Silver stage was skipped "
-                f"(311 status: {m_311.get('status', 'unknown')}, weather status: {m_weather.get('status', 'unknown')})."
-            )
-        else:
-            logger.info("Executing Silver Stage: Unified Analytical Fact Join...")
-            m_join = join_silver_datasets(start_date=args.start_date, end_date=args.end_date)
+        # Stage 2: Clean NYC 311
+        if args.stage in ["all", "311"]:
+            logger.info(f"[{w_start} -> {w_end}] Executing Silver Stage: Clean NYC 311 Service Requests...")
+            curr_311 = clean_and_validate_311(start_date=w_start, end_date=w_end)
+            if not m_311:
+                m_311 = curr_311.copy()
+            else:
+                for k in [
+                    "input_rows",
+                    "duplicate_rows_removed",
+                    "valid_rows_accepted",
+                    "closed_tickets_count",
+                    "open_tickets_count",
+                    "status_conflict_count",
+                    "instant_closure_count",
+                    "quarantined_rows",
+                ]:
+                    if k in curr_311 and k in m_311:
+                        m_311[k] += curr_311[k]
+
+        # Stage 3: Unified Fact Join
+        if args.stage in ["all", "join"]:
+            if args.stage == "all" and (m_311.get("status") == "skipped" or m_weather.get("status") == "skipped"):
+                logger.warning(
+                    f"Skipping Unified Analytical Fact Join because upstream Silver stage was skipped "
+                    f"(311 status: {m_311.get('status', 'unknown')}, weather status: {m_weather.get('status', 'unknown')})."
+                )
+            else:
+                logger.info(f"[{w_start} -> {w_end}] Executing Silver Stage: Unified Analytical Fact Join...")
+                curr_join = join_silver_datasets(start_date=w_start, end_date=w_end)
+                if not m_join:
+                    m_join = curr_join.copy()
+                else:
+                    for k in ["total_311_input", "matched_weather_rows", "unmatched_historical_rows"]:
+                        if k in curr_join and k in m_join:
+                            m_join[k] += curr_join[k]
 
     # If full pipeline ran, compile Quality Reconciliation Ledger
     if args.stage == "all" and m_311 and m_weather and m_join:

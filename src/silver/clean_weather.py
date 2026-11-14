@@ -554,12 +554,14 @@ def clean_and_validate_weather(
         df_raw = spark.read.parquet(*[str(f) for f in bronze_files])
 
         # Optional partition pruning if date range is specified
+        raw_cols = set(df_raw.columns)
+        time_col_name = "date" if "date" in raw_cols else ("time" if "time" in raw_cols else "timestamp_utc")
         if start_date:
-            logger.info(f"Applying start_date filter on Bronze weather: timestamp_utc >= {start_date}")
-            df_raw = df_raw.filter(col("date") >= lit(start_date[:10]) if "date" in df_raw.columns else col("timestamp_utc") >= lit(start_date))
+            logger.info(f"Applying start_date filter on Bronze weather: {time_col_name} >= {start_date}")
+            df_raw = df_raw.filter(col(time_col_name) >= lit(start_date[:10] if time_col_name == "date" else start_date))
         if end_date:
-            logger.info(f"Applying end_date filter on Bronze weather: timestamp_utc <= {end_date}")
-            df_raw = df_raw.filter(col("date") <= lit(end_date[:10]) if "date" in df_raw.columns else col("timestamp_utc") <= lit(end_date))
+            logger.info(f"Applying end_date filter on Bronze weather: {time_col_name} <= {end_date}")
+            df_raw = df_raw.filter(col(time_col_name) <= lit(end_date[:10] if time_col_name == "date" else end_date))
 
         input_rows = df_raw.count()
         step_scan.set_input_rows(input_rows)

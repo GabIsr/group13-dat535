@@ -56,11 +56,12 @@ def generate_quality_reconciliation_report(
         json.dump(report_payload, f, indent=2, ensure_ascii=False)
 
     # Print ASCII Reconciliation Table
-    print("\n" + "=" * 90)
+    width = 105
+    print("\n" + "=" * width)
     print("DAT535 SILVER LAYER: DATA QUALITY RECONCILIATION LEDGER (BEFORE & AFTER)")
-    print("=" * 90)
-    print(f"Report ID: {report_id} | Generated: {report_payload['generated_at_utc']}")
-    print("-" * 90)
+    print("=" * width)
+    print(f"Report ID: {report_id:<40} | Generated (UTC): {report_payload['generated_at_utc']}")
+    print("-" * width)
 
     # 311 Reconciliation
     b_311_in = clean_311_metrics.get("input_rows", 0)
@@ -72,53 +73,86 @@ def generate_quality_reconciliation_report(
     b_311_conflicts = clean_311_metrics.get("status_conflict_count", 0)
     b_311_instant = clean_311_metrics.get("instant_closure_count", 0)
 
-    print(f"{'STAGE 1: NYC 311 SERVICE REQUESTS':<45} | Count / Metrics")
-    print(f"  * Raw Bronze Input Records                : {b_311_in:,}")
-    print(f"  * Exact Duplicates Removed (unique_key)    : -{b_311_dup:,}")
-    print(f"  * Temporal Validation Failures Quarantined : -{b_311_quar:,}")
-    print(f"  * Clean Valid Records Accepted in Silver   : = {b_311_valid:,}")
+    print(f"{'STAGE 1A: NYC 311 INTAKE, DEDUPLICATION & VALIDATION GATE':<45}")
+    print("-" * width)
+    print(f"{'Filter / Quality Gate':<42} | {'Count / Value':<16} | {'Share (%)':<10} | {'Description':<28}")
+    print("-" * width)
+    print(f"{'Raw Bronze Input Records':<42} | {b_311_in:<16,} | {'100.0%':<10} | {'Unprocessed bronze landing':<28}")
+    dup_pct = (b_311_dup / b_311_in * 100.0) if b_311_in > 0 else 0.0
+    quar_pct = (b_311_quar / b_311_in * 100.0) if b_311_in > 0 else 0.0
+    print(f"{'Exact Duplicates Removed (unique_key)':<42} | {f'-{b_311_dup:,}':<16} | {f'{dup_pct:.2f}%':<10} | {'CDC primary key deduplication':<28}")
+    print(f"{'Temporal Failures Quarantined':<42} | {f'-{b_311_quar:,}':<16} | {f'{quar_pct:.2f}%':<10} | {'Negative/corrupted duration':<28}")
+    print(f"{'Clean Valid Records Accepted in Silver':<42} | {f'= {b_311_valid:,}':<16} | {'100.0%':<10} | {'Passed all intake quality gates':<28}")
+
     if b_311_valid > 0:
         pct_closed = (b_311_closed / b_311_valid) * 100.0
         pct_open = (b_311_open / b_311_valid) * 100.0
-        print(f"    - Closed Tickets (Duration Calculated)   : {b_311_closed:,} ({pct_closed:.1f}%)")
-        print(f"    - Open/Active Tickets (Age Tracked)     : {b_311_open:,} ({pct_open:.1f}%)")
-        print(f"    - Status Conflicts Tagged (Open w/ Date): {b_311_conflicts:,}")
-        print(f"    - Instant Closures Tagged (0.0s SLA)    : {b_311_instant:,}")
+        pct_conflicts = (b_311_conflicts / b_311_valid) * 100.0
+        pct_instant = (b_311_instant / b_311_valid) * 100.0
+        print(f"{'  - Closed Tickets (Duration Calculated)':<42} | {b_311_closed:<16,} | {f'{pct_closed:.2f}%':<10} | {'Calculated resolution hours':<28}")
+        print(f"{'  - Open / Active Tickets (Age Tracked)':<42} | {b_311_open:<16,} | {f'{pct_open:.2f}%':<10} | {'Active municipal backlog':<28}")
+        print(f"{'  - Status Conflicts Tagged (Open w/ Date)':<42} | {b_311_conflicts:<16,} | {f'{pct_conflicts:.2f}%':<10} | {'Tagged anomalous lifecycle':<28}")
+        print(f"{'  - Instant Closures Tagged (0.0s SLA)':<42} | {b_311_instant:<16,} | {f'{pct_instant:.2f}%':<10} | {'Zero-second closure audit':<28}")
 
     # Spatial Resolution Breakdown
     spatial = clean_311_metrics.get("spatial_resolution_breakdown", {})
-    print("\n  Spatial Imputation Resolution Hierarchy:")
-    for level, count in spatial.items():
-        pct = (count / b_311_valid * 100.0) if b_311_valid > 0 else 0.0
-        print(f"    - {level:<26}: {count:,} ({pct:.2f}%)")
     avg_dist = clean_311_metrics.get("avg_grid_distance_km")
     p95_dist = clean_311_metrics.get("p95_grid_distance_km")
-    if avg_dist is not None:
-        print(f"    - Grid Center Uncertainty Distance: Mean = {avg_dist:.2f} km | P95 = {p95_dist:.2f} km")
+    if spatial:
+        print("\n" + "-" * width)
+        print(f"{'STAGE 1B: SPATIAL IMPUTATION & RESOLUTION HIERARCHY':<45}")
+        print("-" * width)
+        print(f"{'Spatial Resolution Level':<42} | {'Records Resolved':<16} | {'Share (%)':<10} | {'Hierarchy Target / Method':<28}")
+        print("-" * width)
+        for level, count in sorted(spatial.items(), key=lambda x: x[1], reverse=True):
+            pct = (count / b_311_valid * 100.0) if b_311_valid > 0 else 0.0
+            desc = "Clean native coordinates" if "EXACT" in level else ("ZIP Centroid Imputation" if "ZIP" in level else "Borough Center Imputation")
+            print(f"{level:<42} | {count:<16,} | {f'{pct:.2f}%':<10} | {desc:<28}")
+        if avg_dist is not None:
+            print("-" * width)
+            p95_str = f"{p95_dist:.2f} km" if p95_dist is not None else "N/A"
+            print(f"Spatial Grid Uncertainty: Mean Distance = {avg_dist:.2f} km | P95 Distance = {p95_str}")
 
     # Incident Clustering & Burst Deduplication Breakdown
     clustering = clean_311_metrics.get("incident_clustering", {})
     if clustering:
-        print("\n  STAGE 1B: CITIZEN CALL BURST DEDUPLICATION & INCIDENT CLUSTERING:")
+        print("\n" + "-" * width)
+        print(f"{'STAGE 1C: CITIZEN CALL BURST DEDUPLICATION & INCIDENT CLUSTERING':<65}")
+        print("-" * width)
+        print(f"{'Clustering / Sessionization Metric':<42} | {'Count / Value':<16} | {'Rate (%)':<10} | {'Sessionizer Engine Detail':<28}")
+        print("-" * width)
         loc_recs = clustering.get("total_locatable_records", 0)
         unloc_recs = clustering.get("unlocatable_records", 0)
         dup_calls = clustering.get("duplicate_burst_calls_collapsed", 0)
         distinct_inc = clustering.get("distinct_physical_incidents", 0)
         burst_rate = clustering.get("burst_collapse_rate_pct", 0.0)
-        print(f"    - Locatable Records Routed            : {loc_recs:,}")
-        print(f"    - Unlocatable Records (Isolated)      : {unloc_recs:,}")
-        print(f"    - Duplicate Burst Calls Collapsed     : -{dup_calls:,} ({burst_rate:.2f}%)")
-        print(f"    - Distinct Physical Incidents Derived : = {distinct_inc:,}")
+
+        loc_pct = (loc_recs / b_311_valid * 100.0) if b_311_valid > 0 else 0.0
+        unloc_pct = (unloc_recs / b_311_valid * 100.0) if b_311_valid > 0 else 0.0
+        inc_pct = (distinct_inc / b_311_valid * 100.0) if b_311_valid > 0 else 0.0
+
+        print(f"{'Locatable Records Evaluated':<42} | {loc_recs:<16,} | {f'{loc_pct:.2f}%':<10} | {'Passed to spatial sessionizer':<28}")
+        print(f"{'Unlocatable Records (Isolated)':<42} | {unloc_recs:<16,} | {f'{unloc_pct:.2f}%':<10} | {'Isolated to prevent skew':<28}")
+        print(f"{'Duplicate Burst Calls Collapsed':<42} | {f'-{dup_calls:,}':<16} | {f'{burst_rate:.2f}%':<10} | {'Citizen wave duplicate calls':<28}")
+        print(f"{'Distinct Physical Incidents Derived':<42} | {f'= {distinct_inc:,}':<16} | {f'{inc_pct:.2f}%':<10} | {'True underlying physical events':<28}")
+
         routes = clustering.get("route_breakdown", {})
         if routes:
-            print("    Route Distribution:")
+            print("-" * width)
+            print(f"{'Hierarchical Spatial Routing Tier':<42} | {'Routed Records':<16} | {'Share (%)':<10} | {'Precedence Hierarchy Tier':<28}")
+            print("-" * width)
             for r_name, r_cnt in sorted(routes.items()):
-                print(f"      * {r_name:<34}: {r_cnt:,}")
+                r_pct = (r_cnt / b_311_valid * 100.0) if b_311_valid > 0 else 0.0
+                print(f"{r_name:<42} | {r_cnt:<16,} | {f'{r_pct:.2f}%':<10} | {'Spatial Precedence':<28}")
 
     # Resolution Text Mining & Phantom Closure Auditing Breakdown
     res_mining = clean_311_metrics.get("resolution_text_mining", {})
     if res_mining:
-        print("\n  STAGE 1C: UNSTRUCTURED RESOLUTION TEXT MINING & PHANTOM CLOSURES:")
+        print("\n" + "-" * width)
+        print(f"{'STAGE 1D: UNSTRUCTURED RESOLUTION TEXT MINING & PHANTOM CLOSURES':<65}")
+        print("-" * width)
+        print(f"{'Resolution Classification Category':<42} | {'Records':<16} | {'Share (%)':<10} | {'Audit Classification':<28}")
+        print("-" * width)
         ver_cnt = res_mining.get("field_verified_remediations", 0)
         ver_rate = res_mining.get("field_verified_rate_pct", (ver_cnt / b_311_closed * 100.0) if b_311_closed > 0 else 0.0)
         phan_cnt = res_mining.get("phantom_closures", 0)
@@ -126,45 +160,42 @@ def generate_quality_reconciliation_report(
         unclass_cnt = res_mining.get("unclassified_resolutions", 0)
         unclass_rate = res_mining.get("unclassified_rate_pct", (unclass_cnt / b_311_closed * 100.0) if b_311_closed > 0 else 0.0)
 
-        print(f"    - True Field Remediations (Verified)  : {ver_cnt:,} ({ver_rate:.2f}% of closed)")
-        print(f"    - Administrative Phantom Closures     : {phan_cnt:,} ({phan_rate:.2f}% of closed)")
-        print(f"    - Unclassified Vocabulary (Cataloged) : {unclass_cnt:,} ({unclass_rate:.2f}% of closed)")
         breakdown = res_mining.get("outcome_breakdown", {})
         if breakdown:
-            print("    Resolution Outcome Distribution:")
             for cat_name, cat_cnt in sorted(breakdown.items(), key=lambda x: x[1], reverse=True):
                 if cat_name == "OPEN_TICKET":
                     continue
                 cat_pct = (cat_cnt / b_311_closed * 100.0) if b_311_closed > 0 else 0.0
-                print(f"      * {cat_name:<34}: {cat_cnt:,} ({cat_pct:.2f}%)")
+                sem = "Field Verified Remediation" if cat_name in ["ACTION_TAKEN_REMEDIED", "NO_VIOLATION_FOUND"] else ("Phantom Closure" if cat_name in ["ADMINISTRATIVE_DISMISSAL", "DUPLICATE_CONSOLIDATED", "DEFERRED_PENDING_ACTION", "ACCESS_DENIED_UNABLE_TO_LOCATE"] else "Governance Defect / Novel")
+                print(f"{cat_name:<42} | {cat_cnt:<16,} | {f'{cat_pct:.2f}%':<10} | {sem:<28}")
+        print("-" * width)
+        print(f"Summary: Verified Remediations = {ver_cnt:,} ({ver_rate:.2f}%) | Phantom Closures = {phan_cnt:,} ({phan_rate:.2f}%) | Unclassified = {unclass_cnt:,} ({unclass_rate:.2f}%)")
 
     # Categorical Schema Drift & Semantic Conformance Breakdown
     sem_conf = clean_311_metrics.get("semantic_conformance", {})
     if sem_conf:
-        print("\n  STAGE 1D: CATEGORICAL SCHEMA DRIFT & CONFORMED TAXONOMY:")
+        print("\n" + "-" * width)
+        print(f"{'STAGE 1E: CATEGORICAL SCHEMA DRIFT & CONFORMED TAXONOMY':<60}")
+        print("-" * width)
+        print(f"{'Canonical Service Domain':<42} | {'Records':<16} | {'Share (%)':<10} | {'Domain Scope':<28}")
+        print("-" * width)
         conf_cnt = sem_conf.get("conformed_records", 0)
         unmap_cnt = sem_conf.get("unmapped_records", 0)
         unmap_rate = sem_conf.get("unmapped_rate_pct", 0.0)
         legacy_cnt = sem_conf.get("legacy_mapped_records", 0)
         conf_rate = (conf_cnt / b_311_valid * 100.0) if b_311_valid > 0 else 0.0
 
-        print(f"    - Conformed to Canonical Domains      : {conf_cnt:,} ({conf_rate:.2f}%)")
-        print(f"    - Historical Legacy Aliases Conformed : {legacy_cnt:,}")
-        print(f"    - Unmapped Category Volume (Ledgered) : {unmap_cnt:,} ({unmap_rate:.2f}%)")
-        if unmap_rate > MAX_UNMAPPED_TAXONOMY_RATE_PCT:
-            print(f"    - [OBSERVABILITY ALERT] Unmapped rate ({unmap_rate}%) exceeds threshold ({MAX_UNMAPPED_TAXONOMY_RATE_PCT}%)!")
-        else:
-            print(f"    - [OBSERVABILITY GATE] Conformance within acceptable threshold (< {MAX_UNMAPPED_TAXONOMY_RATE_PCT}%)")
-
         d_breakdown = sem_conf.get("domain_breakdown", {})
         if d_breakdown:
-            print("    Canonical Service Domain Distribution:")
             for d_name, d_cnt in sorted(d_breakdown.items(), key=lambda x: x[1], reverse=True):
                 d_pct = (d_cnt / b_311_valid * 100.0) if b_311_valid > 0 else 0.0
-                print(f"      * {d_name:<34}: {d_cnt:,} ({d_pct:.2f}%)") 
+                print(f"{d_name:<42} | {d_cnt:<16,} | {f'{d_pct:.2f}%':<10} | {'Conformed Canonical Domain':<28}")
+        print("-" * width)
+        gate_status = "PASS" if unmap_rate <= MAX_UNMAPPED_TAXONOMY_RATE_PCT else "ALERT"
+        print(f"Observability Gate [{gate_status}]: Conformed = {conf_cnt:,} ({conf_rate:.2f}%) | Legacy Aliases = {legacy_cnt:,} | Unmapped = {unmap_cnt:,} ({unmap_rate:.2f}% <= {MAX_UNMAPPED_TAXONOMY_RATE_PCT}%)")
 
-    # Weather Reconciliation
-    print("\n" + "-" * 90)
+    # Weather Reconciliation & Analytical Fact Join
+    print("\n" + "-" * width)
     w_in = clean_weather_metrics.get("input_rows", 0)
     w_dup = clean_weather_metrics.get("duplicate_rows_dropped", 0)
     w_unkeyed = clean_weather_metrics.get("dropped_unkeyed_rows", 0)
@@ -174,30 +205,34 @@ def generate_quality_reconciliation_report(
     w_extreme = clean_weather_metrics.get("extreme_weather_tagged_rows", 0)
     w_cells = clean_weather_metrics.get("distinct_grid_cells", 0)
 
-    print(f"{'STAGE 2: ERA5-LAND METEOROLOGICAL REANALYSIS':<45} | Count / Metrics")
-    print(f"  * Raw Bronze Weather Observations         : {w_in:,}")
-    if w_dup > 0:
-        print(f"  * Exact Duplicates Removed (grid_id, ts)  : -{w_dup:,}")
-    print(f"  * Unkeyed Observations Dropped            : -{w_unkeyed:,}")
-    print(f"  * Corrupt Fields Masked (Row Preserved)   : {w_masked:,}")
-    print(f"  * Forensic Sensor Anomalies Ledgered      : {w_anomalies:,} (saved to {SENSOR_ANOMALY_LEDGER_PATH.name})")
-    print(f"  * Valid Observations in Silver            : = {w_valid:,}")
-    print(f"  * Active Native NYC Grid Cells Covered    : {w_cells} of 19 cells")
-    print(f"  * Extreme Weather Outliers Tagged (Kept)  : {w_extreme:,}")
-
-    # Unified Fact Join Reconciliation
-    print("\n" + "-" * 90)
     j_total = join_metrics.get("total_311_records", 0)
     j_matched = join_metrics.get("matched_weather_records", 0)
     j_unmatched = join_metrics.get("unmatched_weather_records", 0)
     j_rate = join_metrics.get("weather_match_rate_pct", 0.0)
 
-    print(f"{'STAGE 3: UNIFIED ANALYTICAL FACT JOIN':<45} | Count / Metrics")
-    print(f"  * Total Clean 311 Records Joined          : {j_total:,}")
-    print(f"  * Enriched with Weather Observation       : {j_matched:,} ({j_rate}%)")
-    print(f"  * Unmatched Records (Historical/Unlocated): {j_unmatched:,}")
-    print("=" * 90)
+    print(f"{'STAGE 2 & 3: ERA5-LAND REANALYSIS & UNIFIED ANALYTICAL FACT JOIN':<65}")
+    print("-" * width)
+    print(f"{'Quality Metric / Stage':<42} | {'Count / Value':<16} | {'Share (%)':<10} | {'Description / Observability':<28}")
+    print("-" * width)
+    print(f"{'Raw Bronze Weather Observations':<42} | {w_in:<16,} | {'100.0%':<10} | {'ERA5-Land reanalysis records':<28}")
+    if w_dup > 0:
+        w_dup_pct = (w_dup / w_in * 100.0) if w_in > 0 else 0.0
+        print(f"{'Exact Duplicates Removed (grid_id, ts)':<42} | {f'-{w_dup:,}':<16} | {f'{w_dup_pct:.2f}%':<10} | {'Spatiotemporal deduplication':<28}")
+    w_unk_pct = (w_unkeyed / w_in * 100.0) if w_in > 0 else 0.0
+    w_mask_pct = (w_masked / w_valid * 100.0) if w_valid > 0 else 0.0
+    w_ext_pct = (w_extreme / w_valid * 100.0) if w_valid > 0 else 0.0
+    print(f"{'Unkeyed Observations Dropped':<42} | {f'-{w_unkeyed:,}':<16} | {f'{w_unk_pct:.2f}%':<10} | {'Missing grid or timestamp':<28}")
+    print(f"{'Corrupt Fields Masked (Row Preserved)':<42} | {w_masked:<16,} | {f'{w_mask_pct:.2f}%':<10} | {'Nullified out-of-bounds metrics':<28}")
+    print(f"{'Forensic Sensor Anomalies Ledgered':<42} | {w_anomalies:<16,} | {'-':<10} | {f'Saved to {SENSOR_ANOMALY_LEDGER_PATH.name}':<28}")
+    print(f"{'Clean Valid Observations in Silver':<42} | {f'= {w_valid:,}':<16} | {'100.0%':<10} | {f'Active NYC grid cells: {w_cells}/19':<28}")
+    print(f"{'Extreme Weather Outliers Tagged (Kept)':<42} | {w_extreme:<16,} | {f'{w_ext_pct:.2f}%':<10} | {'Precipitation / wind gust flags':<28}")
+    print("-" * width)
+    print(f"{'Total Clean 311 Records Joined':<42} | {j_total:<16,} | {'100.0%':<10} | {'Analytical Fact Input':<28}")
+    print(f"{'Enriched with Weather Reanalysis':<42} | {j_matched:<16,} | {f'{j_rate:.2f}%':<10} | {'Hourly spatial mesh matched':<28}")
+    unm_pct = (100.0 - j_rate) if j_total > 0 else 0.0
+    print(f"{'Unmatched Records (Historical/Unlocated)':<42} | {j_unmatched:<16,} | {f'{unm_pct:.2f}%':<10} | {'Outside weather spatial window':<28}")
+    print("=" * width)
     print(f"Quality Ledger document saved to: {report_file}")
-    print("=" * 90 + "\n")
+    print("=" * width + "\n")
 
     return report_file

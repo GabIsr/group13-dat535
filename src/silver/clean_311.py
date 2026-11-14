@@ -912,32 +912,48 @@ def clean_and_validate_311(
     logger.info(f"Phase 1 materialized to transient staging: {staging_dir}")
 
     success = False
+    staging_clustered_dir = staging_dir.parent / f"{staging_dir.name}_clustered"
     try:
         # =========================================================================
         # PHASE 2: Stateful Burst Clustering, Enrichment & Final Partition Write
         # =========================================================================
         logger.info("Executing Silver 311 Phase 2: Burst clustering from clean staging...")
-        with profiler.measure_step("silver_311", "clustering_enrichment_and_parquet_write", input_rows=candidate_count - duplicate_rows_removed) as step_p2:
-            df_staging = spark.read.parquet(str(staging_dir))
 
+        # Step 2A: Stateful Citizen Call Burst Clustering Sessionization
+        df_staging = spark.read.parquet(str(staging_dir))
+        with profiler.measure_step("silver_311", "burst_clustering_sessionization", input_rows=candidate_count - duplicate_rows_removed) as step_cluster:
             df_clustered = cluster_citizen_call_bursts(df_staging, burst_window_hours=6.0)
+            staging_clustered_dir.mkdir(parents=True, exist_ok=True)
+            df_clustered.write.mode("overwrite").parquet(str(staging_clustered_dir))
+            step_cluster.set_output_rows(candidate_count - duplicate_rows_removed)
 
-            # Categorical Schema Drift & Semantic Conformance (Issue #8)
-            logger.info("Executing PySpark Categorical Schema Drift & Semantic Conformance...")
-            df_conformed = conform_complaint_taxonomy(df_clustered, spark=spark, reference_path=TAXONOMY_REFERENCE_PATH)
+        # Truncate AST lineage from clustering so downstream stages never re-trigger applyInPandas
+        df_clustered_persisted = spark.read.parquet(str(staging_clustered_dir))
+
+        # Step 2B: Categorical Schema Drift & Semantic Conformance (Issue #8)
+        logger.info("Executing PySpark Categorical Schema Drift & Semantic Conformance...")
+        with profiler.measure_step("silver_311", "taxonomy_conformance_and_ledger", input_rows=candidate_count - duplicate_rows_removed) as step_tax:
+            df_conformed = conform_complaint_taxonomy(df_clustered_persisted, spark=spark, reference_path=TAXONOMY_REFERENCE_PATH)
             upsert_unmapped_taxonomy_ledger(df_conformed, spark, ledger_path=UNMAPPED_TAXONOMY_LEDGER_PATH)
+            step_tax.set_output_rows(candidate_count - duplicate_rows_removed)
 
-            # Unstructured Resolution Text Mining & Phantom Closure Auditing (Issue #6)
-            logger.info("Executing PySpark Unstructured Resolution Text Mining & Semantic Auditing...")
+        # Step 2C: Unstructured Resolution Text Mining & Phantom Closure Auditing (Issue #6)
+        logger.info("Executing PySpark Unstructured Resolution Text Mining & Semantic Auditing...")
+        with profiler.measure_step("silver_311", "resolution_text_mining_and_ledger", input_rows=candidate_count - duplicate_rows_removed) as step_mine:
             df_resolved = classify_resolution_outcomes(df_conformed)
             upsert_unclassified_resolutions_ledger(df_resolved, spark)
+            step_mine.set_output_rows(candidate_count - duplicate_rows_removed)
 
+        # Step 2D: Attribute Standardization & Audit Tags
+        with profiler.measure_step("silver_311", "attribute_standardization_and_audit_tags", input_rows=candidate_count - duplicate_rows_removed) as step_std:
             df_std = standardize_categorical_and_administrative_attributes(df_resolved)
             df_silver = attach_quality_audit_tags(df_std, processed_at_utc)
+            step_std.set_output_rows(candidate_count - duplicate_rows_removed)
 
-            # Pure PySpark Partitioned Parquet Write (streaming distributed write)
+        # Step 2E: Distributed Partitioned Parquet Write
+        with profiler.measure_step("silver_311", "partitioned_parquet_write", input_rows=candidate_count - duplicate_rows_removed) as step_write:
             written_files = write_silver_311(df_silver, silver_311_dir)
-            step_p2.set_output_rows(candidate_count - duplicate_rows_removed)
+            step_write.set_output_rows(candidate_count - duplicate_rows_removed)
 
         # 8. Compute Audit Metrics in PySpark directly from written Parquet (avoids driver heap bloat & plan re-eval)
         with profiler.measure_step("silver_311", "reconciliation_audit_aggregation") as step_audit:
@@ -1125,12 +1141,18 @@ def clean_and_validate_311(
             "status": "success",
         }
     finally:
-        # EPHEMERAL CLEANUP: Intermediate staging scratch directory is cleaned up on success
+        # EPHEMERAL CLEANUP: Intermediate staging scratch directories are cleaned up on success
         if success and staging_dir.exists():
             shutil.rmtree(staging_dir, ignore_errors=True)
             logger.info(f"Ephemeral staging directory cleaned up successfully: {staging_dir}")
         elif not success and staging_dir.exists():
             logger.warning(f"Preserving intermediate staging directory for root-cause triage: {staging_dir}")
+
+        if success and staging_clustered_dir.exists():
+            shutil.rmtree(staging_clustered_dir, ignore_errors=True)
+            logger.info(f"Ephemeral clustered staging directory cleaned up successfully: {staging_clustered_dir}")
+        elif not success and staging_clustered_dir.exists():
+            logger.warning(f"Preserving intermediate clustered staging directory for triage: {staging_clustered_dir}")
 
 
 if __name__ == "__main__":

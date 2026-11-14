@@ -91,6 +91,7 @@ class PipelineProfiler:
     """
 
     def __init__(self, run_id: Optional[str] = None, mode: str = "incremental"):
+        self.disabled = os.environ.get("DAT535_BENCHMARK_DISABLED") == "true"
         self.run_id = run_id or os.environ.get("DAT535_BENCHMARK_ID")
         if not self.run_id:
             now_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -103,7 +104,8 @@ class PipelineProfiler:
         self.total_duration_seconds: float = 0.0
         self.environment = "github_actions" if os.environ.get("GITHUB_ACTIONS") == "true" else "local_environment"
         self.steps: List[StepTracker] = []
-        self._load_existing_if_present()
+        if not self.disabled:
+            self._load_existing_if_present()
 
     def _get_benchmark_path(self) -> Path:
         return BENCHMARKS_DIR / f"{self.run_id}.json"
@@ -240,10 +242,13 @@ class PipelineProfiler:
     def save_json(self, output_dir: Optional[Path] = None) -> Path:
         """Write benchmark data to timestamped JSON file and update latest_benchmark.json."""
         target_dir = output_dir or BENCHMARKS_DIR
+        file_path = target_dir / f"{self.run_id}.json"
+        if self.disabled:
+            return file_path
+
         target_dir.mkdir(parents=True, exist_ok=True)
 
         payload = self.to_dict()
-        file_path = target_dir / f"{self.run_id}.json"
         with open(file_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
 
@@ -258,6 +263,9 @@ class PipelineProfiler:
 
     def print_summary_table(self) -> None:
         """Print clean ASCII execution summary table to console."""
+        if self.disabled:
+            return
+
         data = self.to_dict()
         summary = data.get("summary", {})
         steps = data.get("steps", [])

@@ -45,7 +45,13 @@ def run_tests():
     logger.info("RUNNING AUTOMATED TEST SUITE (INGESTION & SILVER)")
     logger.info("=" * 70)
     start = time.time()
-    res = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests"])
+    test_env = os.environ.copy()
+    test_env.pop("DAT535_BENCHMARK_ID", None)
+    test_env["DAT535_BENCHMARK_DISABLED"] = "true"
+    res = subprocess.run(
+        [sys.executable, "-m", "unittest", "discover", "-s", "tests"],
+        env=test_env,
+    )
     elapsed = time.time() - start
     if res.returncode == 0:
         logger.info(f"All unit tests passed successfully in {elapsed:.2f}s.")
@@ -157,17 +163,17 @@ def main():
             logger.error("Gold layer failed. Halting pipeline.")
             sys.exit(1)
 
+    elapsed = time.time() - total_start
+    logger.info(f"Medallion project run completed successfully in {elapsed:.2f} seconds.")
+
+    # Finalize, save, and print aggregated benchmark JSON and terminal summary table BEFORE running tests
+    profiler.save_json()
+    profiler.print_summary_table()
+
     if args.action == "all":
         logger.info("Running post-execution test verification...")
         if not run_tests():
             sys.exit(1)
-
-    elapsed = time.time() - total_start
-    logger.info(f"Medallion project run completed successfully in {elapsed:.2f} seconds.")
-
-    # Save aggregated benchmark JSON and print terminal summary table
-    profiler.save_json()
-    profiler.print_summary_table()
 
 
 if __name__ == "__main__":

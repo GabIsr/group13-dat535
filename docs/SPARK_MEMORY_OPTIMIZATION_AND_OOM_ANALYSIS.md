@@ -1026,7 +1026,30 @@ df_joined_spark = df_311_pruned.alias("t").join(broadcast(df_w_sub).alias("w"), 
 
 ---
 
-## 5.4 Production Verification & Empirical Benchmark Summary
+## 5.4 Slowest-Source Synchronization, Incremental Partition Targeting & Profiler Accumulation
+
+### 5.4.1 Slowest-Source Watermark Alignment (ERA5 Weather Reanalysis Lag)
+* **The Problem:** ERA5-Land weather reanalysis has an inherent **5-day scientific verification and publication latency** (observations available up to November 9), whereas NYC 311 service requests are ingested up to November 13 (1-day latency). Joining 311 calls from Nov 10–13 against weather produced **37,676 unmatched rows**, dropping the November Fact Join match rate to **71.11%** and producing empty meteorological indicators in downstream Gold marts.
+* **The Fix:** In [`src/silver/join_silver.py`](file:///C:/Media/UiS/DAT535/group13-dat535/src/silver/join_silver.py#L88-L100), we dynamically detect the maximum weather observation timestamp (`max_weather_ts = spark_max("timestamp_utc")`) and cap 311 fact joining to `weather_join_hour_utc <= max_weather_ts`.
+* **Why It Fixes It:** Adheres to enterprise synchronization principles where joined analytical facts are bounded by the slowest source. Keeps the Fact Join match rate at **~99.9%** across all months, prevents incomplete weather metrics from distorting Gold mart aggregations, and eliminates the 71% quality alert. Unjoined 311 records are preserved in Silver and joined as soon as late-arriving weather data is ingested.
+
+### 5.4.2 True End-to-End Incremental Partition Targeting (CDC)
+* **The Problem:** While Bronze ran in incremental CDC mode (ingesting only 1 new record in 10 seconds), `run_silver.py` had no awareness of what Bronze ingested. It discovered all partition folders in Bronze (`month=10` and `month=11`) and reprocessed **387,412 rows across both months from scratch**, wasting over 3 minutes re-cleaning unchanged October data.
+* **The Fix:** In [`src/utils/partitioning.py`](file:///C:/Media/UiS/DAT535/group13-dat535/src/utils/partitioning.py) and [`run_silver.py`](file:///C:/Media/UiS/DAT535/group13-dat535/run_silver.py), incremental mode inspects the latest Bronze ingestion manifest (`nyc_311_*.json`) to identify which specific `(year, month)` partitions received new or mutated records. Silver executes only the affected monthly slices using dynamic partition overwrite (`partitionOverwriteMode=dynamic`).
+* **Why It Fixes It:** If only November received new records, Silver cleans only November (~1.5 minutes), leaving October untouched on disk. If an older October ticket was closed/updated in Socrata, the manifest detects that `month=10` was written to, and Silver re-runs October as well to update SLA durations. Cuts daily pipeline runtime from 6m 22s down to ~1.5 minutes.
+
+### 5.4.3 Quality Report De-Duplication & Profiler Accumulation
+* **The Problem:** 
+  1. In [`src/silver/clean_311.py`](file:///C:/Media/UiS/DAT535/group13-dat535/src/silver/clean_311.py#L960-L972), the reconciliation audit scanned the entire Silver directory on disk (740,500 rows) at the end of every slice. The orchestrator summed these full-table counts across slices, reporting an inflated **1,481,000 accepted records** ($740,500 \times 2$).
+  2. In [`src/utils/benchmark.py`](file:///C:/Media/UiS/DAT535/group13-dat535/src/utils/benchmark.py), sub-operation metrics were keyed only by `stage_step_name`. Slice 2 (November) overwrote Slice 1 (October), causing the terminal summary table to report only **3m 08s** instead of the true total pipeline duration (**6m 22s**).
+* **The Fix:**
+  1. Scoped `clean_311.py` audit aggregation to `created_at_utc` within `start_date` and `end_date`, and added `total_lakehouse_records` for the distinct on-disk snapshot (**740,500**).
+  2. Added active partition tagging (`set_active_partition("2026-10")`) in `PipelineProfiler`. Raw steps are preserved with their partition label in `partitions["2026-10"]` and `partitions["2026-11"]` in the benchmark JSON for individual inspection, while `steps` accumulates durations and row counts across all slices.
+* **Why It Fixes It:** The quality ledger prints mathematically consistent numbers (valid rows match input minus duplicates minus quarantine), the JSON preserves isolated per-month performance data for reporting, and the printed benchmark table reflects the true combined execution time across all executed slices.
+
+---
+
+## 5.5 Production Verification & Empirical Benchmark Summary
 
 The combined optimizations of Iteration 4 were verified through end-to-end execution of the Silver layer for the full month of October 2026:
 

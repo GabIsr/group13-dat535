@@ -83,6 +83,9 @@ def generate_quality_reconciliation_report(
     print(f"{'Exact Duplicates Removed (unique_key)':<42} | {f'-{b_311_dup:,}':<16} | {f'{dup_pct:.2f}%':<10} | {'CDC primary key deduplication':<28}")
     print(f"{'Temporal Failures Quarantined':<42} | {f'-{b_311_quar:,}':<16} | {f'{quar_pct:.2f}%':<10} | {'Negative/corrupted duration':<28}")
     print(f"{'Clean Valid Records Accepted in Silver':<42} | {f'= {b_311_valid:,}':<16} | {'100.0%':<10} | {'Passed all intake quality gates':<28}")
+    total_lakehouse = clean_311_metrics.get("total_lakehouse_records")
+    if total_lakehouse and total_lakehouse != b_311_valid:
+        print(f"{'Cumulative Clean Records in Lakehouse':<42} | {f'= {total_lakehouse:,}':<16} | {'-':<10} | {'Total verified records on disk':<28}")
 
     if b_311_valid > 0:
         pct_closed = (b_311_closed / b_311_valid) * 100.0

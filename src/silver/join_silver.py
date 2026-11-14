@@ -11,7 +11,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from pyspark.sql.functions import broadcast, col, date_format, lit, sum as spark_sum, when
+from pyspark.sql.functions import (
+    broadcast,
+    col,
+    date_format,
+    lit,
+    max as spark_max,
+    sum as spark_sum,
+    when,
+)
 from pyspark.storagelevel import StorageLevel
 
 from src.silver.config import PROJECT_ROOT, SILVER_DIR
@@ -78,6 +86,19 @@ def join_silver_datasets(
 
         total_weather = df_weather_spark.count()
         logger.info(f"Loaded {total_weather:,} hourly weather observations into PySpark.")
+
+        # Slowest-source watermark synchronization: Cap 311 records to available weather horizon
+        if total_weather > 0:
+            max_weather_row = df_weather_spark.select(spark_max("timestamp_utc")).collect()[0]
+            max_weather_ts = max_weather_row[0] if max_weather_row else None
+            if max_weather_ts is not None:
+                logger.info(
+                    f"Slowest-source synchronization: Capping 311 Fact Join to latest weather watermark (<= {max_weather_ts})"
+                )
+                df_311_spark = df_311_spark.filter(col("weather_join_hour_utc") <= lit(max_weather_ts))
+                total_311 = df_311_spark.count()
+                logger.info(f"Retained {total_311:,} clean 311 records within weather observation horizon.")
+
         step_scan.set_input_rows(total_311)
         step_scan.set_output_rows(total_311)
 

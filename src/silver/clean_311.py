@@ -962,6 +962,10 @@ def clean_and_validate_311(
             written_silver_files = sorted(silver_311_dir.glob("**/*.parquet"))
             if written_silver_files:
                 df_written = spark.read.parquet(str(silver_311_dir))
+                if start_date:
+                    df_written = df_written.filter(col("created_at_utc") >= lit(start_date))
+                if end_date:
+                    df_written = df_written.filter(col("created_at_utc") <= lit(end_date))
                 valid_rows_accepted = df_written.count()
             else:
                 df_written = None

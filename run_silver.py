@@ -47,6 +47,12 @@ def main():
         help="Target execution environment (default: dev)",
     )
     parser.add_argument(
+        "--mode",
+        choices=["all", "incremental", "backfill"],
+        default="all",
+        help="Pipeline execution mode (default: all)",
+    )
+    parser.add_argument(
         "--start-date",
         type=str,
         default=None,
@@ -71,6 +77,7 @@ def main():
         start_date=args.start_date,
         end_date=args.end_date,
         bronze_dir=bronze_311_dir,
+        mode=args.mode,
     )
 
     if not windows:
@@ -82,12 +89,18 @@ def main():
         f"{', '.join([f'[{w[0]} -> {w[1]}]' for w in windows])}"
     )
 
+    profiler = get_profiler()
     m_weather = {}
     m_311 = {}
     m_join = {}
 
     for idx, (w_start, w_end) in enumerate(windows, 1):
-        logger.info(f"=== Processing Partition Slice {idx}/{len(windows)}: [{w_start} -> {w_end}] ===")
+        partition_label = w_start[:7]
+        profiler.set_active_partition(partition_label)
+        logger.info(
+            f"=== Processing Partition Slice {idx}/{len(windows)}: [{w_start} -> {w_end}] "
+            f"(Partition: {partition_label}) ==="
+        )
 
         # Stage 1: Clean Weather
         if args.stage in ["all", "weather"]:
@@ -137,8 +150,17 @@ def main():
                         if k in curr_join and k in m_join:
                             m_join[k] += curr_join[k]
 
+    profiler.set_active_partition(None)
+
     # If full pipeline ran, compile Quality Reconciliation Ledger
     if args.stage == "all" and m_311 and m_weather and m_join:
+        try:
+            from src.utils.spark import get_spark_session
+            audit_spark = get_spark_session("DAT535-Silver-Audit")
+            total_lakehouse_count = audit_spark.read.parquet(str(PROJECT_ROOT / "data" / "silver" / "nyc311")).count()
+            m_311["total_lakehouse_records"] = total_lakehouse_count
+        except Exception as e:
+            logger.debug(f"Could not compute total on-disk Lakehouse records: {e}")
         generate_quality_reconciliation_report(m_311, m_weather, m_join)
 
     elapsed = time.time() - overall_start

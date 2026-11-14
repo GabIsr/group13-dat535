@@ -5,6 +5,7 @@ Provides robust calendar-aligned month-by-month partition batching for bounded-m
 """
 
 import calendar
+import json
 import logging
 import re
 from datetime import date, datetime
@@ -18,6 +19,8 @@ def get_monthly_execution_windows(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     bronze_dir: Optional[Path] = None,
+    mode: str = "all",
+    manifests_dir: Optional[Path] = None,
 ) -> List[Tuple[str, str]]:
     """
     Generate sequential month-by-month execution windows [(start_iso, end_iso), ...].
@@ -29,8 +32,12 @@ def get_monthly_execution_windows(
        e.g., '2026-01-15' to '2026-03-10' produces:
              [('2026-01-15', '2026-01-31'), ('2026-02-01', '2026-02-28'), ('2026-03-01', '2026-03-10')]
 
-    2. If dates are omitted or partial:
-       Discovers available 'year=YYYY/month=MM' Hive partition directories in bronze_dir
+    2. If mode == 'incremental' and dates are omitted:
+       Discovers which specific 'year=YYYY/month=MM' partitions were touched by the latest
+       Bronze ingestion manifest, executing only affected partition slices (skipping untouched months).
+
+    3. If dates are omitted or partial in 'all' / 'backfill' mode:
+       Discovers all available 'year=YYYY/month=MM' Hive partition directories in bronze_dir
        and generates chronological full-month windows.
     """
     dt_start = datetime.strptime(start_date, "%Y-%m-%d").date() if start_date else None
@@ -59,9 +66,47 @@ def get_monthly_execution_windows(
                 curr = date(curr.year, curr.month + 1, 1)
         return windows
 
-    # If dates are omitted or partially omitted, discover from bronze_dir partitions
     discovered_months: List[Tuple[int, int]] = []
-    if bronze_dir and bronze_dir.exists():
+
+    # Incremental CDC Discovery: check partitions touched in latest Bronze manifest
+    if mode == "incremental":
+        m_dir = manifests_dir
+        if not m_dir and bronze_dir:
+            candidate_m = bronze_dir.parent.parent / "metadata" / "manifests"
+            if candidate_m.exists():
+                m_dir = candidate_m
+
+        if m_dir and m_dir.exists():
+            manifest_files = sorted(
+                m_dir.glob("nyc_311_*.json"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if manifest_files:
+                try:
+                    with open(manifest_files[0], "r", encoding="utf-8") as f:
+                        m_data = json.load(f)
+                        for wf in m_data.get("written_files", []):
+                            rel = wf.get("relative_path", "")
+                            match = re.search(r"year=(\d{4})[\\/]month=(\d{1,2})", rel)
+                            if match:
+                                discovered_months.append((int(match.group(1)), int(match.group(2))))
+
+                        if not discovered_months and m_data.get("source_data_start"):
+                            s_dt = datetime.strptime(str(m_data["source_data_start"])[:10], "%Y-%m-%d").date()
+                            discovered_months.append((s_dt.year, s_dt.month))
+
+                    if discovered_months:
+                        unique_m = sorted(list(set(discovered_months)))
+                        logger.info(
+                            f"Incremental CDC mode: Discovered {len(unique_m)} partition(s) touched by "
+                            f"latest Bronze batch: {unique_m}"
+                        )
+                except Exception as e:
+                    logger.debug(f"Could not read latest ingestion manifest for incremental partitioning: {e}")
+
+    # Fallback to discovering all partitions from bronze_dir if not incremental or manifest empty
+    if not discovered_months and bronze_dir and bronze_dir.exists():
         # Match Hive style year=YYYY/month=MM or year=YYYY/month=M
         for p in bronze_dir.glob("year=*/month=*"):
             m = re.search(r"year=(\d{4})[\\/]month=(\d{1,2})", str(p))

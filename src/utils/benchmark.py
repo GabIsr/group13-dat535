@@ -32,9 +32,16 @@ logger = logging.getLogger("benchmark")
 class StepTracker:
     """Active container for a single measured sub-operation."""
 
-    def __init__(self, stage: str, step_name: str, input_rows: Optional[int] = None):
+    def __init__(
+        self,
+        stage: str,
+        step_name: str,
+        input_rows: Optional[int] = None,
+        partition: Optional[str] = None,
+    ):
         self.stage = stage
         self.step_name = step_name
+        self.partition = partition
         self.input_rows = input_rows
         self.output_rows: Optional[int] = None
         self.start_perf = time.perf_counter()
@@ -63,7 +70,7 @@ class StepTracker:
         if rows_evaluated and self.duration_seconds > 0:
             throughput = round(rows_evaluated / self.duration_seconds, 2)
 
-        return {
+        payload = {
             "stage": self.stage,
             "step_name": self.step_name,
             "duration_seconds": self.duration_seconds,
@@ -73,6 +80,9 @@ class StepTracker:
             "throughput_rows_per_sec": throughput,
             "details": self.details,
         }
+        if self.partition:
+            payload["partition"] = self.partition
+        return payload
 
 
 def format_duration(seconds: float) -> str:
@@ -98,6 +108,7 @@ class PipelineProfiler:
             self.run_id = f"bench_{now_str}"
 
         self.mode = mode
+        self.active_partition: Optional[str] = None
         self.start_wall_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         self.start_perf = time.perf_counter()
         self.end_perf: Optional[float] = None
@@ -106,6 +117,10 @@ class PipelineProfiler:
         self.steps: List[StepTracker] = []
         if not self.disabled:
             self._load_existing_if_present()
+
+    def set_active_partition(self, partition: Optional[str]) -> None:
+        """Set the active partition context (e.g. '2026-10') for subsequent measured steps."""
+        self.active_partition = partition
 
     def _get_benchmark_path(self) -> Path:
         return BENCHMARKS_DIR / f"{self.run_id}.json"
@@ -123,9 +138,16 @@ class PipelineProfiler:
                 logger.debug(f"Could not read existing benchmark file {path}: {e}")
 
     @contextmanager
-    def measure_step(self, stage: str, step_name: str, input_rows: Optional[int] = None):
+    def measure_step(
+        self,
+        stage: str,
+        step_name: str,
+        input_rows: Optional[int] = None,
+        partition: Optional[str] = None,
+    ):
         """Context manager to measure execution time of a pipeline step."""
-        tracker = StepTracker(stage=stage, step_name=step_name, input_rows=input_rows)
+        p = partition or self.active_partition
+        tracker = StepTracker(stage=stage, step_name=step_name, input_rows=input_rows, partition=p)
         try:
             yield tracker
         finally:
@@ -142,9 +164,11 @@ class PipelineProfiler:
         input_rows: Optional[int] = None,
         output_rows: Optional[int] = None,
         details: Optional[Dict[str, Any]] = None,
+        partition: Optional[str] = None,
     ) -> None:
         """Explicitly record a step without a context manager."""
-        tracker = StepTracker(stage=stage, step_name=step_name, input_rows=input_rows)
+        p = partition or self.active_partition
+        tracker = StepTracker(stage=stage, step_name=step_name, input_rows=input_rows, partition=p)
         tracker.duration_seconds = round(duration_seconds, 3)
         tracker.output_rows = output_rows
         if details:
@@ -163,29 +187,85 @@ class PipelineProfiler:
         """Compile complete structured dictionary for JSON export."""
         self.finish()
 
-        # Read any prior stages recorded by other subprocesses in this run session
-        prior_steps_dict: Dict[str, Dict[str, Any]] = {}
+        # Read any prior raw steps recorded by earlier steps or subprocesses
+        raw_steps_dict: Dict[str, Dict[str, Any]] = {}
         path = self._get_benchmark_path()
         if path.exists():
             try:
                 with open(path, "r", encoding="utf-8") as f:
                     existing = json.load(f)
-                    for s in existing.get("steps", []):
-                        key = f"{s.get('stage')}_{s.get('step_name')}"
-                        prior_steps_dict[key] = s
+                    for s in existing.get("raw_steps", existing.get("steps", [])):
+                        part_key = s.get("partition") or "unpartitioned"
+                        key = f"{part_key}_{s.get('stage')}_{s.get('step_name')}"
+                        raw_steps_dict[key] = s
             except Exception:
                 pass
 
-        # Merge current in-memory steps over prior steps
+        # Merge current in-memory steps into raw_steps_dict
         for st in self.steps:
             st_dict = st.to_dict()
-            key = f"{st_dict['stage']}_{st_dict['step_name']}"
-            prior_steps_dict[key] = st_dict
+            part_key = st_dict.get("partition") or "unpartitioned"
+            key = f"{part_key}_{st_dict['stage']}_{st_dict['step_name']}"
+            raw_steps_dict[key] = st_dict
 
-        all_steps = list(prior_steps_dict.values())
-        total_time = sum(s.get("duration_seconds", 0.0) for s in all_steps)
+        all_raw_steps = list(raw_steps_dict.values())
+
+        # 1. Build distinct per-partition breakdown so each month can be inspected separately in JSON
+        partitions_summary: Dict[str, Dict[str, Any]] = {}
+        for s in all_raw_steps:
+            p_name = s.get("partition") or "unpartitioned"
+            if p_name not in partitions_summary:
+                partitions_summary[p_name] = {
+                    "total_duration_seconds": 0.0,
+                    "steps": [],
+                }
+            partitions_summary[p_name]["total_duration_seconds"] = round(
+                partitions_summary[p_name]["total_duration_seconds"] + s.get("duration_seconds", 0.0), 3
+            )
+            partitions_summary[p_name]["steps"].append(s)
+
+        for p_info in partitions_summary.values():
+            p_sec = p_info["total_duration_seconds"]
+            p_info["total_duration_human"] = format_duration(p_sec)
+
+        # 2. Build aggregated summary across all executed partitions/slices
+        aggregated_dict: Dict[str, Dict[str, Any]] = {}
+        for s in all_raw_steps:
+            agg_key = f"{s.get('stage')}_{s.get('step_name')}"
+            if agg_key not in aggregated_dict:
+                aggregated_dict[agg_key] = {
+                    "stage": s.get("stage"),
+                    "step_name": s.get("step_name"),
+                    "duration_seconds": 0.0,
+                    "input_rows": 0,
+                    "output_rows": 0,
+                    "partitions_covered": [],
+                }
+            entry = aggregated_dict[agg_key]
+            entry["duration_seconds"] = round(entry["duration_seconds"] + s.get("duration_seconds", 0.0), 3)
+            if s.get("input_rows") is not None:
+                entry["input_rows"] += s.get("input_rows", 0)
+            if s.get("output_rows") is not None:
+                entry["output_rows"] += s.get("output_rows", 0)
+            p_label = s.get("partition")
+            if p_label and p_label not in entry["partitions_covered"]:
+                entry["partitions_covered"].append(p_label)
+
+        total_time = sum(s["duration_seconds"] for s in aggregated_dict.values())
         if total_time <= 0:
             total_time = self.total_duration_seconds
+
+        all_steps = []
+        for s in aggregated_dict.values():
+            s["duration_human"] = format_duration(s["duration_seconds"])
+            rows_evaluated = s["output_rows"] if s["output_rows"] > 0 else s["input_rows"]
+            s["throughput_rows_per_sec"] = (
+                round(rows_evaluated / s["duration_seconds"], 2)
+                if s["duration_seconds"] > 0 and rows_evaluated > 0
+                else 0.0
+            )
+            s["pct_of_total"] = round((s["duration_seconds"] / total_time * 100.0), 2) if total_time > 0 else 0.0
+            all_steps.append(s)
 
         # Group steps by stage
         stages_summary: Dict[str, Dict[str, Any]] = {}
@@ -199,9 +279,6 @@ class PipelineProfiler:
             stages_summary[st_name]["total_duration_seconds"] = round(
                 stages_summary[st_name]["total_duration_seconds"] + s.get("duration_seconds", 0.0), 3
             )
-            # Add relative percentage share of total
-            pct = round((s.get("duration_seconds", 0.0) / total_time * 100.0), 2) if total_time > 0 else 0.0
-            s["pct_of_total"] = pct
             stages_summary[st_name]["steps"].append(s)
 
         for st_info in stages_summary.values():
@@ -229,14 +306,16 @@ class PipelineProfiler:
                 "python_version": platform.python_version(),
             },
             "summary": {
-                "total_duration_seconds": round(total_time, 3),
+                "total_duration_seconds": total_time,
                 "total_duration_human": format_duration(total_time),
+                "total_steps_executed": len(all_raw_steps),
                 "max_rows_processed": max_rows,
                 "overall_throughput_rows_per_sec": overall_throughput,
-                "total_steps_executed": len(all_steps),
             },
-            "stages": stages_summary,
+            "partitions": partitions_summary,
             "steps": all_steps,
+            "raw_steps": all_raw_steps,
+            "stages": stages_summary,
         }
 
     def save_json(self, output_dir: Optional[Path] = None) -> Path:

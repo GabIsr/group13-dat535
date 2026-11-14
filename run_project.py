@@ -61,24 +61,24 @@ def run_tests():
         return False
 
 
-def run_bronze(env: str = "dev"):
+def run_bronze(env: str = "dev", mode: str = "incremental"):
     """Execute Bronze Landing and Ingestion."""
     logger.info("=" * 70)
     logger.info("EXECUTING BRONZE LAYER (LANDING & PRESERVATION)")
     logger.info("=" * 70)
     from run_ingestion import main as ingestion_main
     # Call ingestion
-    cmd = [sys.executable, "run_ingestion.py", "--dataset", "all", "--mode", "incremental", "--env", env]
+    cmd = [sys.executable, "run_ingestion.py", "--dataset", "all", "--mode", mode, "--env", env]
     res = subprocess.run(cmd)
     return res.returncode == 0
 
 
-def run_silver(env: str = "dev"):
+def run_silver(env: str = "dev", mode: str = "incremental"):
     """Execute Silver Cleaning, Validation, Imputation, and Broadcast Join."""
     logger.info("=" * 70)
     logger.info("EXECUTING SILVER LAYER (CLEANING, IMPUTATION & FACT JOIN)")
     logger.info("=" * 70)
-    cmd = [sys.executable, "run_silver.py", "--stage", "all", "--env", env]
+    cmd = [sys.executable, "run_silver.py", "--stage", "all", "--env", env, "--mode", mode]
     res = subprocess.run(cmd)
     return res.returncode == 0
 
@@ -122,6 +122,12 @@ def main():
         help="Target execution environment (default: dev)",
     )
     parser.add_argument(
+        "--mode",
+        choices=["incremental", "backfill"],
+        default="incremental",
+        help="Pipeline execution mode (default: incremental)",
+    )
+    parser.add_argument(
         "--compact",
         action="store_true",
         help="Run partition compaction on Bronze after ingestion",
@@ -135,7 +141,7 @@ def main():
         now_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         os.environ["DAT535_BENCHMARK_ID"] = f"pipeline_{now_str}"
 
-    profiler = get_profiler(run_id=os.environ["DAT535_BENCHMARK_ID"], mode=args.action)
+    profiler = get_profiler(run_id=os.environ["DAT535_BENCHMARK_ID"], mode=args.mode)
 
     if args.action == "test":
         success = run_tests()
@@ -146,7 +152,7 @@ def main():
         sys.exit(0)
 
     if args.action in ["all", "bronze"]:
-        if not run_bronze(env=args.env):
+        if not run_bronze(env=args.env, mode=args.mode):
             logger.error("Bronze layer failed. Halting pipeline.")
             sys.exit(1)
 
@@ -154,7 +160,7 @@ def main():
         run_compaction()
 
     if args.action in ["all", "silver"]:
-        if not run_silver(env=args.env):
+        if not run_silver(env=args.env, mode=args.mode):
             logger.error("Silver layer failed. Halting pipeline.")
             sys.exit(1)
 

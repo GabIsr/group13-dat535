@@ -53,15 +53,18 @@ def build_agency_resolution_performance_mart(
     silver_weather_dir: Path = SILVER_WEATHER_DIR,
     output_dir: Path = GOLD_MARTS_DIR,
     long_open_days: float = LONG_OPEN_BACKLOG_DAYS,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Construct the Agency Resolution & SLA Performance Mart using PySpark.
     Conceptually separates creation cohorts (incoming demand), closure cohorts (agency output),
     and active backlog accumulation as of each reporting date.
     Utilizes PySpark percentile_approx for robust SLA distribution modeling (Lab 3 requirement).
+    Supports optional start_date and end_date partition pruning.
     """
     start_time = time.time()
-    built_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    built_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
     # 1. Discover Clean Silver 311 Records
     files_311 = sorted(silver_311_dir.glob("**/*.parquet"))
@@ -73,6 +76,14 @@ def build_agency_resolution_performance_mart(
 
     file_paths_311 = [str(f.resolve()) for f in files_311]
     df_311_spark = spark.read.parquet(*file_paths_311)
+
+    if start_date:
+        logger.info(f"Applying start_date filter on Silver 311: created_at_utc >= {start_date}")
+        df_311_spark = df_311_spark.filter(col("created_at_utc") >= lit(start_date))
+    if end_date:
+        logger.info(f"Applying end_date filter on Silver 311: created_at_utc <= {end_date}")
+        df_311_spark = df_311_spark.filter(col("created_at_utc") <= lit(end_date))
+
     total_311_input = df_311_spark.count()
     logger.info(f"Loaded {total_311_input:,} clean 311 records into PySpark.")
 
@@ -300,12 +311,10 @@ def build_agency_resolution_performance_mart(
 
     # 7. Grain Uniqueness Verification in PySpark
     grain_cols = ["reporting_date", "borough", "agency"]
-    df_perf_spark.persist(StorageLevel.MEMORY_AND_DISK)
     total_perf_rows = df_perf_spark.count()
     distinct_grain_count = df_perf_spark.select(*grain_cols).distinct().count()
 
     if distinct_grain_count != total_perf_rows:
-        df_perf_spark.unpersist()
         raise ValueError(f"Grain uniqueness violation: {total_perf_rows - distinct_grain_count} duplicate keys on {grain_cols}")
 
     # 8. Write Parquet Mart using PySpark distributed coalesce(1) write
@@ -321,7 +330,6 @@ def build_agency_resolution_performance_mart(
         spark_sum("tickets_created_today").alias("total_created"),
         spark_sum("tickets_closed_today").alias("total_closed"),
     ).collect()[0]
-    df_perf_spark.unpersist()
 
     elapsed = time.time() - start_time
     logger.info(

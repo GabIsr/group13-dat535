@@ -23,6 +23,7 @@ from pyspark.sql.functions import (
     asin,
     avg,
     broadcast,
+    coalesce,
     col,
     concat,
     concat_ws,
@@ -69,6 +70,7 @@ from src.silver.semantic_conformance import (
     upsert_unmapped_taxonomy_ledger,
 )
 from src.utils.spark import get_spark_session
+from src.utils.benchmark import get_profiler
 from src.silver.config import (
     BOROUGH_CENTROIDS,
     BRONZE_DIR,
@@ -385,18 +387,31 @@ def quarantine_invalid_311_records(
 def deduplicate_311_records(df: DataFrame) -> Tuple[DataFrame, int]:
     """
     Perform Change Data Capture (CDC) deduplication via PySpark Window on valid records.
-    Prioritizes Socrata source update timestamp over arrival timestamp, ensuring historical
-    backfills never overwrite newer ticket states.
+    Prioritizes authoritative business mutation timestamps:
+      coalesce(resolution_action_updated_date, closed_date, created_date)
+    over Lakehouse pipeline ingestion timestamp (_ingested_at_utc), falling back to source_updated_at.
+    Ensures genuine municipal case resolutions always win deterministically without trusting
+    unreliable third-party database re-indexing metadata.
     100% pure PySpark.
     """
     cols = set(df.columns)
     order_cols = []
-    if "source_updated_at" in cols:
-        order_cols.append(col("source_updated_at").desc())
+
+    # 1. Authoritative business lifecycle mutation timestamp (real municipal work date)
+    business_date_candidates = []
+    for c in ["resolution_action_updated_date", "closed_date", "created_date", "created_at_utc"]:
+        if c in cols:
+            business_date_candidates.append(col(c))
+    if business_date_candidates:
+        order_cols.append(coalesce(*business_date_candidates).desc())
+
+    # 2. Authoritative Lakehouse pipeline arrival timestamp (our Bronze ingestion batch time)
     if "_ingested_at_utc" in cols:
         order_cols.append(col("_ingested_at_utc").desc())
-    if "created_date" in cols:
-        order_cols.append(col("created_date").desc())
+
+    # 3. Tertiary fallback to source_updated_at if present, or unique_key
+    if "source_updated_at" in cols:
+        order_cols.append(col("source_updated_at").desc())
     if not order_cols:
         order_cols.append(col("unique_key").desc())
 
@@ -794,10 +809,12 @@ def clean_and_validate_311(
     silver_311_dir: Path = SILVER_DIR / "nyc311",
     quarantine_dir: Path = QUARANTINE_DIR / "nyc311",
     staging_dir: Optional[Path] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     100% pure PySpark Silver Layer 311 Orchestrator:
-    1. Ingest Bronze Parquet files.
+    1. Ingest Bronze Parquet files (with optional start_date/end_date partition pruning).
     2. Normalize Eastern Time timestamps to UTC and compute durations.
     3. Quarantine invalid boundary violations directly to Parquet.
     4. CDC Deduplicate valid records by unique_key.
@@ -807,7 +824,7 @@ def clean_and_validate_311(
     8. Write clean partitioned Parquet tables via pure PySpark.
     """
     start_time = time.time()
-    processed_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    processed_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
     now_epoch = int(datetime.now(timezone.utc).timestamp())
 
     if staging_dir is None:
@@ -818,22 +835,37 @@ def clean_and_validate_311(
         logger.warning(f"No Bronze 311 files found in {bronze_311_dir}")
         return {"status": "skipped", "reason": "no_input_files"}
 
-    logger.info(f"Loading {len(bronze_files)} Bronze 311 partition files into PySpark...")
-    spark = get_spark_session("DAT535-Silver-Clean-311")
-    file_paths = [str(f.resolve()) for f in bronze_files]
-    df_raw = spark.read.parquet(*file_paths)
-    input_rows = df_raw.count()
+    profiler = get_profiler()
+
+    with profiler.measure_step("silver_311", "bronze_scan_and_pruning") as step_scan:
+        logger.info(f"Loading {len(bronze_files)} Bronze 311 partition files into PySpark...")
+        spark = get_spark_session("DAT535-Silver-Clean-311")
+        file_paths = [str(f.resolve()) for f in bronze_files]
+        df_raw = spark.read.parquet(*file_paths)
+
+        # Optional partition pruning if date range is specified
+        if start_date:
+            logger.info(f"Applying start_date filter on Bronze 311: created_date >= {start_date}")
+            df_raw = df_raw.filter(col("created_date") >= lit(start_date))
+        if end_date:
+            logger.info(f"Applying end_date filter on Bronze 311: created_date <= {end_date}")
+            df_raw = df_raw.filter(col("created_date") <= lit(end_date))
+
+        input_rows = df_raw.count()
+        step_scan.set_input_rows(input_rows)
+        step_scan.set_output_rows(input_rows)
     logger.info(f"Loaded {input_rows:,} raw 311 records from Bronze via PySpark.")
 
-    # 1. Temporal Normalization & Duration Derivations
-    df_proc = normalize_timestamps_and_durations(df_raw, now_epoch)
+    with profiler.measure_step("silver_311", "temporal_and_quarantine_validation", input_rows=input_rows) as step_quar:
+        # 1. Temporal Normalization & Duration Derivations
+        df_proc = normalize_timestamps_and_durations(df_raw, now_epoch)
 
-    # 2. Strict Boundary Quarantine Validation
-    df_valid_candidates, quarantined_count = quarantine_invalid_311_records(
-        df_proc, now_epoch, quarantine_dir
-    )
-
-    candidate_count = df_valid_candidates.count()
+        # 2. Strict Boundary Quarantine Validation
+        df_valid_candidates, quarantined_count = quarantine_invalid_311_records(
+            df_proc, now_epoch, quarantine_dir
+        )
+        candidate_count = df_valid_candidates.count()
+        step_quar.set_output_rows(candidate_count)
     if candidate_count == 0:
         elapsed = time.time() - start_time
         logger.info("Silver 311 processing complete: 0 valid records retained.")
@@ -867,12 +899,16 @@ def clean_and_validate_311(
     # PHASE 1: Row-Level Normalization, Spatial Imputation & Street Canonicalization
     # =========================================================================
     logger.info("Executing Silver 311 Phase 1: Row-level normalization & spatial canonicalization...")
-    df_dedup, duplicate_rows_removed = deduplicate_311_records(df_valid_candidates)
-    df_spatial_clean = impute_spatial_and_canonicalize_routes(df_dedup, spark)
+    with profiler.measure_step("silver_311", "cdc_deduplication", input_rows=candidate_count) as step_dedup:
+        df_dedup, duplicate_rows_removed = deduplicate_311_records(df_valid_candidates)
+        step_dedup.set_output_rows(candidate_count - duplicate_rows_removed)
 
-    # MATERIALIZE PHASE 1 TO TRANSIENT STAGING: Completely truncates Catalyst AST lineage
-    staging_dir.mkdir(parents=True, exist_ok=True)
-    df_spatial_clean.write.mode("overwrite").parquet(str(staging_dir))
+    with profiler.measure_step("silver_311", "spatial_imputation_and_staging_write", input_rows=candidate_count - duplicate_rows_removed) as step_spat:
+        df_spatial_clean = impute_spatial_and_canonicalize_routes(df_dedup, spark)
+        # MATERIALIZE PHASE 1 TO TRANSIENT STAGING: Completely truncates Catalyst AST lineage
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        df_spatial_clean.write.mode("overwrite").parquet(str(staging_dir))
+        step_spat.set_output_rows(candidate_count - duplicate_rows_removed)
     logger.info(f"Phase 1 materialized to transient staging: {staging_dir}")
 
     success = False
@@ -881,34 +917,40 @@ def clean_and_validate_311(
         # PHASE 2: Stateful Burst Clustering, Enrichment & Final Partition Write
         # =========================================================================
         logger.info("Executing Silver 311 Phase 2: Burst clustering from clean staging...")
-        df_staging = spark.read.parquet(str(staging_dir))
+        with profiler.measure_step("silver_311", "clustering_enrichment_and_parquet_write", input_rows=candidate_count - duplicate_rows_removed) as step_p2:
+            df_staging = spark.read.parquet(str(staging_dir))
 
-        df_clustered = cluster_citizen_call_bursts(df_staging, burst_window_hours=6.0)
+            df_clustered = cluster_citizen_call_bursts(df_staging, burst_window_hours=6.0)
 
-        # Categorical Schema Drift & Semantic Conformance (Issue #8)
-        logger.info("Executing PySpark Categorical Schema Drift & Semantic Conformance...")
-        df_conformed = conform_complaint_taxonomy(df_clustered, spark=spark, reference_path=TAXONOMY_REFERENCE_PATH)
-        upsert_unmapped_taxonomy_ledger(df_conformed, spark, ledger_path=UNMAPPED_TAXONOMY_LEDGER_PATH)
+            # Categorical Schema Drift & Semantic Conformance (Issue #8)
+            logger.info("Executing PySpark Categorical Schema Drift & Semantic Conformance...")
+            df_conformed = conform_complaint_taxonomy(df_clustered, spark=spark, reference_path=TAXONOMY_REFERENCE_PATH)
+            upsert_unmapped_taxonomy_ledger(df_conformed, spark, ledger_path=UNMAPPED_TAXONOMY_LEDGER_PATH)
 
-        # Unstructured Resolution Text Mining & Phantom Closure Auditing (Issue #6)
-        logger.info("Executing PySpark Unstructured Resolution Text Mining & Semantic Auditing...")
-        df_resolved = classify_resolution_outcomes(df_conformed)
-        upsert_unclassified_resolutions_ledger(df_resolved, spark)
+            # Unstructured Resolution Text Mining & Phantom Closure Auditing (Issue #6)
+            logger.info("Executing PySpark Unstructured Resolution Text Mining & Semantic Auditing...")
+            df_resolved = classify_resolution_outcomes(df_conformed)
+            upsert_unclassified_resolutions_ledger(df_resolved, spark)
 
-        df_std = standardize_categorical_and_administrative_attributes(df_resolved)
-        df_silver = attach_quality_audit_tags(df_std, processed_at_utc)
+            df_std = standardize_categorical_and_administrative_attributes(df_resolved)
+            df_silver = attach_quality_audit_tags(df_std, processed_at_utc)
 
-        # Pure PySpark Partitioned Parquet Write (streaming distributed write)
-        written_files = write_silver_311(df_silver, silver_311_dir)
+            # Pure PySpark Partitioned Parquet Write (streaming distributed write)
+            written_files = write_silver_311(df_silver, silver_311_dir)
+            step_p2.set_output_rows(candidate_count - duplicate_rows_removed)
 
         # 8. Compute Audit Metrics in PySpark directly from written Parquet (avoids driver heap bloat & plan re-eval)
-        written_silver_files = sorted(silver_311_dir.glob("**/*.parquet"))
-        if written_silver_files:
-            df_written = spark.read.parquet(str(silver_311_dir))
-            valid_rows_accepted = df_written.count()
-        else:
-            df_written = None
-            valid_rows_accepted = 0
+        with profiler.measure_step("silver_311", "reconciliation_audit_aggregation") as step_audit:
+            written_silver_files = sorted(silver_311_dir.glob("**/*.parquet"))
+            if written_silver_files:
+                df_written = spark.read.parquet(str(silver_311_dir))
+                valid_rows_accepted = df_written.count()
+            else:
+                df_written = None
+                valid_rows_accepted = 0
+
+            step_audit.set_input_rows(valid_rows_accepted)
+            step_audit.set_output_rows(valid_rows_accepted)
 
         if valid_rows_accepted > 0 and df_written is not None:
             cols_silver = set(df_written.columns)

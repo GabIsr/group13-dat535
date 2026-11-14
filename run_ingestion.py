@@ -20,6 +20,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from src.ingestion.ingest_311 import run_311_ingestion
 from src.ingestion.ingest_weather import run_weather_ingestion
 from src.utils.config import MANIFESTS_DIR, PROJECT_START_DATE
+from src.utils.benchmark import get_profiler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -196,6 +197,17 @@ def main():
             has_error = True
 
     print_summary_table(manifests)
+    profiler = get_profiler()
+    for m in manifests:
+        profiler.record_step(
+            stage="bronze_ingestion",
+            step_name=f"ingest_{m.get('dataset_name', 'unknown')}",
+            duration_seconds=m.get("duration_seconds", 0.0),
+            input_rows=m.get("row_count", 0),
+            output_rows=m.get("row_count", 0),
+            details={"batch_id": m.get("batch_id"), "mode": m.get("extraction_mode")},
+        )
+    profiler.save_json()
     total_elapsed = time.time() - overall_start
     logger.info(f"Pipeline run completed in {total_elapsed:.2f} seconds.")
 

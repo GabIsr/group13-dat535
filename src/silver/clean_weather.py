@@ -60,6 +60,7 @@ from src.silver.config import (
     WEATHER_HARD_LIMITS,
 )
 from src.utils.spark import get_spark_session
+from src.utils.benchmark import get_profiler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("clean_weather")
@@ -124,8 +125,6 @@ def quarantine_unkeyed_weather(
         .withColumn("timestamp_utc", parsed_ts)
     )
 
-    df_evaluated.persist(StorageLevel.MEMORY_AND_DISK)
-
     df_quarantined = df_evaluated.filter(col("_is_quarantined") == True)
     quarantined_weather_rows = df_quarantined.count()
 
@@ -141,7 +140,6 @@ def quarantine_unkeyed_weather(
         logger.warning(f"Quarantined {quarantined_weather_rows:,} unkeyed/unparseable weather rows to {q_path}")
 
     df_valid = df_evaluated.filter(col("_is_quarantined") == False).drop("_is_quarantined", "_quarantine_reason")
-    df_evaluated.unpersist()
 
     return df_valid, quarantined_weather_rows
 
@@ -155,7 +153,6 @@ def deduplicate_weather(df_valid: DataFrame, cols: List[str]) -> Tuple[DataFrame
         col("_ingested_at_utc").desc() if "_ingested_at_utc" in cols else col("timestamp_utc").desc()
     )
     df_clean_spark = df_valid.withColumn("_rn", row_number().over(w_dedup)).filter(col("_rn") == 1).drop("_rn")
-    df_clean_spark.persist(StorageLevel.MEMORY_AND_DISK)
 
     valid_count = df_clean_spark.count()
     duplicate_rows_dropped = before_dedup_count - valid_count
@@ -355,14 +352,12 @@ def evaluate_sensor_rules_and_mask(
     # Write Sensor Anomaly Audit Ledger Parquet via pure PySpark
     anomaly_ledger_path.parent.mkdir(parents=True, exist_ok=True)
     if combined_ledger_spark is not None:
-        combined_ledger_spark.persist(StorageLevel.MEMORY_AND_DISK)
         num_anomalies = combined_ledger_spark.count()
     else:
         num_anomalies = 0
 
     if num_anomalies > 0:
         combined_ledger_spark.coalesce(1).write.mode("overwrite").parquet(str(anomaly_ledger_path))
-        combined_ledger_spark.unpersist()
         logger.warning(
             f"Sensor Anomaly Audit: Logged {num_anomalies:,} corrupt sensor readings to {anomaly_ledger_path}"
         )
@@ -529,6 +524,8 @@ def clean_and_validate_weather(
     silver_weather_dir: Path = SILVER_DIR / "weather",
     anomaly_ledger_path: Path = SENSOR_ANOMALY_LEDGER_PATH,
     quarantine_dir: Path = QUARANTINE_DIR / "weather",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     100% pure PySpark Silver Weather pipeline:
@@ -540,29 +537,45 @@ def clean_and_validate_weather(
     6. Native PySpark partitioned Parquet output.
     """
     start_time = time.time()
-    processed_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    processed_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
     bronze_files = sorted(bronze_weather_dir.glob("**/*.parquet"))
     if not bronze_files:
         logger.warning(f"No Bronze weather files found in {bronze_weather_dir}")
         return {"status": "skipped", "reason": "no_input_files"}
 
-    spark = get_spark_session(app_name="DAT535-Silver-Clean-Weather")
-    spark.conf.set("spark.sql.ansi.enabled", "false")
-    logger.info(f"Loading {len(bronze_files)} Bronze weather partition files into PySpark...")
+    profiler = get_profiler()
 
-    df_raw = spark.read.parquet(*[str(f) for f in bronze_files])
-    input_rows = df_raw.count()
+    with profiler.measure_step("silver_weather", "bronze_scan_and_pruning") as step_scan:
+        spark = get_spark_session(app_name="DAT535-Silver-Clean-Weather")
+        spark.conf.set("spark.sql.ansi.enabled", "false")
+        logger.info(f"Loading {len(bronze_files)} Bronze weather partition files into PySpark...")
+
+        df_raw = spark.read.parquet(*[str(f) for f in bronze_files])
+
+        # Optional partition pruning if date range is specified
+        if start_date:
+            logger.info(f"Applying start_date filter on Bronze weather: timestamp_utc >= {start_date}")
+            df_raw = df_raw.filter(col("date") >= lit(start_date[:10]) if "date" in df_raw.columns else col("timestamp_utc") >= lit(start_date))
+        if end_date:
+            logger.info(f"Applying end_date filter on Bronze weather: timestamp_utc <= {end_date}")
+            df_raw = df_raw.filter(col("date") <= lit(end_date[:10]) if "date" in df_raw.columns else col("timestamp_utc") <= lit(end_date))
+
+        input_rows = df_raw.count()
+        step_scan.set_input_rows(input_rows)
+        step_scan.set_output_rows(input_rows)
     logger.info(f"Loaded {input_rows:,} raw weather observations from Bronze.")
 
-    # 1. Unkeyed & Corrupted Primary Key Quarantine
-    df_valid, quarantined_weather_rows = quarantine_unkeyed_weather(
-        df_raw=df_raw,
-        processed_at_utc=processed_at_utc,
-        quarantine_dir=quarantine_dir,
-    )
+    with profiler.measure_step("silver_weather", "unkeyed_quarantine_and_deduplication", input_rows=input_rows) as step_quar:
+        # 1. Unkeyed & Corrupted Primary Key Quarantine
+        df_valid, quarantined_weather_rows = quarantine_unkeyed_weather(
+            df_raw=df_raw,
+            processed_at_utc=processed_at_utc,
+            quarantine_dir=quarantine_dir,
+        )
+        valid_count = df_valid.count()
+        step_quar.set_output_rows(valid_count)
 
-    valid_count = df_valid.count()
     if valid_count == 0:
         if not anomaly_ledger_path.exists():
             empty_ledger = spark.createDataFrame([], schema=LEDGER_SCHEMA)
@@ -589,32 +602,34 @@ def clean_and_validate_weather(
             "status": "success",
         }
 
-    # 2. Deduplication
-    df_dedup, duplicate_rows_dropped = deduplicate_weather(df_valid, df_raw.columns)
+    # 2. Deduplication & Physical Bounds Verification
+    with profiler.measure_step("silver_weather", "bounds_verification_and_anomaly_ledger", input_rows=valid_count) as step_bounds:
+        df_dedup, duplicate_rows_dropped = deduplicate_weather(df_valid, df_raw.columns)
 
-    # 3. Sensor Rules, Physical Bounds & Anomaly Ledger
-    df_masked, num_anomalies, corrupted_fields_rows = evaluate_sensor_rules_and_mask(
-        df=df_dedup,
-        processed_at_utc=processed_at_utc,
-        anomaly_ledger_path=anomaly_ledger_path,
-    )
+        # 3. Sensor Rules, Physical Bounds & Anomaly Ledger
+        df_masked, num_anomalies, corrupted_fields_rows = evaluate_sensor_rules_and_mask(
+            df=df_dedup,
+            processed_at_utc=processed_at_utc,
+            anomaly_ledger_path=anomaly_ledger_path,
+        )
+        step_bounds.set_output_rows(valid_count - duplicate_rows_dropped)
 
     # 4. Cumulative & Lagged Weather Features (Chronological PySpark Rolling Windows)
-    df_windowed = compute_rolling_weather_windows(df_masked)
+    with profiler.measure_step("silver_weather", "rolling_features_and_enrichment", input_rows=valid_count - duplicate_rows_dropped) as step_enrich:
+        df_windowed = compute_rolling_weather_windows(df_masked)
 
-    # 5. Enrichment & Standardized Derived Flags
-    df_silver = enrich_weather_attributes(df_windowed, processed_at_utc)
-    df_silver.persist(StorageLevel.MEMORY_AND_DISK)
+        # 5. Enrichment & Standardized Derived Flags
+        df_silver = enrich_weather_attributes(df_windowed, processed_at_utc)
 
-    extreme_rows_count = df_silver.filter(col("is_extreme_weather") == True).count()
-    distinct_grids = df_silver.select("grid_id").distinct().count()
-    total_valid = df_silver.count()
+        extreme_rows_count = df_silver.filter(col("is_extreme_weather") == True).count()
+        distinct_grids = df_silver.select("grid_id").distinct().count()
+        total_valid = df_silver.count()
+        step_enrich.set_output_rows(total_valid)
 
     # 6. Partitioned Parquet Write via Pure PySpark
-    written_files = write_silver_weather(df_silver, silver_weather_dir)
-
-    df_dedup.unpersist()
-    df_silver.unpersist()
+    with profiler.measure_step("silver_weather", "silver_weather_parquet_write", input_rows=total_valid) as step_write:
+        written_files = write_silver_weather(df_silver, silver_weather_dir)
+        step_write.set_output_rows(total_valid)
 
     elapsed = time.time() - start_time
     logger.info(

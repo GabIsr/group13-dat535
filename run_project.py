@@ -6,10 +6,12 @@ Author: Group 13
 
 import argparse
 import logging
+import os
 import subprocess
 import sys
 import time
 import warnings
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Suppress known external library deprecations (Pandas 2/3 and PySpark 3.5 bridge)
@@ -26,6 +28,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 # Ensure Spark environment and paths are initialized before any PySpark imports
 from src.utils.spark import _configure_environment
 _configure_environment()
+
+from src.utils.benchmark import get_profiler
 
 logging.basicConfig(
     level=logging.INFO,
@@ -120,6 +124,13 @@ def main():
     args = parser.parse_args()
     total_start = time.time()
 
+    # Initialize unified benchmark session ID for all pipeline subprocesses
+    if "DAT535_BENCHMARK_ID" not in os.environ:
+        now_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        os.environ["DAT535_BENCHMARK_ID"] = f"pipeline_{now_str}"
+
+    profiler = get_profiler(run_id=os.environ["DAT535_BENCHMARK_ID"], mode=args.action)
+
     if args.action == "test":
         success = run_tests()
         sys.exit(0 if success else 1)
@@ -153,6 +164,10 @@ def main():
 
     elapsed = time.time() - total_start
     logger.info(f"Medallion project run completed successfully in {elapsed:.2f} seconds.")
+
+    # Save aggregated benchmark JSON and print terminal summary table
+    profiler.save_json()
+    profiler.print_summary_table()
 
 
 if __name__ == "__main__":

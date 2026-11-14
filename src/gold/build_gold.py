@@ -11,7 +11,7 @@ import logging
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from src.gold.build_agency_performance import build_agency_resolution_performance_mart
 from src.gold.build_service_demand import build_daily_service_demand_mart
@@ -23,6 +23,7 @@ from src.gold.config import (
     SILVER_JOINED_DIR,
     SILVER_WEATHER_DIR,
 )
+from src.utils.benchmark import get_profiler
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("build_gold")
@@ -34,10 +35,13 @@ def run_gold_pipeline(
     silver_joined_dir: Path = SILVER_JOINED_DIR,
     marts_dir: Path = GOLD_MARTS_DIR,
     metadata_dir: Path = GOLD_METADATA_DIR,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Execute the entire Gold Layer pipeline.
     Produces consumption-ready analytical data marts with zero join friction.
+    Supports optional start_date and end_date partition pruning.
     """
     start_time = time.time()
     timestamp_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -45,31 +49,50 @@ def run_gold_pipeline(
 
     logger.info("=" * 80)
     logger.info("STARTING MEDALLION GOLD LAYER ORCHESTRATION")
+    if start_date or end_date:
+        logger.info(f"Targeting Gold Window: [{start_date or 'ALL'} -> {end_date or 'ALL'}]")
     logger.info("=" * 80)
+
+    profiler = get_profiler()
 
     # 1. Build Mart 1: Daily Service Demand Mart
     logger.info("--- Stage 1: Building Daily Service Demand Mart ---")
-    m_demand = build_daily_service_demand_mart(
-        silver_311_dir=silver_311_dir,
-        silver_weather_dir=silver_weather_dir,
-        output_dir=marts_dir,
-    )
+    with profiler.measure_step("gold_marts", "daily_service_demand_mart") as step_demand:
+        m_demand = build_daily_service_demand_mart(
+            silver_311_dir=silver_311_dir,
+            silver_weather_dir=silver_weather_dir,
+            output_dir=marts_dir,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        step_demand.set_input_rows(m_demand.get("total_complaints_reconciled", 0))
+        step_demand.set_output_rows(m_demand.get("rows", 0))
 
     # 2. Build Mart 2: Agency Resolution & SLA Performance Mart
     logger.info("--- Stage 2: Building Agency Resolution & SLA Performance Mart ---")
-    m_perf = build_agency_resolution_performance_mart(
-        silver_311_dir=silver_311_dir,
-        silver_weather_dir=silver_weather_dir,
-        output_dir=marts_dir,
-    )
+    with profiler.measure_step("gold_marts", "agency_resolution_performance_mart") as step_perf:
+        m_perf = build_agency_resolution_performance_mart(
+            silver_311_dir=silver_311_dir,
+            silver_weather_dir=silver_weather_dir,
+            output_dir=marts_dir,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        step_perf.set_input_rows(m_perf.get("total_tickets_created_tracked", 0))
+        step_perf.set_output_rows(m_perf.get("rows", 0))
 
     # 3. Build Mart 3: ZIP-Code Infrastructure Vulnerability & Spatial Uncertainty Scorecard Mart
     logger.info("--- Stage 3: Building ZIP Infrastructure Vulnerability & Spatial Scorecard Mart ---")
-    m_vuln = build_zip_infrastructure_vulnerability_mart(
-        silver_joined_dir=silver_joined_dir,
-        silver_weather_dir=silver_weather_dir,
-        output_dir=marts_dir,
-    )
+    with profiler.measure_step("gold_marts", "zip_infrastructure_vulnerability_mart") as step_vuln:
+        m_vuln = build_zip_infrastructure_vulnerability_mart(
+            silver_joined_dir=silver_joined_dir,
+            silver_weather_dir=silver_weather_dir,
+            output_dir=marts_dir,
+            start_date=start_date,
+            end_date=end_date,
+        )
+        step_vuln.set_input_rows(m_vuln.get("total_complaints_reconciled", 0))
+        step_vuln.set_output_rows(m_vuln.get("rows", 0))
 
     elapsed = time.time() - start_time
 
@@ -79,7 +102,7 @@ def run_gold_pipeline(
 
     ledger_payload = {
         "report_id": report_id,
-        "generated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "generated_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
         "status": "PASS",
         "duration_seconds": round(elapsed, 2),
         "marts": {

@@ -21,7 +21,7 @@ if hasattr(sys.stdout, "reconfigure"):
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.silver.config import QUALITY_DIR
+from src.silver.config import QUALITY_DIR, BENCHMARKS_DIR
 from src.gold.config import GOLD_DIR
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -239,6 +239,54 @@ def generate_markdown_summary(quality_json: Dict[str, Any], gold_dir: Optional[P
     return "\n".join(md)
 
 
+def generate_benchmark_summary(benchmarks_dir: Path) -> str:
+    """Generate Markdown summary from latest_benchmark.json for GitHub Actions."""
+    latest_bench = benchmarks_dir / "latest_benchmark.json"
+    if not latest_bench.exists():
+        candidates = sorted(benchmarks_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if candidates:
+            latest_bench = candidates[0]
+        else:
+            return ""
+
+    try:
+        with open(latest_bench, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        summary = data.get("summary", {})
+        steps = data.get("steps", [])
+        if not steps:
+            return ""
+
+        md: list = []
+        md.append("## ⏱️ Medallion Pipeline Runtime & Performance Breakdown")
+        md.append(
+            f"**Total Runtime:** `{summary.get('total_duration_human')}` (`{summary.get('total_duration_seconds'):.2f}s`) | "
+            f"**Max Records Evaluated:** `{summary.get('max_rows_processed'):,}` | "
+            f"**Run ID:** `{data.get('benchmark_id')}`"
+        )
+        md.append("")
+        md.append("| Layer / Pipeline Stage | Key Operation / Sub-Step | Duration | Share of Total | Rows Evaluated | Throughput |")
+        md.append("| :--- | :--- | :---: | :---: | :---: | :---: |")
+
+        for s in steps:
+            st = s.get("stage", "other").replace("_", " ").title()
+            op = s.get("step_name", "").replace("_", " ").title()
+            dur = s.get("duration_human") or f"{s.get('duration_seconds', 0.0):.2f}s"
+            pct = f"{s.get('pct_of_total', 0.0):.1f}%"
+            rows = s.get("output_rows") if s.get("output_rows") is not None else s.get("input_rows")
+            r_str = f"{rows:,}" if rows is not None else "N/A"
+            tput = s.get("throughput_rows_per_sec", 0.0)
+            tp_str = f"`{tput:,.0f} r/s`" if tput > 0 else "-"
+            md.append(f"| **{st}** | {op} | `{dur}` | `{pct}` | `{r_str}` | {tp_str} |")
+
+        md.append("")
+        return "\n".join(md)
+    except Exception as e:
+        logger.warning(f"Could not parse benchmark summary from {latest_bench}: {e}")
+        return ""
+
+
 def main():
     parser = argparse.ArgumentParser(description="Publish DAT535 Data Quality Scorecard to GITHUB_STEP_SUMMARY")
     parser.add_argument(
@@ -252,6 +300,12 @@ def main():
         type=Path,
         default=GOLD_DIR,
         help="Path to directory containing gold marts",
+    )
+    parser.add_argument(
+        "--benchmarks-dir",
+        type=Path,
+        default=BENCHMARKS_DIR,
+        help="Path to directory containing benchmark JSON files",
     )
     parser.add_argument(
         "--output-file",
@@ -270,6 +324,11 @@ def main():
         data = json.load(f)
 
     md_content = generate_markdown_summary(data, gold_dir=args.gold_dir)
+
+    # Append runtime and performance benchmarks if present
+    bench_md = generate_benchmark_summary(args.benchmarks_dir)
+    if bench_md:
+        md_content = md_content + "\n" + bench_md
 
     # Determine destination
     target_summary = args.output_file or os.environ.get("GITHUB_STEP_SUMMARY")

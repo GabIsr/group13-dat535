@@ -43,14 +43,17 @@ def build_daily_service_demand_mart(
     silver_311_dir: Path = SILVER_311_DIR,
     silver_weather_dir: Path = SILVER_WEATHER_DIR,
     output_dir: Path = GOLD_MARTS_DIR,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Construct the Daily Service Demand Mart using PySpark.
     Pre-aggregates 311 complaints and meteorological observations to the daily grain before joining,
     ensuring zero row-loss reconciliation and complete weather-coverage tracking.
+    Supports optional start_date and end_date partition pruning.
     """
     start_time = time.time()
-    built_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    built_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
     # 1. Discover Silver 311 Records
     files_311 = sorted(silver_311_dir.glob("**/*.parquet"))
@@ -67,11 +70,25 @@ def build_daily_service_demand_mart(
 
     file_paths_311 = [str(f.resolve()) for f in files_311]
     df_311_spark = spark.read.parquet(*file_paths_311)
+
+    if start_date:
+        logger.info(f"Applying start_date filter on Silver 311: created_at_utc >= {start_date}")
+        df_311_spark = df_311_spark.filter(col("created_at_utc") >= lit(start_date))
+    if end_date:
+        logger.info(f"Applying end_date filter on Silver 311: created_at_utc <= {end_date}")
+        df_311_spark = df_311_spark.filter(col("created_at_utc") <= lit(end_date))
+
     total_311_input = df_311_spark.count()
     logger.info(f"Loaded {total_311_input:,} clean 311 records into PySpark.")
 
     file_paths_weather = [str(f.resolve()) for f in files_weather]
     df_weather_spark = spark.read.parquet(*file_paths_weather)
+
+    if start_date:
+        df_weather_spark = df_weather_spark.filter(col("timestamp_utc") >= lit(start_date))
+    if end_date:
+        df_weather_spark = df_weather_spark.filter(col("timestamp_utc") <= lit(end_date))
+
     weather_input_rows = df_weather_spark.count()
     logger.info(f"Loaded {weather_input_rows:,} hourly weather observations into PySpark.")
 
@@ -159,12 +176,10 @@ def build_daily_service_demand_mart(
         .withColumn("_gold_built_at_utc", lit(built_at_utc))
     )
 
-    mart_spark.persist(StorageLevel.MEMORY_AND_DISK)
     mart_rows = mart_spark.count()
 
     reconciled_total_complaints = int(mart_spark.agg(spark_sum("complaint_count")).collect()[0][0])
     if reconciled_total_complaints != total_311_input:
-        mart_spark.unpersist()
         raise ValueError(
             f"Row count reconciliation violation in Daily Demand Mart! "
             f"Silver input ({total_311_input}) != Mart total ({reconciled_total_complaints})"
@@ -173,7 +188,6 @@ def build_daily_service_demand_mart(
     # 7. Verification: Ensure Grain Uniqueness in PySpark
     distinct_grains = mart_spark.select(*daily_group_cols).distinct().count()
     if distinct_grains != mart_rows:
-        mart_spark.unpersist()
         raise ValueError(f"Grain uniqueness violation: {mart_rows - distinct_grains} duplicate keys on grain")
 
     # 8. Write Parquet Mart using PySpark distributed write
@@ -185,7 +199,6 @@ def build_daily_service_demand_mart(
     distinct_grid_cells = mart_spark.select("grid_id").distinct().count()
     distinct_complaint_types = mart_spark.select("complaint_type").distinct().count()
     weather_matched_rows = mart_spark.filter(col("weather_data_coverage_pct") > 0).count()
-    mart_spark.unpersist()
 
     elapsed = time.time() - start_time
     logger.info(

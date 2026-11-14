@@ -17,9 +17,10 @@ QUARANTINE_DIR = SILVER_DIR / "quarantine"
 REFERENCE_DIR = DATA_DIR / "reference"
 METADATA_DIR = DATA_DIR / "metadata"
 QUALITY_DIR = METADATA_DIR / "quality"
+BENCHMARKS_DIR = METADATA_DIR / "benchmarks"
 
 # Ensure essential silver directories exist
-for d in [SILVER_DIR, QUARANTINE_DIR, REFERENCE_DIR, QUALITY_DIR]:
+for d in [SILVER_DIR, QUARANTINE_DIR, REFERENCE_DIR, QUALITY_DIR, BENCHMARKS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 # Sensor Anomaly Ledger Path (Data Observability & Audit Trail)

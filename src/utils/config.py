@@ -25,9 +25,10 @@ LANDING_DIR = DATA_DIR / "landing"
 BRONZE_DIR = DATA_DIR / "bronze"
 METADATA_DIR = DATA_DIR / "metadata"
 MANIFESTS_DIR = METADATA_DIR / "manifests"
+BENCHMARKS_DIR = METADATA_DIR / "benchmarks"
 
 # Ensure essential directories can be created
-for d in [LANDING_DIR, BRONZE_DIR, MANIFESTS_DIR]:
+for d in [LANDING_DIR, BRONZE_DIR, MANIFESTS_DIR, BENCHMARKS_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 # Datasets

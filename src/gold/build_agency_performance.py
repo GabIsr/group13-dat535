@@ -75,8 +75,7 @@ def build_agency_resolution_performance_mart(
     logger.info("Initializing PySpark session for Agency Performance Mart...")
     spark = get_spark_session("DAT535-Gold-Agency-Performance")
 
-    file_paths_311 = [str(f.resolve()) for f in files_311]
-    df_311_spark = spark.read.parquet(*file_paths_311)
+    df_311_spark = spark.read.parquet(str(silver_311_dir))
 
     if start_date:
         logger.info(f"Applying start_date filter on Silver 311: created_at_utc >= {start_date}")
@@ -245,8 +244,7 @@ def build_agency_resolution_performance_mart(
     logger.info("Computing Borough-level daily environmental context with PySpark...")
     files_weather = sorted(silver_weather_dir.glob("**/*.parquet"))
     if files_weather:
-        file_paths_weather = [str(f.resolve()) for f in files_weather]
-        df_w_spark = spark.read.parquet(*file_paths_weather)
+        df_w_spark = spark.read.parquet(str(silver_weather_dir))
 
         w_cols = set(df_w_spark.columns)
         has_hint = "borough_hint" in w_cols

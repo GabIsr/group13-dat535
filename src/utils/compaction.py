@@ -74,10 +74,9 @@ def compact_partition(
     # Calculate pre-compaction metrics
     bytes_before = sum(f.stat().st_size for f in parquet_files)
     
-    # Read all files in the partition via PySpark
+    # Read all files in the partition directory via PySpark
     spark = get_spark_session("BronzePartitionCompaction")
-    file_paths = [str(f.resolve()) for f in parquet_files]
-    df_spark = spark.read.parquet(*file_paths)
+    df_spark = spark.read.parquet(str(partition_dir.resolve()))
     rows_before = df_spark.count()
 
     if dry_run:

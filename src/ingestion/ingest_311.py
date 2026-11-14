@@ -272,49 +272,39 @@ def convert_landing_to_bronze_pyspark(
     else:
         df_bronze = df_bronze.withColumn("year", lit("unknown")).withColumn("month", lit("unknown"))
 
-    df_bronze = df_bronze.cache()
-    partitions = df_bronze.select("year", "month").distinct().collect()
+    # Native PySpark partitioned write (single execution plan, zero driver loops)
+    existing_files = set(base_bronze_dir.glob("year=*/month=*/*.parquet"))
+    (
+        df_bronze.coalesce(1)
+        .write.mode("append")
+        .partitionBy("year", "month")
+        .parquet(str(base_bronze_dir))
+    )
+
+    new_files = sorted(
+        [f for f in base_bronze_dir.glob("year=*/month=*/*.parquet") if f not in existing_files]
+    )
+
     written_files: List[Dict[str, Any]] = []
+    for file_path in new_files:
+        f_size = file_path.stat().st_size
+        f_sha = compute_file_sha256(file_path)
+        f_rows = pq.ParquetFile(str(file_path)).metadata.num_rows
 
-    for row in partitions:
-        y, m = str(row["year"]), str(row["month"])
-        partition_dir = base_bronze_dir / f"year={y}" / f"month={m}"
-        partition_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            rel_path = get_relative_path(file_path)
+        except ValueError:
+            rel_path = file_path.as_posix()
 
-        filename = f"part_{batch_id}_spark_{y}_{m}.parquet"
-        file_path = partition_dir / filename
+        written_files.append({
+            "file_name": file_path.name,
+            "relative_path": rel_path,
+            "layer": "bronze",
+            "rows": f_rows,
+            "bytes": f_size,
+            "sha256": f_sha,
+        })
 
-        sub_df = df_bronze.filter((col("year") == lit(y)) & (col("month") == lit(m))).drop("year", "month")
-        f_rows = sub_df.count()
-
-        tmp_out = partition_dir / f"_tmp_{filename}"
-        sub_df.coalesce(1).write.mode("overwrite").parquet(str(tmp_out))
-
-        part_files = list(tmp_out.glob("part-*.parquet"))
-        if part_files:
-            if file_path.exists():
-                file_path.unlink()
-            shutil.move(str(part_files[0]), str(file_path))
-            shutil.rmtree(tmp_out, ignore_errors=True)
-
-            f_size = file_path.stat().st_size
-            f_sha = compute_file_sha256(file_path)
-
-            try:
-                rel_path = get_relative_path(file_path)
-            except ValueError:
-                rel_path = file_path.as_posix()
-
-            written_files.append({
-                "file_name": filename,
-                "relative_path": rel_path,
-                "layer": "bronze",
-                "rows": f_rows,
-                "bytes": f_size,
-                "sha256": f_sha,
-            })
-
-    df_bronze.unpersist()
     logger.info(f"PySpark Bronze complete: wrote {len(written_files)} partition file(s) ({total_rows:,} total rows).")
     return written_files
 

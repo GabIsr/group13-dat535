@@ -540,9 +540,9 @@ def clean_and_validate_weather(
     with profiler.measure_step("silver_weather", "bronze_scan_and_pruning") as step_scan:
         spark = get_spark_session(app_name="DAT535-Silver-Clean-Weather")
         spark.conf.set("spark.sql.ansi.enabled", "false")
-        logger.info(f"Loading {len(bronze_files)} Bronze weather partition files into PySpark...")
+        logger.info(f"Loading Bronze weather data from {bronze_weather_dir} into PySpark...")
 
-        df_raw = spark.read.parquet(*[str(f) for f in bronze_files])
+        df_raw = spark.read.parquet(str(bronze_weather_dir))
 
         # Optional partition pruning if date range is specified
         raw_cols = set(df_raw.columns)

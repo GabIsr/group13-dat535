@@ -69,8 +69,7 @@ def build_daily_service_demand_mart(
     logger.info("Initializing PySpark session for Daily Service Demand Mart...")
     spark = get_spark_session("DAT535-Gold-Service-Demand")
 
-    file_paths_311 = [str(f.resolve()) for f in files_311]
-    df_311_spark = spark.read.parquet(*file_paths_311)
+    df_311_spark = spark.read.parquet(str(silver_311_dir))
 
     if start_date:
         logger.info(f"Applying start_date filter on Silver 311: created_at_utc >= {start_date}")
@@ -82,8 +81,7 @@ def build_daily_service_demand_mart(
     total_311_input = df_311_spark.count()
     logger.info(f"Loaded {total_311_input:,} clean 311 records into PySpark.")
 
-    file_paths_weather = [str(f.resolve()) for f in files_weather]
-    df_weather_spark = spark.read.parquet(*file_paths_weather)
+    df_weather_spark = spark.read.parquet(str(silver_weather_dir))
 
     if start_date:
         df_weather_spark = df_weather_spark.filter(col("timestamp_utc") >= lit(start_date))

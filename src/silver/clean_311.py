@@ -103,14 +103,8 @@ logger = logging.getLogger("clean_311")
 # =========================================================================
 # Standalone Helper Functions (Kept for unit test compatibility)
 # =========================================================================
-
-def load_zip_reference(zip_ref_path: Path = ZIP_CENTROIDS_PATH) -> pd.DataFrame:
-    """Load the precomputed NYC ZIP centroid reference table (kept for unit test compatibility)."""
-    if not zip_ref_path.exists():
-        logger.warning(f"ZIP reference table not found at {zip_ref_path}. Creating fallback mapping.")
-        return pd.DataFrame(columns=["zip5", "centroid_lat", "centroid_lon", "grid_id", "primary_borough"])
-    return pd.read_parquet(zip_ref_path)
-
+# Reference Implementations (Algorithmic Benchmarks & Unit Test Suite)
+# =========================================================================
 
 def to_utc_datetime(series: pd.Series, local_tz: str = "America/New_York") -> pd.Series:
     """
@@ -1040,22 +1034,27 @@ def clean_and_validate_311(
             unmapped_rate = round((unmapped_cnt / valid_rows_accepted * 100.0), 2) if valid_rows_accepted > 0 else 0.0
             conformed_rate = round((conformed_cnt / valid_rows_accepted * 100.0), 2) if valid_rows_accepted > 0 else 0.0
 
-            breakdown_cols = [c for c in ["spatial_resolution_level", "loc_routing_type", "resolution_outcome_category", "canonical_service_domain"] if c in cols_silver]
-            df_grouped = df_written.groupBy(*breakdown_cols).count().collect()
-            spatial_stats = {}
-            routes_dict = {}
-            res_dict = {}
-            domain_dict = {}
-            for r in df_grouped:
-                c = int(r["count"])
-                s = r["spatial_resolution_level"] if "spatial_resolution_level" in r else None
-                if s: spatial_stats[s] = spatial_stats.get(s, 0) + c
-                rt = r["loc_routing_type"] if "loc_routing_type" in r else None
-                if rt: routes_dict[rt] = routes_dict.get(rt, 0) + c
-                res = r["resolution_outcome_category"] if "resolution_outcome_category" in r else None
-                if res: res_dict[res] = res_dict.get(res, 0) + c
-                dom = r["canonical_service_domain"] if "canonical_service_domain" in r else None
-                if dom: domain_dict[dom] = domain_dict.get(dom, 0) + c
+            # Decoupled 1-dimensional categorical aggregations (prevents multi-dimensional cube explosion)
+            spatial_stats = (
+                {str(r[0]): int(r["count"]) for r in df_written.filter(col("spatial_resolution_level").isNotNull()).groupBy("spatial_resolution_level").count().collect()}
+                if "spatial_resolution_level" in cols_silver
+                else {}
+            )
+            routes_dict = (
+                {str(r[0]): int(r["count"]) for r in df_written.filter(col("loc_routing_type").isNotNull()).groupBy("loc_routing_type").count().collect()}
+                if "loc_routing_type" in cols_silver
+                else {}
+            )
+            res_dict = (
+                {str(r[0]): int(r["count"]) for r in df_written.filter(col("resolution_outcome_category").isNotNull()).groupBy("resolution_outcome_category").count().collect()}
+                if "resolution_outcome_category" in cols_silver
+                else {}
+            )
+            domain_dict = (
+                {str(r[0]): int(r["count"]) for r in df_written.filter(col("canonical_service_domain").isNotNull()).groupBy("canonical_service_domain").count().collect()}
+                if "canonical_service_domain" in cols_silver
+                else {}
+            )
         else:
             closed_count = 0
             open_count = 0

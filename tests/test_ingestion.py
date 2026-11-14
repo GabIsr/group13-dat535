@@ -28,7 +28,11 @@ from src.utils.manifest import (
     is_batch_completed,
     save_manifest,
 )
+from unittest.mock import patch, MagicMock
+import io
+import urllib.error
 from src.ingestion.ingest_311 import compute_row_hashes
+from src.ingestion.ingest_weather import fetch_open_meteo_batch
 
 
 class TestIngestionPipeline(unittest.TestCase):
@@ -309,6 +313,37 @@ class TestIngestionPipeline(unittest.TestCase):
             self.assertIn(f"resolution_action_updated_date >= '{last_run}'", query)
             self.assertIn(f"created_date >= '{proj_floor}'", query)
             self.assertIn(f"closed_date >= '{last_run}'", query)
+
+    @patch("time.sleep")
+    @patch("urllib.request.urlopen")
+    def test_open_meteo_retry_on_502_bad_gateway(self, mock_urlopen, mock_sleep):
+        """Verify that fetch_open_meteo_batch catches 502 Bad Gateway and retries with backoff."""
+        # 1st attempt: 502 Bad Gateway, 2nd attempt: Success 200
+        mock_resp_fail = urllib.error.HTTPError("http://test", 502, "Bad Gateway", {}, io.BytesIO(b"Bad Gateway"))
+        mock_resp_success = MagicMock()
+        mock_resp_success.read.return_value = b'[{"latitude": 40.7, "longitude": -74.0, "hourly": {}}]'
+        mock_resp_success.__enter__.return_value = mock_resp_success
+
+        mock_urlopen.side_effect = [mock_resp_fail, mock_resp_success]
+
+        grid_points = [{"grid_lat": 40.7, "grid_lon": -74.0, "grid_id": "GRID_40.7_-74.0"}]
+        locations, raw = fetch_open_meteo_batch(grid_points, "2026-11-09", "2026-11-09", ["temperature_2m"], max_retries=3)
+
+        self.assertEqual(len(locations), 1)
+        self.assertEqual(mock_urlopen.call_count, 2)
+        mock_sleep.assert_called_once_with(4)  # 2^1 * 2 = 4s backoff
+
+    @patch("urllib.request.urlopen")
+    def test_open_meteo_no_retry_on_400_client_error(self, mock_urlopen):
+        """Verify that fetch_open_meteo_batch does NOT retry non-transient 4xx client errors."""
+        mock_resp_fail = urllib.error.HTTPError("http://test", 400, "Bad Request", {}, io.BytesIO(b"Bad Request"))
+        mock_urlopen.side_effect = mock_resp_fail
+
+        grid_points = [{"grid_lat": 40.7, "grid_lon": -74.0, "grid_id": "GRID_40.7_-74.0"}]
+        with self.assertRaises(urllib.error.HTTPError):
+            fetch_open_meteo_batch(grid_points, "2026-11-09", "2026-11-09", ["temperature_2m"], max_retries=3)
+
+        self.assertEqual(mock_urlopen.call_count, 1)
 
 
 if __name__ == "__main__":

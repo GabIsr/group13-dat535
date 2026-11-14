@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -76,9 +77,11 @@ def fetch_open_meteo_batch(
     end_date: str,
     hourly_vars: List[str],
     timeout: int = 60,
+    max_retries: int = 4,
 ) -> Tuple[List[Dict[str, Any]], bytes]:
     """
-    Fetch all 19 NYC grid coordinates in a single multi-location HTTP request.
+    Fetch all 19 NYC grid coordinates in a single multi-location HTTP request
+    with exponential backoff retries for transient 5xx server errors and network timeouts.
     Open-Meteo returns a JSON list of location objects matching coordinate order.
     """
     lats = [str(pt["grid_lat"]) for pt in grid_points]
@@ -98,16 +101,43 @@ def fetch_open_meteo_batch(
     logger.info(f"Querying Open-Meteo multi-location API for {len(grid_points)} grid cells...")
 
     req = urllib.request.Request(url, headers={"User-Agent": "DAT535-UiS-Ingestion/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as response:
-        raw_bytes = response.read()
 
-    data = json.loads(raw_bytes.decode("utf-8"))
-    if isinstance(data, dict) and "error" in data:
-        raise RuntimeError(f"Open-Meteo API Error: {data.get('reason')}")
+    for attempt in range(1, max_retries + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                raw_bytes = response.read()
 
-    # If single point requested, API returns dict; if multi-location, returns list of dicts
-    locations_list = data if isinstance(data, list) else [data]
-    return locations_list, raw_bytes
+            data = json.loads(raw_bytes.decode("utf-8"))
+            if isinstance(data, dict) and "error" in data:
+                raise RuntimeError(f"Open-Meteo API Error: {data.get('reason')}")
+
+            # If single point requested, API returns dict; if multi-location, returns list of dicts
+            locations_list = data if isinstance(data, list) else [data]
+            return locations_list, raw_bytes
+        except urllib.error.HTTPError as e:
+            # 4xx errors (except 429 Too Many Requests) are non-transient client errors
+            if 400 <= e.code < 500 and e.code != 429:
+                logger.error(f"Non-transient HTTP client error from Open-Meteo ({e.code}): {e}")
+                raise
+            if attempt == max_retries:
+                logger.error(f"Open-Meteo request failed after {max_retries} attempts: {e}")
+                raise
+            wait_time = 2 ** attempt * 2
+            logger.warning(
+                f"Transient HTTP error querying Open-Meteo ({e.code}: {e.reason}) on attempt {attempt}/{max_retries}. "
+                f"Retrying in {wait_time}s..."
+            )
+            time.sleep(wait_time)
+        except (TimeoutError, urllib.error.URLError, Exception) as e:
+            if attempt == max_retries:
+                logger.error(f"Open-Meteo network request failed after {max_retries} attempts: {e}")
+                raise
+            wait_time = 2 ** attempt * 2
+            logger.warning(
+                f"Transient network/timeout error querying Open-Meteo on attempt {attempt}/{max_retries}: {e}. "
+                f"Retrying in {wait_time}s..."
+            )
+            time.sleep(wait_time)
 
 
 def run_weather_ingestion(

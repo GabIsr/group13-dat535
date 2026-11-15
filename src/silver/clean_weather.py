@@ -9,6 +9,7 @@ Author: Group 13
 
 import functools
 import logging
+import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -498,6 +499,9 @@ def write_silver_weather(df_silver: DataFrame, silver_weather_dir: Path) -> int:
     Uses pure PySpark with distributed directory partitioning, matching the 311 partition strategy.
     """
     silver_weather_dir.mkdir(parents=True, exist_ok=True)
+    for legacy in silver_weather_dir.glob("grid_id=*"):
+        shutil.rmtree(legacy, ignore_errors=True)
+
     (
         df_silver.coalesce(1)
         .write

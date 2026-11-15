@@ -6,6 +6,7 @@ Author: Group 13
 """
 
 import logging
+import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,6 +53,9 @@ def join_silver_datasets(
         raise FileNotFoundError(f"No Silver 311 files found in {silver_311_dir}")
 
     # 2. Load Silver Weather (The Broadcast Dimension)
+    for legacy in silver_weather_dir.glob("grid_id=*"):
+        shutil.rmtree(legacy, ignore_errors=True)
+
     files_weather = sorted(silver_weather_dir.glob("**/*.parquet"))
     if not files_weather:
         raise FileNotFoundError(f"No Silver weather files found in {silver_weather_dir}")

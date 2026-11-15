@@ -79,9 +79,9 @@ def main():
     )
     parser.add_argument(
         "--mode",
-        choices=["incremental", "backfill", "bootstrap"],
+        choices=["incremental", "backfill"],
         default="incremental",
-        help="Acquisition mode: incremental (CDC via watermark), backfill, or bootstrap (default: incremental)",
+        help="Acquisition mode: incremental (CDC via watermark) or backfill (default: incremental)",
     )
     parser.add_argument(
         "--env",
@@ -139,6 +139,16 @@ def main():
         type=str,
         help="Optional Socrata App Token to avoid public rate throttling",
     )
+    parser.add_argument(
+        "--batch-id",
+        type=str,
+        help="Explicit batch ID to assign or check for idempotency",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force ingestion even if date range or batch ID already succeeded",
+    )
 
     args = parser.parse_args()
     logger.info(
@@ -169,6 +179,8 @@ def main():
                 app_token=args.app_token or os.environ.get("SOCRATA_APP_TOKEN"),
                 env=args.env,
                 manifests_dir=MANIFESTS_DIR,
+                batch_id=args.batch_id,
+                force=args.force,
             )
             if m_311:
                 manifests.append(m_311)
@@ -180,7 +192,6 @@ def main():
     if args.dataset in ["all", "weather"]:
         try:
             logger.info(f"Targeting Weather End Ceiling: {end_weather} (Lag: {args.lag_weather}d)")
-            # Weather mode does not use "bootstrap" directly; maps to "incremental" or "backfill"
             weather_mode = "backfill" if args.mode == "backfill" else "incremental"
             m_wth = run_weather_ingestion(
                 mode=weather_mode,
@@ -189,6 +200,8 @@ def main():
                 lookback_days=args.lookback_days,
                 env=args.env,
                 manifests_dir=MANIFESTS_DIR,
+                batch_id=args.batch_id,
+                force=args.force,
             )
             if m_wth:
                 manifests.append(m_wth)

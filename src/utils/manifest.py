@@ -9,7 +9,7 @@ import json
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from src.utils.config import MANIFESTS_DIR
 
@@ -35,14 +35,61 @@ def compute_file_sha256(filepath: Path, chunk_size: int = 65536) -> str:
     return hasher.hexdigest()
 
 
-def compute_schema_fingerprint(columns_and_types: Dict[str, str]) -> str:
+def compute_schema_fingerprint(columns_and_types: Union[Dict[str, str], str]) -> str:
     """
-    Compute a deterministic canonical schema fingerprint from column names and types.
+    Compute a deterministic canonical schema fingerprint from column names/types dict or Spark schema JSON string.
     Detects schema drift across ingestion batches.
     """
-    sorted_items = sorted(columns_and_types.items(), key=lambda x: x[0])
-    canonical_repr = ",".join(f"{col}:{dtype}" for col, dtype in sorted_items)
+    if isinstance(columns_and_types, str):
+        try:
+            parsed = json.loads(columns_and_types)
+            canonical_repr = json.dumps(parsed, sort_keys=True)
+        except Exception:
+            canonical_repr = columns_and_types
+    else:
+        sorted_items = sorted(columns_and_types.items(), key=lambda x: x[0])
+        canonical_repr = ",".join(f"{col}:{dtype}" for col, dtype in sorted_items)
     return f"sha256:{hashlib.sha256(canonical_repr.encode('utf-8')).hexdigest()}"
+
+
+def get_latest_schema_fingerprint(dataset_name: str, manifests_dir: Path = MANIFESTS_DIR) -> Optional[str]:
+    """Inspect latest successful manifest to retrieve previous schema fingerprint."""
+    manifests_dir = Path(manifests_dir)
+    if not manifests_dir.exists():
+        return None
+    pattern = f"{dataset_name}_*.json"
+    manifest_files = sorted(list(manifests_dir.glob(pattern)), key=lambda p: p.stat().st_mtime, reverse=True)
+    for mf in manifest_files:
+        try:
+            with open(mf, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("status") == "success" and data.get("schema_fingerprint"):
+                return data["schema_fingerprint"]
+        except Exception:
+            continue
+    return None
+
+
+def get_committed_files(dataset_name: str, layer: str = "bronze", manifests_dir: Path = MANIFESTS_DIR) -> List[str]:
+    """Retrieve relative paths of all files published in successful manifests for a given dataset and layer."""
+    manifests_dir = Path(manifests_dir)
+    if not manifests_dir.exists():
+        return []
+    pattern = f"{dataset_name}_*.json"
+    manifest_files = list(manifests_dir.glob(pattern))
+    committed_files: List[str] = []
+    for mf in manifest_files:
+        try:
+            with open(mf, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("status") != "success":
+                continue
+            for f_info in data.get("files", []):
+                if f_info.get("layer") == layer and "relative_path" in f_info:
+                    committed_files.append(f_info["relative_path"])
+        except Exception:
+            continue
+    return committed_files
 
 
 def generate_batch_id(dataset_prefix: str, date_str: Optional[str] = None, manifests_dir: Path = MANIFESTS_DIR) -> str:
@@ -118,35 +165,6 @@ def get_earliest_watermark(dataset_name: str, manifests_dir: Path = MANIFESTS_DI
     return earliest_watermark
 
 
-def get_latest_cdc_watermark(dataset_name: str, manifests_dir: Path = MANIFESTS_DIR) -> Optional[str]:
-    """
-    Inspect existing successful manifests for a dataset to determine the highest cdc_updated_at_watermark.
-    Returns None if no previous incremental CDC batches exist.
-    """
-    manifests_dir = Path(manifests_dir)
-    if not manifests_dir.exists():
-        return None
-
-    pattern = f"{dataset_name}_*.json"
-    manifest_files = list(manifests_dir.glob(pattern))
-    if not manifest_files:
-        return None
-
-    latest_cdc_watermark = None
-    for mf in manifest_files:
-        try:
-            with open(mf, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if data.get("status") == "success" and data.get("cdc_updated_at_watermark"):
-                val = str(data["cdc_updated_at_watermark"])
-                if latest_cdc_watermark is None or val > latest_cdc_watermark:
-                    latest_cdc_watermark = val
-        except Exception:
-            continue
-
-    return latest_cdc_watermark
-
-
 def get_latest_pipeline_run_timestamp(dataset_name: str, manifests_dir: Path = MANIFESTS_DIR) -> Optional[str]:
     """
     Inspect existing successful manifests for a dataset to determine the highest retrieved_at_utc execution timestamp.
@@ -191,6 +209,101 @@ def is_batch_completed(batch_id: str, dataset_name: str, manifests_dir: Path = M
         return False
 
 
+def _parse_manifest_date(val: Optional[str], is_end: bool = False) -> Optional[datetime]:
+    """Helper to parse varied date/datetime formats from manifest files into datetime objects."""
+    if not val or val == "N/A":
+        return None
+    val = str(val).rstrip("Z").strip()
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            return datetime.strptime(val, fmt)
+        except ValueError:
+            pass
+    if len(val) == 10:
+        try:
+            dt = datetime.strptime(val, "%Y-%m-%d")
+            return dt.replace(hour=23, minute=59, second=59, microsecond=999999) if is_end else dt
+        except ValueError:
+            pass
+    try:
+        return datetime.fromisoformat(val)
+    except Exception:
+        return None
+
+
+def compute_uncovered_date_intervals(
+    dataset_name: str,
+    requested_start: str,
+    requested_end: str,
+    manifests_dir: Path = MANIFESTS_DIR,
+) -> List[Tuple[str, str]]:
+    """
+    Given a requested date range [requested_start, requested_end], inspect all successful manifests
+    for dataset_name and compute the uncovered date intervals (subtraction of covered ranges).
+    Returns a list of (start_iso, end_iso) tuples representing the gaps that still need to be ingested.
+    If the requested range is fully covered, returns an empty list [].
+    """
+    req_start_dt = _parse_manifest_date(requested_start, is_end=False)
+    req_end_dt = _parse_manifest_date(requested_end, is_end=True)
+    if not req_start_dt or not req_end_dt or req_start_dt > req_end_dt:
+        return [(requested_start, requested_end)]
+
+    manifests_dir = Path(manifests_dir)
+    if not manifests_dir.exists():
+        return [(req_start_dt.isoformat(), req_end_dt.isoformat())]
+
+    covered_intervals: List[Tuple[datetime, datetime]] = []
+    pattern = f"{dataset_name}_*.json"
+    for mf in manifests_dir.glob(pattern):
+        try:
+            with open(mf, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("status") != "success":
+                continue
+            m_start = _parse_manifest_date(data.get("source_data_start"), is_end=False)
+            m_end = _parse_manifest_date(data.get("source_data_end") or data.get("target_coverage_end"), is_end=True)
+            if m_start and m_end and m_start <= m_end:
+                covered_intervals.append((m_start, m_end))
+        except Exception:
+            continue
+
+    if not covered_intervals:
+        return [(req_start_dt.isoformat(), req_end_dt.isoformat())]
+
+    # Interval subtraction algorithm:
+    uncovered: List[Tuple[datetime, datetime]] = [(req_start_dt, req_end_dt)]
+
+    for cov_start, cov_end in covered_intervals:
+        next_uncovered: List[Tuple[datetime, datetime]] = []
+        for unc_start, unc_end in uncovered:
+            # Case 1: No overlap
+            if cov_end < unc_start or cov_start > unc_end:
+                next_uncovered.append((unc_start, unc_end))
+            else:
+                # Case 2: Left remaining slice
+                if unc_start < cov_start:
+                    next_uncovered.append((unc_start, cov_start))
+                # Case 3: Right remaining slice
+                if unc_end > cov_end:
+                    next_uncovered.append((cov_end, unc_end))
+        uncovered = next_uncovered
+        if not uncovered:
+            break
+
+    return [(s.isoformat(), e.isoformat()) for s, e in uncovered]
+
+
+def is_date_range_completed(
+    dataset_name: str,
+    start_date: str,
+    end_date: str,
+    manifests_dir: Path = MANIFESTS_DIR,
+) -> bool:
+    """Check if the requested date range [start_date, end_date] is 100% covered by successful manifests."""
+    uncovered = compute_uncovered_date_intervals(dataset_name, start_date, end_date, manifests_dir=manifests_dir)
+    return len(uncovered) == 0
+
+
 def create_manifest_dict(
     batch_id: str,
     dataset_name: str,
@@ -209,7 +322,6 @@ def create_manifest_dict(
     schema_fingerprint: str,
     status: str,
     files: List[Dict[str, Any]],
-    cdc_updated_at_watermark: Optional[str] = None,
     target_coverage_end: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Construct a Tier 1 manifest dictionary complying strictly with specification."""
@@ -234,8 +346,6 @@ def create_manifest_dict(
     }
     if target_coverage_end:
         d["target_coverage_end"] = target_coverage_end
-    if cdc_updated_at_watermark:
-        d["cdc_updated_at_watermark"] = cdc_updated_at_watermark
     return d
 
 

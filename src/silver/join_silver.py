@@ -141,8 +141,8 @@ def join_silver_datasets(
     # 3b. Early 311 Column Pruning (Projection Pushdown BEFORE Broadcast Join - P3 Optimization)
     cols_to_drop_311 = [
         "_batch_id", "_ingested_at_utc", "_source_file", "_source_name",
-        "_extraction_mode", "_schema_version", "_raw_row_hash", "_bronze_status",
-        "source_created_at", "source_updated_at", "created_date", "closed_date",
+        "_extraction_mode", "_schema_version", "_bronze_status",
+        "source_created_at", "created_date", "closed_date",
         "due_date", "resolution_action_updated_date", "due_date_utc",
         "resolution_action_updated_date_utc", "x_coordinate_state_plane",
         "y_coordinate_state_plane", "taxi_company_borough", "taxi_pick_up_location",

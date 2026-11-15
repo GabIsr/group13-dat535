@@ -33,6 +33,7 @@ from pyspark.sql.functions import (
     dayofweek,
     desc,
     from_utc_timestamp,
+    greatest,
     hour,
     initcap,
     length,
@@ -286,10 +287,7 @@ def normalize_timestamps_and_durations(df: DataFrame, now_epoch: int) -> DataFra
         when(~col("is_ticket_closed"), spark_round(open_age_secs / 86400.0, 2)).otherwise(lit(None).cast("double")),
     )
 
-    # Source timestamps normalization (Socrata :created_at and :updated_at)
-    if "source_updated_at" in cols:
-        df_proc = df_proc.withColumn("source_updated_at", to_timestamp(col("source_updated_at")))
-
+    # Source timestamps normalization (Socrata :created_at)
     if "source_created_at" in cols:
         src_cr_ts = to_timestamp(col("source_created_at"))
         df_proc = df_proc.withColumn("source_created_at", src_cr_ts)
@@ -381,33 +379,45 @@ def quarantine_invalid_311_records(
 def deduplicate_311_records(df: DataFrame) -> Tuple[DataFrame, int]:
     """
     Perform Change Data Capture (CDC) deduplication via PySpark Window on valid records.
-    Prioritizes authoritative business mutation timestamps:
-      coalesce(resolution_action_updated_date, closed_date, created_date)
-    over Lakehouse pipeline ingestion timestamp (_ingested_at_utc), falling back to source_updated_at.
-    Ensures genuine municipal case resolutions always win deterministically without trusting
-    unreliable third-party database re-indexing metadata.
+    Prioritizes:
+      1. Authoritative business mutation timestamps:
+         greatest(coalesce(closed_date, created_date), coalesce(resolution_action_updated_date, created_date)) DESC
+      2. Lakehouse pipeline arrival timestamp & batch lineage:
+         _ingested_at_utc DESC, _batch_id DESC
+      3. Deterministic tie-breaker:
+         unique_key DESC
+    Ensures genuine municipal case resolutions always win deterministically without relying
+    on third-party database metadata (:updated_at).
     100% pure PySpark.
     """
     cols = set(df.columns)
     order_cols = []
 
-    # 1. Authoritative business lifecycle mutation timestamp (real municipal work date)
-    business_date_candidates = []
-    for c in ["resolution_action_updated_date", "closed_date", "created_date", "created_at_utc"]:
-        if c in cols:
-            business_date_candidates.append(col(c))
-    if business_date_candidates:
-        order_cols.append(coalesce(*business_date_candidates).desc())
+    # 1. Authoritative real-world business mutation timestamp (latest municipal work date)
+    date_candidates = []
+    base_created = col("created_date") if "created_date" in cols else lit(None)
 
-    # 2. Authoritative Lakehouse pipeline arrival timestamp (our Bronze ingestion batch time)
+    if "closed_date" in cols:
+        date_candidates.append(coalesce(col("closed_date"), base_created))
+    if "resolution_action_updated_date" in cols:
+        date_candidates.append(coalesce(col("resolution_action_updated_date"), base_created))
+
+    if date_candidates:
+        if len(date_candidates) > 1:
+            order_cols.append(greatest(*date_candidates).desc())
+        else:
+            order_cols.append(date_candidates[0].desc())
+    elif "created_date" in cols:
+        order_cols.append(col("created_date").desc())
+
+    # 2. Authoritative Lakehouse pipeline arrival timestamp & batch lineage
     if "_ingested_at_utc" in cols:
         order_cols.append(col("_ingested_at_utc").desc())
+    if "_batch_id" in cols:
+        order_cols.append(col("_batch_id").desc())
 
-    # 3. Tertiary fallback to source_updated_at if present, or unique_key
-    if "source_updated_at" in cols:
-        order_cols.append(col("source_updated_at").desc())
-    if not order_cols:
-        order_cols.append(col("unique_key").desc())
+    # 3. Deterministic tie-breaker across worker nodes
+    order_cols.append(col("unique_key").desc())
 
     # Ensure unique_key is cast to LongType
     df_keyed = df.withColumn("unique_key", col("unique_key").cast("long"))
@@ -826,7 +836,7 @@ def clean_and_validate_311(
     if staging_dir is None:
         staging_dir = silver_311_dir.parent / "staging_311"
 
-    bronze_files = sorted(bronze_311_dir.glob("**/*.parquet"))
+    bronze_files = sorted([f for f in bronze_311_dir.glob("**/*.parquet") if "_staging" not in f.parts])
     if not bronze_files:
         logger.warning(f"No Bronze 311 files found in {bronze_311_dir}")
         return {"status": "skipped", "reason": "no_input_files"}

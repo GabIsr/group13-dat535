@@ -19,19 +19,21 @@ from src.utils.config import (
 from src.utils.manifest import (
     compute_file_sha256,
     compute_schema_fingerprint,
+    compute_uncovered_date_intervals,
     create_manifest_dict,
     generate_batch_id,
+    get_committed_files,
     get_earliest_watermark,
-    get_latest_cdc_watermark,
     get_latest_pipeline_run_timestamp,
+    get_latest_schema_fingerprint,
     get_latest_watermark,
     is_batch_completed,
+    is_date_range_completed,
     save_manifest,
 )
 from unittest.mock import patch, MagicMock
 import io
 import urllib.error
-from src.ingestion.ingest_311 import compute_row_hashes
 from src.ingestion.ingest_weather import fetch_open_meteo_batch
 
 
@@ -84,17 +86,6 @@ class TestIngestionPipeline(unittest.TestCase):
 
         self.assertEqual(fp_a, fp_b)  # Canonical sorting ensures equality
         self.assertNotEqual(fp_a, fp_c)  # Schema drift detected
-
-    def test_row_hashing_determinism(self):
-        """Verify that row hashing generates identical hashes for identical payloads."""
-        df1 = pd.DataFrame([{"id": 1, "val": "abc"}, {"id": 2, "val": "def"}])
-        df2 = pd.DataFrame([{"val": "abc", "id": 1}, {"val": "def", "id": 2}])
-
-        h1 = compute_row_hashes(df1)
-        h2 = compute_row_hashes(df2)
-        self.assertEqual(h1, h2)
-        self.assertEqual(len(h1), 2)
-        self.assertEqual(len(h1[0]), 64)  # SHA-256 hex length
 
     def test_manifest_lifecycle_and_watermark(self):
         """Verify creating, saving, discovering watermarks, and idempotency checks."""
@@ -151,7 +142,7 @@ class TestIngestionPipeline(unittest.TestCase):
             landing_dir.mkdir(parents=True)
             bronze_dir = tmp_path / "bronze"
 
-            # Create mock compressed landing JSON including Socrata system columns :updated_at and :created_at
+            # Create mock compressed landing JSON including Socrata system column :created_at
             mock_records = [
                 {
                     "unique_key": "1001",
@@ -159,7 +150,6 @@ class TestIngestionPipeline(unittest.TestCase):
                     "complaint_type": "Noise",
                     "latitude": "40.71",
                     "longitude": "-74.00",
-                    ":updated_at": 1729245600,
                     ":created_at": 1729245000,
                 },
                 {
@@ -168,7 +158,6 @@ class TestIngestionPipeline(unittest.TestCase):
                     "complaint_type": "Illegal Parking",
                     "latitude": "40.75",
                     "longitude": "-73.98",
-                    ":updated_at": "2026-10-19T14:35:00.000Z",
                     ":created_at": "2026-10-19T14:30:00.000Z",
                 },
             ]
@@ -192,22 +181,19 @@ class TestIngestionPipeline(unittest.TestCase):
             self.assertEqual(len(parquet_files), 1)
             df_bronze = pd.read_parquet(parquet_files[0])
             self.assertEqual(len(df_bronze), 2)
-            self.assertIn("_raw_row_hash", df_bronze.columns)
             self.assertIn("_batch_id", df_bronze.columns)
             self.assertEqual(df_bronze["_batch_id"].iloc[0], "311_20261029_001")
 
-            # Verify colon columns :updated_at and :created_at were cleanly renamed to standard Bronze identifiers
-            self.assertIn("source_updated_at", df_bronze.columns)
+            # Verify colon column :created_at was cleanly renamed to standard Bronze identifier
             self.assertIn("source_created_at", df_bronze.columns)
-            self.assertNotIn(":updated_at", df_bronze.columns)
             self.assertNotIn(":created_at", df_bronze.columns)
 
-    def test_cdc_watermark_dual_mode_manifest_tracking(self):
-        """Verify that get_latest_cdc_watermark independently tracks :updated_at without corrupting backfill watermarks."""
+    def test_pipeline_run_timestamp_manifest_tracking(self):
+        """Verify watermark tracking and pipeline run timestamp tracking across backfill and incremental manifests."""
         with tempfile.TemporaryDirectory() as tmp_dir:
             tmp_path = Path(tmp_dir)
 
-            # 1. Backfill batch (targets created_date 2025, no cdc_watermark)
+            # 1. Backfill batch (targets created_date 2025)
             m_backfill = create_manifest_dict(
                 batch_id="311_2025_backfill",
                 dataset_name="nyc_311",
@@ -226,16 +212,14 @@ class TestIngestionPipeline(unittest.TestCase):
                 schema_fingerprint="sha256:test",
                 status="success",
                 files=[],
-                cdc_updated_at_watermark=None,
             )
             save_manifest(m_backfill, output_dir=tmp_path)
 
-            # Incremental CDC watermark should still be None
-            self.assertIsNone(get_latest_cdc_watermark("nyc_311", manifests_dir=tmp_path))
             # Standard watermark sees the 2025 backfill
             self.assertEqual(get_latest_watermark("nyc_311", manifests_dir=tmp_path), "2025-12-31")
+            self.assertEqual(get_latest_pipeline_run_timestamp("nyc_311", manifests_dir=tmp_path), "2026-10-30T10:00:00")
 
-            # 2. Incremental batch advances cdc_updated_at_watermark
+            # 2. Incremental batch advances watermark and pipeline run timestamp
             m_incr = create_manifest_dict(
                 batch_id="311_20261030_001",
                 dataset_name="nyc_311",
@@ -254,14 +238,11 @@ class TestIngestionPipeline(unittest.TestCase):
                 schema_fingerprint="sha256:test",
                 status="success",
                 files=[],
-                cdc_updated_at_watermark="2026-10-30T10:45:00.000",
             )
             save_manifest(m_incr, output_dir=tmp_path)
 
-            # Both watermarks exist cleanly separated!
-            self.assertEqual(get_latest_cdc_watermark("nyc_311", manifests_dir=tmp_path), "2026-10-30T10:45:00.000")
             self.assertEqual(get_latest_watermark("nyc_311", manifests_dir=tmp_path), "2026-10-30")
-            # Pipeline execution watermark tracks the latest retrieved_at_utc run timestamp (stripped of any Z for Socrata floating timestamp compliance)!
+            # Pipeline execution watermark tracks the latest retrieved_at_utc run timestamp (stripped of trailing Z)
             self.assertEqual(get_latest_pipeline_run_timestamp("nyc_311", manifests_dir=tmp_path), "2026-10-30T11:00:00")
 
     def test_business_mutation_window_clauses(self):
@@ -344,6 +325,360 @@ class TestIngestionPipeline(unittest.TestCase):
             fetch_open_meteo_batch(grid_points, "2026-11-09", "2026-11-09", ["temperature_2m"], max_retries=3)
 
         self.assertEqual(mock_urlopen.call_count, 1)
+
+    def test_compute_uncovered_date_intervals_and_idempotency(self):
+        """Verify date-interval gap calculation and idempotency matching across subsets and supersets."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+
+            # 1. No manifests: entire range uncovered
+            uncovered = compute_uncovered_date_intervals("nyc_311", "2026-10-10", "2026-10-20", manifests_dir=tmp_path)
+            self.assertEqual(len(uncovered), 1)
+            self.assertFalse(is_date_range_completed("nyc_311", "2026-10-10", "2026-10-20", manifests_dir=tmp_path))
+
+            # 2. Add manifest covering 2026-10-10 to 2026-10-20
+            m = create_manifest_dict(
+                batch_id="311_20261020_001",
+                dataset_name="nyc_311",
+                source_name="nyc_open_data",
+                source_dataset_id="erm2-nwe9",
+                source_url="https://data.cityofnewyork.us/resource/erm2-nwe9.json",
+                retrieved_at_utc="2026-10-20T12:00:00Z",
+                source_data_start="2026-10-10",
+                source_data_end="2026-10-20",
+                extraction_mode="backfill",
+                environment="dev",
+                code_version="test",
+                duration_seconds=1.0,
+                byte_size=500,
+                row_count=100,
+                schema_fingerprint="sha256:test",
+                status="success",
+                files=[],
+            )
+            save_manifest(m, output_dir=tmp_path)
+
+            # Exact match: covered
+            self.assertTrue(is_date_range_completed("nyc_311", "2026-10-10", "2026-10-20", manifests_dir=tmp_path))
+
+            # Subset: covered
+            self.assertTrue(is_date_range_completed("nyc_311", "2026-10-12", "2026-10-18", manifests_dir=tmp_path))
+
+            # Superset: not fully covered (returns uncovered slices)
+            self.assertFalse(is_date_range_completed("nyc_311", "2026-10-01", "2026-10-31", manifests_dir=tmp_path))
+            gaps = compute_uncovered_date_intervals("nyc_311", "2026-10-01", "2026-10-31", manifests_dir=tmp_path)
+            self.assertEqual(len(gaps), 2)  # Gap before Oct 10 and gap after Oct 20
+
+    def test_run_311_ingestion_idempotency_skip(self):
+        """Verify run_311_ingestion skips execution when date range is covered unless force=True."""
+        from src.ingestion.ingest_311 import run_311_ingestion
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+
+            # Establish covered manifest
+            m = create_manifest_dict(
+                batch_id="311_20261020_001",
+                dataset_name="nyc_311",
+                source_name="nyc_open_data",
+                source_dataset_id="erm2-nwe9",
+                source_url="https://data.cityofnewyork.us/resource/erm2-nwe9.json",
+                retrieved_at_utc="2026-10-20T12:00:00Z",
+                source_data_start="2026-10-10",
+                source_data_end="2026-10-20",
+                extraction_mode="backfill",
+                environment="dev",
+                code_version="test",
+                duration_seconds=1.0,
+                byte_size=500,
+                row_count=100,
+                schema_fingerprint="sha256:test",
+                status="success",
+                files=[],
+            )
+            save_manifest(m, output_dir=tmp_path)
+
+            # Calling without force should skip (return None)
+            res = run_311_ingestion(
+                mode="backfill",
+                start_date="2026-10-10",
+                end_date="2026-10-20",
+                manifests_dir=tmp_path,
+                force=False,
+            )
+            self.assertIsNone(res)
+
+    @patch("src.ingestion.ingest_311.fetch_socrata_page")
+    def test_fetch_311_to_landing_pure_python_and_cleanup(self, mock_fetch):
+        """Verify pure Python streaming to landing, metadata extraction, and cleanup on failure."""
+        from src.ingestion.ingest_311 import fetch_311_to_landing
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            landing_dir = Path(tmp_dir) / "landing_batch"
+
+            mock_records = [
+                {"unique_key": "1", "created_date": "2026-10-01T10:00:00.000"},
+                {"unique_key": "2", "created_date": "2026-10-02T12:00:00.000"},
+            ]
+            raw_bytes = json.dumps(mock_records).encode("utf-8")
+            mock_fetch.side_effect = [(mock_records, raw_bytes), ([], b"[]")]
+
+            res = fetch_311_to_landing(
+                landing_batch_dir=landing_dir,
+                where_clause=None,
+                batch_size=10,
+                max_records=10,
+            )
+
+            self.assertEqual(res["total_rows"], 2)
+            self.assertEqual(res["source_min_date"], "2026-10-01T10:00:00.000")
+            self.assertEqual(res["source_max_date"], "2026-10-02T12:00:00.000")
+            self.assertEqual(len(res["manifest_files"]), 1)
+            self.assertTrue((landing_dir / "raw_part_0000.json.gz").exists())
+
+            # Test cleanup on failure:
+            landing_fail_dir = Path(tmp_dir) / "landing_fail_batch"
+            mock_fetch.side_effect = RuntimeError("Network exploded")
+            with self.assertRaises(RuntimeError):
+                fetch_311_to_landing(landing_batch_dir=landing_fail_dir)
+            # Confirm no leftover partial files
+            self.assertEqual(len(list(landing_fail_dir.glob("raw_part_*.json.gz"))), 0)
+
+    def test_bronze_multi_partition_write_and_wap_validation(self):
+        """Verify volume-aware partitioned writes across multiple year/month partitions and WAP publication."""
+        import gzip
+        import json
+        from src.ingestion.ingest_311 import convert_landing_to_bronze_pyspark
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            landing_dir = tmp_path / "landing" / "batch_multi_part"
+            landing_dir.mkdir(parents=True)
+            bronze_dir = tmp_path / "bronze"
+
+            # Records across Oct 2026 and Nov 2026
+            records = [
+                {"unique_key": "2001", "created_date": "2026-10-31T23:50:00.000", "complaint_type": "Noise"},
+                {"unique_key": "2002", "created_date": "2026-11-01T00:10:00.000", "complaint_type": "Noise"},
+            ]
+            gz_path = landing_dir / "raw_part_0000.json.gz"
+            with gzip.open(gz_path, "wb") as f:
+                f.write(json.dumps(records).encode("utf-8"))
+
+            written_files, schema_json = convert_landing_to_bronze_pyspark(
+                landing_batch_dir=landing_dir,
+                base_bronze_dir=bronze_dir,
+                batch_id="batch_multi_part",
+                retrieved_at_utc="2026-11-01T01:00:00Z",
+                extraction_mode="incremental",
+                return_schema=True,
+            )
+
+            self.assertEqual(len(written_files), 2)
+            self.assertEqual(sum(f["rows"] for f in written_files), 2)
+
+            # Both partitions exist on disk
+            oct_files = list(bronze_dir.glob("year=2026/month=10/*.parquet"))
+            nov_files = list(bronze_dir.glob("year=2026/month=11/*.parquet"))
+            self.assertEqual(len(oct_files), 1)
+            self.assertEqual(len(nov_files), 1)
+
+            # Filenames are batch-prefixed
+            self.assertTrue(oct_files[0].name.startswith("batch_multi_part_"))
+            self.assertTrue(nov_files[0].name.startswith("batch_multi_part_"))
+
+            # Staging directory is cleaned up
+            staging_dir = bronze_dir / "_staging"
+            self.assertFalse((staging_dir / "batch_multi_part").exists())
+
+            # Schema JSON returned and valid
+            self.assertTrue(len(schema_json) > 0)
+            self.assertIn("unique_key", schema_json)
+
+    def test_bronze_failed_write_not_committed_and_safe_retry(self):
+        """Verify that a batch failure leaves no manifest and can be retried cleanly."""
+        from src.ingestion.ingest_311 import run_311_ingestion
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            manifests_dir = tmp_path / "manifests"
+            bronze_dir = tmp_path / "bronze"
+
+            # 1. Simulate failure during Bronze transformation/validation
+            with patch("src.ingestion.ingest_311.convert_landing_to_bronze_pyspark", side_effect=RuntimeError("Bronze write error")):
+                with patch("src.ingestion.ingest_311.fetch_311_to_landing") as mock_fetch:
+                    mock_fetch.return_value = {
+                        "total_rows": 2,
+                        "total_bytes": 100,
+                        "manifest_files": [],
+                        "source_min_date": "2026-10-01",
+                        "source_max_date": "2026-10-02",
+                    }
+                    with self.assertRaises(RuntimeError):
+                        run_311_ingestion(
+                            batch_id="batch_retry_001",
+                            manifests_dir=manifests_dir,
+                            bronze_dir=bronze_dir,
+                            force=True,
+                        )
+
+            # Manifest was NOT committed
+            self.assertFalse(is_batch_completed("batch_retry_001", "nyc_311", manifests_dir=manifests_dir))
+
+            # 2. Retry succeeds cleanly
+            with patch("src.ingestion.ingest_311.convert_landing_to_bronze_pyspark") as mock_convert:
+                mock_convert.return_value = ([{
+                    "file_name": "batch_retry_001_part.parquet",
+                    "relative_path": "data/bronze/nyc311/year=2026/month=10/batch_retry_001_part.parquet",
+                    "layer": "bronze",
+                    "rows": 2,
+                    "bytes": 500,
+                    "sha256": "fake_sha",
+                }], '{"type":"struct","fields":[]}')
+                with patch("src.ingestion.ingest_311.fetch_311_to_landing") as mock_fetch:
+                    mock_fetch.return_value = {
+                        "total_rows": 2,
+                        "total_bytes": 100,
+                        "manifest_files": [],
+                        "source_min_date": "2026-10-01",
+                        "source_max_date": "2026-10-02",
+                    }
+                    res = run_311_ingestion(
+                        batch_id="batch_retry_001",
+                        manifests_dir=manifests_dir,
+                        bronze_dir=bronze_dir,
+                        force=True,
+                    )
+                    self.assertIsNotNone(res)
+                    self.assertTrue(is_batch_completed("batch_retry_001", "nyc_311", manifests_dir=manifests_dir))
+
+    def test_audit_and_publish_validation_failure_on_row_mismatch(self):
+        """Verify that audit_and_publish_bronze_batch raises ValueError when staged rows != expected rows."""
+        from src.ingestion.ingest_311 import audit_and_publish_bronze_batch
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            staging_dir = tmp_path / "_staging" / "batch_test"
+            part_dir = staging_dir / "year=2026" / "month=10"
+            part_dir.mkdir(parents=True)
+            df = pd.DataFrame([{"unique_key": 1}, {"unique_key": 2}])
+            df.to_parquet(part_dir / "part.parquet")
+
+            # Staged file has 2 rows, but expected_rows is 5 -> MUST raise ValueError
+            with self.assertRaises(ValueError):
+                audit_and_publish_bronze_batch(
+                    staging_batch_dir=staging_dir,
+                    base_bronze_dir=tmp_path / "bronze",
+                    batch_id="batch_test",
+                    expected_rows=5,
+                )
+
+    def test_schema_drift_detection_across_batches(self):
+        """Verify schema fingerprint detects evolution between Spark DataFrame schemas."""
+        schema_v1 = '{"type":"struct","fields":[{"name":"unique_key","type":"string","nullable":true}]}'
+        schema_v2 = '{"type":"struct","fields":[{"name":"unique_key","type":"string","nullable":true},{"name":"new_feature","type":"integer","nullable":true}]}'
+
+        fp1 = compute_schema_fingerprint(schema_v1)
+        fp2 = compute_schema_fingerprint(schema_v2)
+
+        self.assertTrue(fp1.startswith("sha256:"))
+        self.assertTrue(fp2.startswith("sha256:"))
+        self.assertNotEqual(fp1, fp2, "Schema drift between v1 and v2 was not detected!")
+
+    def test_backfill_requires_end_date(self):
+        """Verify backfill mode raises ValueError when end_date is omitted."""
+        from src.ingestion.ingest_311 import build_311_soql_filter
+        with self.assertRaises(ValueError) as ctx:
+            build_311_soql_filter(mode="backfill", start_date="2026-01-01", end_date=None)
+        self.assertIn("Backfill mode requires an explicit --end-date", str(ctx.exception))
+
+    def test_backfill_rejects_future_dates(self):
+        """Verify build_311_soql_filter raises ValueError when end_date is in the future."""
+        from src.ingestion.ingest_311 import build_311_soql_filter
+        with self.assertRaises(ValueError) as ctx:
+            build_311_soql_filter(mode="backfill", start_date="2026-01-01", end_date="2099-01-01")
+        self.assertIn("cannot be in the future", str(ctx.exception))
+
+    def test_backfill_rejects_start_after_end(self):
+        """Verify build_311_soql_filter raises ValueError when start_date > end_date."""
+        from src.ingestion.ingest_311 import build_311_soql_filter
+        with self.assertRaises(ValueError) as ctx:
+            build_311_soql_filter(mode="backfill", start_date="2026-05-01", end_date="2026-01-01")
+        self.assertIn("cannot be after end_date", str(ctx.exception))
+
+    @patch("urllib.request.urlopen")
+    def test_fetch_socrata_page_no_retry_on_permanent_4xx(self, mock_urlopen):
+        """Verify fetch_socrata_page raises immediately on permanent 4xx without retrying."""
+        import urllib.error
+        from src.ingestion.ingest_311 import fetch_socrata_page
+
+        mock_err = urllib.error.HTTPError(
+            url="http://fake", code=400, msg="Bad Request", hdrs={}, fp=None
+        )
+        mock_urlopen.side_effect = mock_err
+
+        with self.assertRaises(urllib.error.HTTPError):
+            fetch_socrata_page(limit=10, offset=0, max_retries=3)
+
+        self.assertEqual(mock_urlopen.call_count, 1)
+
+    def test_run_weather_ingestion_idempotency_skip(self):
+        """Verify run_weather_ingestion skips execution when date range is covered unless force=True."""
+        from src.ingestion.ingest_weather import run_weather_ingestion
+        from src.utils.config import DATASET_WEATHER
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+
+            m = create_manifest_dict(
+                batch_id="wth_20261020_001",
+                dataset_name=DATASET_WEATHER,
+                source_name="open_meteo",
+                source_dataset_id="era5_land",
+                source_url="https://archive-api.open-meteo.com/v1/archive",
+                retrieved_at_utc="2026-10-20T12:00:00Z",
+                source_data_start="2026-10-10",
+                source_data_end="2026-10-20",
+                extraction_mode="backfill",
+                environment="dev",
+                code_version="test",
+                duration_seconds=1.0,
+                byte_size=500,
+                row_count=100,
+                schema_fingerprint="sha256:test",
+                status="success",
+                files=[],
+            )
+            save_manifest(m, output_dir=tmp_path)
+
+            # Calling without force should skip
+            res = run_weather_ingestion(
+                mode="backfill",
+                start_date="2026-10-10",
+                end_date="2026-10-20",
+                manifests_dir=tmp_path,
+                force=False,
+            )
+            self.assertIsNone(res)
+
+    def test_weather_backfill_requires_explicit_dates(self):
+        """Verify backfill mode requires both start_date and end_date."""
+        from src.ingestion.ingest_weather import run_weather_ingestion
+
+        with self.assertRaises(ValueError) as ctx:
+            run_weather_ingestion(mode="backfill", start_date=None, end_date="2026-10-10")
+        self.assertIn("explicit --start-date", str(ctx.exception))
+
+        with self.assertRaises(ValueError) as ctx:
+            run_weather_ingestion(mode="backfill", start_date="2026-10-01", end_date=None)
+        self.assertIn("explicit --end-date", str(ctx.exception))
+
+    def test_weather_backfill_rejects_dates_beyond_ecmwf_lag(self):
+        """Verify backfill rejects end_date beyond the 5-day ECMWF publication ceiling."""
+        from src.ingestion.ingest_weather import run_weather_ingestion
+
+        with self.assertRaises(ValueError) as ctx:
+            run_weather_ingestion(mode="backfill", start_date="2026-10-01", end_date="2099-01-01")
+        self.assertIn("ECMWF 5-day publication latency", str(ctx.exception))
 
 
 if __name__ == "__main__":

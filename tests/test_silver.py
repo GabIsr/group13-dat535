@@ -1122,9 +1122,10 @@ class TestSilverLayerPipeline(unittest.TestCase):
             df_quar = pd.read_parquet(quar_out / "quarantined_311.parquet")
             self.assertEqual(len(df_quar), 3)
 
-    def test_cdc_dedup_prioritizes_source_updated_at_over_ingestion_time(self):
+    def test_cdc_dedup_prioritizes_business_date_over_ingestion_time(self):
         """
-        Verify that CDC deduplication prioritizes source_updated_at over _ingested_at_utc.
+        Verify that CDC deduplication prioritizes real municipal business dates (closed_date / resolution)
+        over pipeline _ingested_at_utc arrival order.
         Simulates an out-of-order backfill: a 2025 backfill (OPEN) ingested LATER at 12:00
         must NOT overwrite a 2026 batch (CLOSED) that was ingested EARLIER at 10:00!
         """
@@ -1136,7 +1137,7 @@ class TestSilverLayerPipeline(unittest.TestCase):
             bronze_in.mkdir()
 
             mock_records = [
-                # Record 1: From 2026 batch (ingested at 10:00, but updated on Socrata on 2026-01-15: CLOSED)
+                # Record 1: From 2026 batch (ingested at 10:00, but closed on 2026-01-15: CLOSED)
                 {
                     "unique_key": "999999",
                     "created_date": "2025-12-20T10:00:00.000",
@@ -1147,12 +1148,11 @@ class TestSilverLayerPipeline(unittest.TestCase):
                     "borough": "MANHATTAN",
                     "latitude": "40.7500",
                     "longitude": "-73.9900",
-                    "source_updated_at": "2026-01-15T12:00:00.000Z",
                     "source_created_at": "2025-12-20T15:05:00.000Z",
                     "_ingested_at_utc": "2026-10-30T10:00:00Z",
                     "_batch_id": "b_2026",
                 },
-                # Record 2: From historical 2025 backfill (ingested at 12:00, but Socrata update was 2025-12-20: OPEN)
+                # Record 2: From historical 2025 backfill (ingested at 12:00, but open as of 2025-12-20: OPEN)
                 {
                     "unique_key": "999999",
                     "created_date": "2025-12-20T10:00:00.000",
@@ -1163,7 +1163,6 @@ class TestSilverLayerPipeline(unittest.TestCase):
                     "borough": "MANHATTAN",
                     "latitude": "40.7500",
                     "longitude": "-73.9900",
-                    "source_updated_at": "2025-12-20T10:00:00.000Z",
                     "source_created_at": "2025-12-20T15:05:00.000Z",
                     "_ingested_at_utc": "2026-10-30T12:00:00Z",
                     "_batch_id": "b_2025",
@@ -1180,7 +1179,7 @@ class TestSilverLayerPipeline(unittest.TestCase):
             df_res = pd.concat([pd.read_parquet(f) for f in clean_files])
             winner = df_res.iloc[0]
 
-            # The 2026 update MUST win because source_updated_at was 2026-01-15!
+            # The 2026 update MUST win because closed_date was 2026-01-15!
             self.assertEqual(winner["status"], "CLOSED")
             self.assertEqual(str(winner["_batch_id"]), "b_2026")
             self.assertIn("source_intake_lag_hours", df_res.columns)

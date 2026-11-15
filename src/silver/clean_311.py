@@ -14,8 +14,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
-import pandas as pd
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.functions import (
     array,
@@ -102,115 +100,6 @@ logger = logging.getLogger("clean_311")
 
 
 # =========================================================================
-# Standalone Helper Functions (Kept for unit test compatibility)
-# =========================================================================
-# Reference Implementations (Algorithmic Benchmarks & Unit Test Suite)
-# =========================================================================
-
-def to_utc_datetime(series: pd.Series, local_tz: str = "America/New_York") -> pd.Series:
-    """
-    Parse NYC 311 local Eastern Time timestamps and convert them accurately to UTC.
-    NYC Open Data publishes 311 timestamps in America/New_York local time,
-    which varies between Eastern Standard Time (UTC-5) and Eastern Daylight Time (UTC-4).
-    Treating them naively as UTC induces a 4 to 5 hour temporal error, breaking joins with
-    UTC weather reanalysis.
-    """
-    dt = pd.to_datetime(series, errors="coerce")
-    if dt.dt.tz is None:
-        return dt.dt.tz_localize(local_tz, ambiguous="NaT", nonexistent="shift_forward").dt.tz_convert("UTC")
-    return dt.dt.tz_convert("UTC")
-
-
-def standardize_string_series(
-    series: pd.Series,
-    default_val: str,
-    case: str = "upper",
-) -> pd.Series:
-    """
-    Standardize text columns safely by:
-    1. Detecting nulls, empty strings, whitespace, and literal stringified nulls ('nan', 'none', 'null').
-    2. Imputing with default_val BEFORE or without converting missing values into literal 'NAN'/'None' strings.
-    3. Applying string case formatting ('upper', 'title', 'preserve').
-    """
-    s = series.astype(object)
-    s_str = s.astype(str).str.strip()
-    mask_null = s.isna() | s_str.isin(["", "nan", "NaN", "None", "NONE", "NAN", "null", "NULL", "<NA>"])
-    clean_s = s_str.where(~mask_null, default_val)
-    if case == "upper":
-        return clean_s.str.upper()
-    elif case == "title":
-        return clean_s.str.title()
-    return clean_s
-
-
-def haversine_distance_km(
-    lat1: pd.Series,
-    lon1: pd.Series,
-    lat2: pd.Series,
-    lon2: pd.Series,
-) -> pd.Series:
-    """
-    Compute vectorized Great-Circle Haversine distance in kilometers between two coordinate Series.
-    Mean Earth radius R = 6,371.0 km.
-    Safeguards:
-      1. Defensive dimension check: returns NaN Series with a warning if input lengths mismatch.
-      2. Operates positionally using NumPy to prevent accidental Pandas index misalignment.
-      3. Validates geographic coordinate bounds: latitude in [-90, 90], longitude in [-180, 180].
-      4. Returns NaN for missing, out-of-bounds, or physically invalid coordinates.
-      5. Preserves the index of lat1 on the returned Series.
-    """
-    target_index = getattr(lat1, "index", None)
-    try:
-        n1, n2, n3, n4 = len(lat1), len(lon1), len(lat2), len(lon2)
-    except (TypeError, AttributeError):
-        logger.warning("haversine_distance_km: Invalid input types received. Returning empty NaN Series.")
-        return pd.Series(np.nan, index=target_index, dtype="float64")
-
-    if not (n1 == n2 == n3 == n4):
-        logger.warning(
-            f"haversine_distance_km: Dimension mismatch (lat1={n1}, lon1={n2}, lat2={n3}, lon2={n4}). "
-            "Defensively returning NaN Series to prevent pipeline crash."
-        )
-        return pd.Series(np.nan, index=target_index, dtype="float64")
-
-    v_lat1 = pd.to_numeric(pd.Series(lat1).to_numpy(), errors="coerce").astype(float)
-    v_lon1 = pd.to_numeric(pd.Series(lon1).to_numpy(), errors="coerce").astype(float)
-    v_lat2 = pd.to_numeric(pd.Series(lat2).to_numpy(), errors="coerce").astype(float)
-    v_lon2 = pd.to_numeric(pd.Series(lon2).to_numpy(), errors="coerce").astype(float)
-
-    valid_mask = (
-        ~np.isnan(v_lat1)
-        & ~np.isnan(v_lon1)
-        & ~np.isnan(v_lat2)
-        & ~np.isnan(v_lon2)
-        & (v_lat1 >= -90.0)
-        & (v_lat1 <= 90.0)
-        & (v_lat2 >= -90.0)
-        & (v_lat2 <= 90.0)
-        & (v_lon1 >= -180.0)
-        & (v_lon1 <= 180.0)
-        & (v_lon2 >= -180.0)
-        & (v_lon2 <= 180.0)
-    )
-
-    dist = np.full(n1, np.nan, dtype=np.float64)
-    if np.any(valid_mask):
-        r_lat1 = np.radians(v_lat1[valid_mask])
-        r_lon1 = np.radians(v_lon1[valid_mask])
-        r_lat2 = np.radians(v_lat2[valid_mask])
-        r_lon2 = np.radians(v_lon2[valid_mask])
-
-        dlat = r_lat2 - r_lat1
-        dlon = r_lon2 - r_lon1
-
-        a = np.sin(dlat / 2.0) ** 2 + np.cos(r_lat1) * np.cos(r_lat2) * np.sin(dlon / 2.0) ** 2
-        a = np.clip(a, 0.0, 1.0)
-        c = 2.0 * np.arcsin(np.sqrt(a))
-        dist[valid_mask] = np.round(6371.0 * c, 2)
-
-    return pd.Series(dist, index=target_index, dtype="float64")
-
-
 def spark_haversine_distance_km(lat1_col, lon1_col, lat2_col, lon2_col):
     """
     Compute Great-Circle Haversine distance in km using pure PySpark SQL functions.

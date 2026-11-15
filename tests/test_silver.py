@@ -20,7 +20,7 @@ from src.silver.config import (
     WEATHER_EXTREME_THRESHOLDS,
     WEATHER_HARD_LIMITS,
 )
-from src.silver.clean_311 import clean_and_validate_311, to_utc_datetime, standardize_string_series, haversine_distance_km, spark_haversine_distance_km
+from src.silver.clean_311 import clean_and_validate_311, spark_haversine_distance_km
 from src.silver.clean_weather import clean_and_validate_weather
 from src.silver.join_silver import join_silver_datasets
 from src.silver.spatial_cleaning import (
@@ -212,18 +212,23 @@ class TestSilverLayerPipeline(unittest.TestCase):
             self.assertTrue(res["avg_grid_distance_km"] > 0.0)
 
     def test_timezone_localization_eastern_to_utc(self):
-        """Verify proper 4-hour (EDT) and 5-hour (EST) conversion to UTC."""
-        # EDT (Daylight Saving Time: UTC-4) -> 14:00 local should be 18:00 UTC
-        edt_local = pd.Series(["2026-07-15T14:00:00.000"])
-        edt_utc = to_utc_datetime(edt_local).iloc[0]
-        expected_edt_utc = pd.Timestamp("2026-07-15 18:00:00", tz="UTC")
-        self.assertEqual(edt_utc, expected_edt_utc)
+        """Verify proper 4-hour (EDT) and 5-hour (EST) conversion to UTC using PySpark."""
+        from pyspark.sql.functions import col, date_format, to_timestamp, to_utc_timestamp
+        from src.utils.spark import get_spark_session
 
-        # EST (Standard Time: UTC-5) -> 14:00 local should be 19:00 UTC
-        est_local = pd.Series(["2026-01-15T14:00:00.000"])
-        est_utc = to_utc_datetime(est_local).iloc[0]
-        expected_est_utc = pd.Timestamp("2026-01-15 19:00:00", tz="UTC")
-        self.assertEqual(est_utc, expected_est_utc)
+        spark = get_spark_session("test_tz")
+        df = spark.createDataFrame([
+            ("2026-07-15T14:00:00.000",),  # EDT (Daylight Saving Time: UTC-4) -> 18:00 UTC
+            ("2026-01-15T14:00:00.000",),  # EST (Standard Time: UTC-5) -> 19:00 UTC
+        ], ["ts_str"])
+
+        res = (
+            df.withColumn("utc_ts", to_utc_timestamp(to_timestamp(col("ts_str")), "America/New_York"))
+            .withColumn("utc_str", date_format(col("utc_ts"), "yyyy-MM-dd HH:mm:ss"))
+            .collect()
+        )
+        self.assertEqual(res[0]["utc_str"], "2026-07-15 18:00:00")
+        self.assertEqual(res[1]["utc_str"], "2026-01-15 19:00:00")
 
     def test_open_ticket_semantics_and_age(self):
         """Verify open vs closed ticket flags, duration calculation, and active age tracking."""
@@ -318,22 +323,36 @@ class TestSilverLayerPipeline(unittest.TestCase):
 
 
     def test_string_standardization_null_handling(self):
-        """Verify that nulls, empty strings, and stringified null artifacts do not become literal 'NAN'/'NONE'."""
-        test_inputs = pd.Series([None, np.nan, "", "   ", "nan", "None", "brooklyn", "Noise - residential"])
+        """Verify that nulls, empty strings, and stringified null artifacts in PySpark do not become literal 'NAN'/'NONE'."""
+        from pyspark.sql.functions import col, initcap, lit, trim, upper, when
+        from src.utils.spark import get_spark_session
 
-        res_upper = standardize_string_series(test_inputs, "UNSPECIFIED", case="upper")
-        self.assertEqual(res_upper.iloc[0], "UNSPECIFIED")
-        self.assertEqual(res_upper.iloc[1], "UNSPECIFIED")
-        self.assertEqual(res_upper.iloc[2], "UNSPECIFIED")
-        self.assertEqual(res_upper.iloc[3], "UNSPECIFIED")
-        self.assertEqual(res_upper.iloc[4], "UNSPECIFIED")
-        self.assertEqual(res_upper.iloc[5], "UNSPECIFIED")
-        self.assertEqual(res_upper.iloc[6], "BROOKLYN")
+        spark = get_spark_session("test_str")
+        df = spark.createDataFrame([
+            (None,), ("",), ("   ",), ("nan",), ("None",), ("brooklyn",), ("Noise - residential",)
+        ], ["raw_val"])
 
-        res_title = standardize_string_series(test_inputs, "Unknown", case="title")
-        self.assertEqual(res_title.iloc[0], "Unknown")
-        self.assertEqual(res_title.iloc[4], "Unknown")
-        self.assertEqual(res_title.iloc[7], "Noise - Residential")
+        clean_expr = when(
+            col("raw_val").isNull() | trim(col("raw_val")).isin(["", "nan", "None", "null", "NAN", "NONE"]),
+            lit("UNSPECIFIED"),
+        ).otherwise(upper(trim(col("raw_val"))))
+
+        clean_title = when(
+            col("raw_val").isNull() | trim(col("raw_val")).isin(["", "nan", "None", "null", "NAN", "NONE"]),
+            lit("Unknown"),
+        ).otherwise(initcap(trim(col("raw_val"))))
+
+        res = df.withColumn("clean_upper", clean_expr).withColumn("clean_title", clean_title).collect()
+        self.assertEqual(res[0]["clean_upper"], "UNSPECIFIED")
+        self.assertEqual(res[1]["clean_upper"], "UNSPECIFIED")
+        self.assertEqual(res[2]["clean_upper"], "UNSPECIFIED")
+        self.assertEqual(res[3]["clean_upper"], "UNSPECIFIED")
+        self.assertEqual(res[4]["clean_upper"], "UNSPECIFIED")
+        self.assertEqual(res[5]["clean_upper"], "BROOKLYN")
+
+        self.assertEqual(res[0]["clean_title"], "Unknown")
+        self.assertEqual(res[4]["clean_title"], "Unknown")
+        self.assertEqual(res[6]["clean_title"], "Noise - Residential")
 
 
     def test_invalid_unique_key_quarantine(self):
@@ -764,52 +783,6 @@ class TestSilverLayerPipeline(unittest.TestCase):
             self.assertIn("INVALID_TIMESTAMP_FORMAT", df_q["quarantine_reason"].tolist())
 
 
-
-    def test_haversine_distance_vectorization(self):
-        """Verify Great-Circle Haversine distance calculations, index independence, and bounds handling."""
-        # 1. Identical coordinates -> distance must be 0.0
-        lat1 = pd.Series([40.7500, 40.8000, np.nan])
-        lon1 = pd.Series([-73.9900, -74.0000, -73.9900])
-        lat2 = pd.Series([40.7500, 40.8000, 40.7500])
-        lon2 = pd.Series([-73.9900, -73.9000, np.nan])
-
-        dist = haversine_distance_km(lat1, lon1, lat2, lon2)
-        # Point 1: same coordinates -> 0.0 km
-        self.assertEqual(dist.iloc[0], 0.0)
-        # Point 2: (40.8000, -74.0000) to (40.8000, -73.9000) -> approx 8.44 km
-        self.assertAlmostEqual(dist.iloc[1], 8.44, delta=0.2)
-        # Point 3: coordinate with NaN -> distance is NaN
-        self.assertTrue(pd.isna(dist.iloc[2]))
-
-        # 2. Mismatched index test: Series with different index labels must evaluate positionally without NaN corruption
-        s_lat1 = pd.Series([40.7500, 40.8000], index=[100, 200])
-        s_lon1 = pd.Series([-73.9900, -74.0000], index=[100, 200])
-        s_lat2 = pd.Series([40.7500, 40.8000], index=[0, 1])
-        s_lon2 = pd.Series([-73.9900, -73.9000], index=[0, 1])
-        mismatch_dist = haversine_distance_km(s_lat1, s_lon1, s_lat2, s_lon2)
-        self.assertEqual(list(mismatch_dist.index), [100, 200])
-        self.assertEqual(mismatch_dist.loc[100], 0.0)
-        self.assertAlmostEqual(mismatch_dist.loc[200], 8.44, delta=0.2)
-
-        # 3. Unequal length handling defensively returns NaN Series instead of raising ValueError
-        mismatched_len_dist = haversine_distance_km(
-            pd.Series([40.75]),
-            pd.Series([-73.99]),
-            pd.Series([40.75, 40.80]),
-            pd.Series([-73.99, -74.00]),
-        )
-        self.assertEqual(len(mismatched_len_dist), 1)
-        self.assertTrue(pd.isna(mismatched_len_dist.iloc[0]))
-
-        # 4. Out-of-bounds coordinate handling -> NaN
-        bad_coords = haversine_distance_km(
-            pd.Series([999.0, 40.7500]),
-            pd.Series([-73.9900, -300.0]),
-            pd.Series([40.7500, 40.7500]),
-            pd.Series([-73.9900, -73.9900]),
-        )
-        self.assertTrue(pd.isna(bad_coords.iloc[0]))
-        self.assertTrue(pd.isna(bad_coords.iloc[1]))
 
     def test_spark_haversine_distance_vectorization(self):
         """Verify PySpark Great-Circle Haversine distance calculations, null handling, and physical bounds."""

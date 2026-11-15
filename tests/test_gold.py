@@ -379,13 +379,13 @@ class TestGoldLayerPipeline(unittest.TestCase):
             self.assertIn("2026-11-05", dates_present)
 
     def test_partitioning_windows_utility(self):
-        """Verify month-by-month partitioning window calculation."""
+        """Verify month-by-month partitioning window calculation expands to full calendar months."""
         from src.utils.partitioning import get_monthly_execution_windows
         windows = get_monthly_execution_windows("2026-01-15", "2026-03-10")
         self.assertEqual(len(windows), 3)
-        self.assertEqual(windows[0], ("2026-01-15", "2026-01-31"))
+        self.assertEqual(windows[0], ("2026-01-01", "2026-01-31"))
         self.assertEqual(windows[1], ("2026-02-01", "2026-02-28"))
-        self.assertEqual(windows[2], ("2026-03-01", "2026-03-10"))
+        self.assertEqual(windows[2], ("2026-03-01", "2026-03-31"))
 
 
 if __name__ == "__main__":

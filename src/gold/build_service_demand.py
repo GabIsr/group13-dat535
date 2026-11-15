@@ -73,10 +73,10 @@ def build_daily_service_demand_mart(
 
     if start_date:
         logger.info(f"Applying start_date filter on Silver 311: created_at_utc >= {start_date}")
-        df_311_spark = df_311_spark.filter(col("created_at_utc") >= lit(start_date))
+        df_311_spark = df_311_spark.filter(to_date(col("created_at_utc")) >= lit(start_date[:10]))
     if end_date:
         logger.info(f"Applying end_date filter on Silver 311: created_at_utc <= {end_date}")
-        df_311_spark = df_311_spark.filter(col("created_at_utc") <= lit(end_date))
+        df_311_spark = df_311_spark.filter(to_date(col("created_at_utc")) <= lit(end_date[:10]))
 
     total_311_input = df_311_spark.count()
     logger.info(f"Loaded {total_311_input:,} clean 311 records into PySpark.")
@@ -84,9 +84,9 @@ def build_daily_service_demand_mart(
     df_weather_spark = spark.read.parquet(str(silver_weather_dir))
 
     if start_date:
-        df_weather_spark = df_weather_spark.filter(col("timestamp_utc") >= lit(start_date))
+        df_weather_spark = df_weather_spark.filter(to_date(col("timestamp_utc")) >= lit(start_date[:10]))
     if end_date:
-        df_weather_spark = df_weather_spark.filter(col("timestamp_utc") <= lit(end_date))
+        df_weather_spark = df_weather_spark.filter(to_date(col("timestamp_utc")) <= lit(end_date[:10]))
 
     weather_input_rows = df_weather_spark.count()
     logger.info(f"Loaded {weather_input_rows:,} hourly weather observations into PySpark.")

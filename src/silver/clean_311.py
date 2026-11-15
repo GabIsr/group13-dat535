@@ -46,6 +46,7 @@ from pyspark.sql.functions import (
     sqrt,
     substring,
     sum as spark_sum,
+    to_date,
     to_timestamp,
     to_utc_timestamp,
     trim,
@@ -102,8 +103,7 @@ logger = logging.getLogger("clean_311")
 # =========================================================================
 def spark_haversine_distance_km(lat1_col, lon1_col, lat2_col, lon2_col):
     """
-    Compute Great-Circle Haversine distance in km using pure PySpark SQL functions.
-    Fully optimized inside Catalyst optimizer without Python serialization overhead.
+    Compute Great-Circle Haversine distance in km.
     Safeguards:
       1. Validates coordinate bounds: lat in [-90, 90], lon in [-180, 180].
          Returns null for invalid or missing coordinates.
@@ -137,14 +137,13 @@ def spark_haversine_distance_km(lat1_col, lon1_col, lat2_col, lon2_col):
 
 
 # =========================================================================
-# Pure PySpark Silver 311 Pipeline Modular Functions
+# 311 Pipeline Modular Functions
 # =========================================================================
 
 def normalize_timestamps_and_durations(df: DataFrame, now_epoch: int) -> DataFrame:
     """
     Normalize 311 local Eastern Time timestamps to UTC and derive temporal duration metrics.
     Computes ticket status categories, resolution durations, active ticket age, and calendar features.
-    100% pure PySpark.
     """
     cols = set(df.columns)
     created_ts = to_utc_timestamp(to_timestamp(col("created_date")), "America/New_York")
@@ -212,7 +211,6 @@ def quarantine_invalid_311_records(
     Evaluate strict boundary validation predicates in Spark SQL.
     Routes corrupted/unkeyed/negative-duration/out-of-bounds records to quarantine Parquet
     BEFORE deduplication so corrupted records are never collapsed as nulls.
-    100% pure PySpark.
     """
     parsed_keys = col("unique_key").cast("long")
     launch_epoch = int(datetime(2003, 3, 1, tzinfo=timezone.utc).timestamp())
@@ -258,7 +256,7 @@ def quarantine_invalid_311_records(
         df_quarantined = df_quarantined.withColumn("quarantine_reason", concat_ws("; ", rule_checks))
         quarantine_dir.mkdir(parents=True, exist_ok=True)
         q_path = quarantine_dir / "quarantined_311.parquet"
-        df_quarantined.coalesce(1).write.mode("overwrite").parquet(str(q_path))
+        df_quarantined.coalesce(1).write.mode("append").parquet(str(q_path))
         logger.warning(f"Quarantined {quarantined_count:,} invalid records to {q_path}")
 
     df_valid_candidates = df.filter(~quarantine_cond)
@@ -275,9 +273,6 @@ def deduplicate_311_records(df: DataFrame) -> Tuple[DataFrame, int]:
          _ingested_at_utc DESC, _batch_id DESC
       3. Deterministic tie-breaker:
          unique_key DESC
-    Ensures genuine municipal case resolutions always win deterministically without relying
-    on third-party database metadata (:updated_at).
-    100% pure PySpark.
     """
     cols = set(df.columns)
     order_cols = []
@@ -332,7 +327,6 @@ def impute_spatial_and_canonicalize_routes(
     Phase 1: Apply 3-level hierarchical spatial imputation (Native GPS -> ZIP Centroid -> Borough Centroid),
     quantify spatial distance uncertainty via Catalyst PySpark Haversine,
     and normalize spatial features & evaluate 6-route hierarchical location keys (loc_key).
-    100% pure PySpark.
     """
     cols = set(df.columns)
     raw_lats = col("latitude").cast("double") if "latitude" in cols else lit(None).cast("double")
@@ -466,26 +460,11 @@ def impute_spatial_and_canonicalize_routes(
 
     return df
 
-
-def impute_spatial_hierarchy_311(
-    df: DataFrame,
-    spark: SparkSession,
-    zip_ref_path: Path = ZIP_CENTROIDS_PATH,
-) -> DataFrame:
-    """
-    Backwards-compatible wrapper executing spatial imputation, canonicalization,
-    and adaptive citizen call burst clustering in PySpark.
-    """
-    df_spatial = impute_spatial_and_canonicalize_routes(df, spark, zip_ref_path)
-    logger.info("Executing PySpark Ticket-1 Anchored Burst Deduplication Engine (Adaptive Window)...")
-    return cluster_citizen_call_bursts(df_spatial, burst_window_hours=6.0)
-
-
 def standardize_categorical_and_administrative_attributes(df: DataFrame) -> DataFrame:
     """
     Standardize Boroughs, agency acronyms, complaint types, descriptors, channels,
     State Plane coordinates, and administrative districts (Council District, Police Precinct).
-    Derive soft tags (out-of-state ZIP, known agency) in 100% pure PySpark.
+    Derive soft tags (out-of-state ZIP, known agency).
     """
     cols = set(df.columns)
 
@@ -624,7 +603,7 @@ def standardize_categorical_and_administrative_attributes(df: DataFrame) -> Data
 def attach_quality_audit_tags(df: DataFrame, processed_at_utc: str) -> DataFrame:
     """
     Derive instant closure, status conflict, and extreme duration flags.
-    Construct human-readable quality audit notes string using pure PySpark Catalyst functions.
+    Construct human-readable quality audit notes string.
     Attach Silver metadata and prune intermediate string helpers.
     """
     valid_dur_secs = col("closed_at_utc").cast("long") - col("created_at_utc").cast("long")
@@ -683,7 +662,7 @@ def write_silver_311(df: DataFrame, silver_311_dir: Path) -> int:
     """
     Save validated Silver 311 records to partitioned Parquet files:
     year=<YYYY>/month=<MM>/
-    100% pure PySpark native streaming partition write.
+    PySpark native streaming partition write.
     """
     silver_311_dir.mkdir(parents=True, exist_ok=True)
     df_part = (
@@ -708,7 +687,7 @@ def clean_and_validate_311(
     end_date: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    100% pure PySpark Silver Layer 311 Orchestrator:
+    Silver Layer 311 Orchestrator:
     1. Ingest Bronze Parquet files (with optional start_date/end_date partition pruning).
     2. Normalize Eastern Time timestamps to UTC and compute durations.
     3. Quarantine invalid boundary violations directly to Parquet.
@@ -716,7 +695,7 @@ def clean_and_validate_311(
     5. Hierarchical spatial imputation (Level 1 GPS -> Level 2 ZIP -> Level 3 Borough).
     6. Standardize categorical and administrative features.
     7. Attach quality audit notes and flags.
-    8. Write clean partitioned Parquet tables via pure PySpark.
+    8. Write clean partitioned Parquet tables.
     """
     start_time = time.time()
     processed_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
@@ -740,10 +719,10 @@ def clean_and_validate_311(
         # Optional partition pruning if date range is specified
         if start_date:
             logger.info(f"Applying start_date filter on Bronze 311: created_date >= {start_date}")
-            df_raw = df_raw.filter(col("created_date") >= lit(start_date))
+            df_raw = df_raw.filter(substring(col("created_date").cast("string"), 1, 10) >= lit(start_date[:10]))
         if end_date:
             logger.info(f"Applying end_date filter on Bronze 311: created_date <= {end_date}")
-            df_raw = df_raw.filter(col("created_date") <= lit(end_date))
+            df_raw = df_raw.filter(substring(col("created_date").cast("string"), 1, 10) <= lit(end_date[:10]))
 
         input_rows = df_raw.count()
         step_scan.set_input_rows(input_rows)
@@ -839,15 +818,15 @@ def clean_and_validate_311(
             written_files = write_silver_311(df_silver, silver_311_dir)
             step_write.set_output_rows(candidate_count - duplicate_rows_removed)
 
-        # 8. Compute Audit Metrics in PySpark directly from written Parquet (avoids driver heap bloat & plan re-eval)
+        # 8. Compute Audit Metrics in PySpark directly from written Parquet
         with profiler.measure_step("silver_311", "reconciliation_audit_aggregation") as step_audit:
             written_silver_files = sorted(silver_311_dir.glob("**/*.parquet"))
             if written_silver_files:
                 df_written = spark.read.parquet(str(silver_311_dir))
                 if start_date:
-                    df_written = df_written.filter(col("created_at_utc") >= lit(start_date))
+                    df_written = df_written.filter(to_date(col("created_at_utc")) >= lit(start_date[:10]))
                 if end_date:
-                    df_written = df_written.filter(col("created_at_utc") <= lit(end_date))
+                    df_written = df_written.filter(to_date(col("created_at_utc")) <= lit(end_date[:10]))
                 valid_rows_accepted = df_written.count()
             else:
                 df_written = None

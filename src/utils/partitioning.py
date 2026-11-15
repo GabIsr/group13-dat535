@@ -28,9 +28,10 @@ def get_monthly_execution_windows(
     at a time, eliminating driver/executor OOM memory crashes regardless of historical volume.
 
     1. If both start_date and end_date are provided:
-       Splits the date span into contiguous monthly slices.
+       Splits the date span into contiguous monthly slices expanded outward to full calendar months
+       to ensure atomic PySpark dynamic partition overwrites (year=YYYY/month=MM) without data loss.
        e.g., '2026-01-15' to '2026-03-10' produces:
-             [('2026-01-15', '2026-01-31'), ('2026-02-01', '2026-02-28'), ('2026-03-01', '2026-03-10')]
+             [('2026-01-01', '2026-01-31'), ('2026-02-01', '2026-02-28'), ('2026-03-01', '2026-03-31')]
 
     2. If mode == 'incremental' and dates are omitted:
        Discovers which specific 'year=YYYY/month=MM' partitions were touched by the latest
@@ -43,21 +44,21 @@ def get_monthly_execution_windows(
     dt_start = datetime.strptime(start_date, "%Y-%m-%d").date() if start_date else None
     dt_end = datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else None
 
-    # If both dates are provided and fall within the exact same month, return single window
+    # If both dates are provided, expand boundaries outward to the full calendar months.
+    # This prevents PySpark dynamic partition overwrites (year=YYYY/month=MM) from
+    # erasing untargeted dates within partial-month runs.
     if dt_start and dt_end:
         if dt_start > dt_end:
             raise ValueError(f"start_date ({start_date}) cannot be greater than end_date ({end_date})")
 
         windows: List[Tuple[str, str]] = []
-        curr = dt_start
+        curr = date(dt_start.year, dt_start.month, 1)
         while curr <= dt_end:
             # Last day of current month
             _, last_day = calendar.monthrange(curr.year, curr.month)
             month_end = date(curr.year, curr.month, last_day)
 
-            # Cap window end at dt_end if dt_end is earlier than month_end
-            window_end = min(month_end, dt_end)
-            windows.append((curr.isoformat(), window_end.isoformat()))
+            windows.append((curr.isoformat(), month_end.isoformat()))
 
             # Advance to first day of next month
             if curr.month == 12:
@@ -127,14 +128,13 @@ def get_monthly_execution_windows(
         m_start = date(y, m, 1)
         m_end = date(y, m, last_day)
 
-        # Apply partial bounds if provided
+        # Skip months entirely outside the provided bounds
         if dt_start and m_end < dt_start:
             continue
         if dt_end and m_start > dt_end:
             continue
 
-        actual_start = max(m_start, dt_start) if dt_start else m_start
-        actual_end = min(m_end, dt_end) if dt_end else m_end
-        windows.append((actual_start.isoformat(), actual_end.isoformat()))
+        # Expand to full calendar month to ensure atomic partition-level safety
+        windows.append((m_start.isoformat(), m_end.isoformat()))
 
     return windows

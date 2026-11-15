@@ -30,24 +30,21 @@ from pyspark.sql.functions import (
     min as spark_min,
     round as spark_round,
     row_number,
+    substring,
     sum as spark_sum,
+    to_date,
     to_timestamp,
     trim,
     when,
 )
 from pyspark.sql.types import (
-    BooleanType,
     DoubleType,
     FloatType,
-    IntegerType,
-    LongType,
-    ShortType,
     StringType,
     StructField,
     StructType,
     TimestampType,
 )
-from pyspark.storagelevel import StorageLevel
 
 from src.silver.config import (
     BRONZE_DIR,
@@ -136,7 +133,7 @@ def quarantine_unkeyed_weather(
             .withColumn("_quarantined_at_utc", lit(processed_at_utc))
             .drop("_is_quarantined", "_quarantine_reason")
         )
-        save_q.coalesce(1).write.mode("overwrite").parquet(str(q_path))
+        save_q.coalesce(1).write.mode("append").parquet(str(q_path)) 
         logger.warning(f"Quarantined {quarantined_weather_rows:,} unkeyed/unparseable weather rows to {q_path}")
 
     df_valid = df_evaluated.filter(col("_is_quarantined") == False).drop("_is_quarantined", "_quarantine_reason")
@@ -174,7 +171,6 @@ def evaluate_sensor_rules_and_mask(
     """
     Evaluate atmospheric physical laws and sanity bounds across all meteorological sensor columns.
     Masks corrupted values to NULL (avoiding row loss) and logs forensic anomalies to the Audit Ledger.
-    100% pure PySpark implementation.
     """
     cols = df.columns
     rules = []
@@ -349,7 +345,7 @@ def evaluate_sensor_rules_and_mask(
 
     combined_ledger_spark = functools.reduce(lambda a, b: a.unionByName(b), anomaly_dfs) if anomaly_dfs else None
 
-    # Write Sensor Anomaly Audit Ledger Parquet via pure PySpark
+    # Write Sensor Anomaly Audit Ledger Parquet
     anomaly_ledger_path.parent.mkdir(parents=True, exist_ok=True)
     if combined_ledger_spark is not None:
         num_anomalies = combined_ledger_spark.count()
@@ -357,11 +353,11 @@ def evaluate_sensor_rules_and_mask(
         num_anomalies = 0
 
     if num_anomalies > 0:
-        combined_ledger_spark.coalesce(1).write.mode("overwrite").parquet(str(anomaly_ledger_path))
+        combined_ledger_spark.coalesce(1).write.mode("append").parquet(str(anomaly_ledger_path))
         logger.warning(
             f"Sensor Anomaly Audit: Logged {num_anomalies:,} corrupt sensor readings to {anomaly_ledger_path}"
         )
-    else:
+    elif not anomaly_ledger_path.exists():
         empty_ledger = df.sparkSession.createDataFrame([], schema=LEDGER_SCHEMA)
         empty_ledger.coalesce(1).write.mode("overwrite").parquet(str(anomaly_ledger_path))
 
@@ -491,20 +487,22 @@ def enrich_weather_attributes(df: DataFrame, processed_at_utc: str) -> DataFrame
 
     df_enriched = df_enriched.withColumn("_silver_processed_at_utc", to_timestamp(lit(processed_at_utc)))
     df_enriched = df_enriched.withColumn("year", date_format(col("timestamp_utc"), "yyyy"))
+    df_enriched = df_enriched.withColumn("month", date_format(col("timestamp_utc"), "MM"))
 
     return df_enriched
 
 
 def write_silver_weather(df_silver: DataFrame, silver_weather_dir: Path) -> int:
     """
-    Write partitioned Parquet dataset to disk structured by grid_id and year.
-    Uses pure PySpark with distributed directory partitioning, keeping grid_id and year in Parquet schema.
+    Write partitioned Parquet dataset to disk structured by year and month.
+    Uses pure PySpark with distributed directory partitioning, matching the 311 partition strategy.
     """
     silver_weather_dir.mkdir(parents=True, exist_ok=True)
     (
-        df_silver.write
+        df_silver.coalesce(1)
+        .write
         .mode("overwrite")
-        .partitionBy("grid_id", "year")
+        .partitionBy("year", "month")
         .parquet(str(silver_weather_dir))
     )
     return len(list(silver_weather_dir.glob("**/*.parquet")))
@@ -519,7 +517,7 @@ def clean_and_validate_weather(
     end_date: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
-    100% pure PySpark Silver Weather pipeline:
+    Silver Weather pipeline:
     1. Primary key quarantine & temporal standardization (PySpark).
     2. Deduplication on (grid_id, timestamp_utc) via PySpark Window.
     3. Atmospheric physical bounds verification & sensor masking (PySpark).
@@ -549,10 +547,10 @@ def clean_and_validate_weather(
         time_col_name = "date" if "date" in raw_cols else ("time" if "time" in raw_cols else "timestamp_utc")
         if start_date:
             logger.info(f"Applying start_date filter on Bronze weather: {time_col_name} >= {start_date}")
-            df_raw = df_raw.filter(col(time_col_name) >= lit(start_date[:10] if time_col_name == "date" else start_date))
+            df_raw = df_raw.filter(substring(col(time_col_name).cast("string"), 1, 10) >= lit(start_date[:10]))
         if end_date:
             logger.info(f"Applying end_date filter on Bronze weather: {time_col_name} <= {end_date}")
-            df_raw = df_raw.filter(col(time_col_name) <= lit(end_date[:10] if time_col_name == "date" else end_date))
+            df_raw = df_raw.filter(substring(col(time_col_name).cast("string"), 1, 10) <= lit(end_date[:10]))
 
         input_rows = df_raw.count()
         step_scan.set_input_rows(input_rows)

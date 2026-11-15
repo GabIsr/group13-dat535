@@ -18,9 +18,9 @@ from pyspark.sql.functions import (
     lit,
     max as spark_max,
     sum as spark_sum,
+    to_date,
     when,
 )
-from pyspark.storagelevel import StorageLevel
 
 from src.silver.config import PROJECT_ROOT, SILVER_DIR
 from src.utils.spark import get_spark_session
@@ -40,7 +40,7 @@ def join_silver_datasets(
     """
     Join clean 311 service requests with local hourly ERA5-Land meteorological reanalysis.
     Joins on: 311.grid_id == weather.grid_id AND 311.weather_join_hour_utc == weather.timestamp_utc.
-    Uses PySpark BroadcastHashJoin (Lab 3 requirement) to broadcast the weather dimension.
+    Uses PySpark BroadcastHashJoin to broadcast the weather dimension.
     Supports optional start_date and end_date partition pruning for bounded-memory execution.
     """
     start_time = time.time()
@@ -67,10 +67,10 @@ def join_silver_datasets(
         # Optional partition pruning if date range is specified
         if start_date:
             logger.info(f"Applying start_date filter on Silver 311: created_at_utc >= {start_date}")
-            df_311_spark = df_311_spark.filter(col("created_at_utc") >= lit(start_date))
+            df_311_spark = df_311_spark.filter(to_date(col("created_at_utc")) >= lit(start_date[:10]))
         if end_date:
             logger.info(f"Applying end_date filter on Silver 311: created_at_utc <= {end_date}")
-            df_311_spark = df_311_spark.filter(col("created_at_utc") <= lit(end_date))
+            df_311_spark = df_311_spark.filter(to_date(col("created_at_utc")) <= lit(end_date[:10]))
 
         total_311 = df_311_spark.count()
         logger.info(f"Loaded {total_311:,} clean 311 records into PySpark.")
@@ -78,9 +78,9 @@ def join_silver_datasets(
         df_weather_spark = spark.read.parquet(str(silver_weather_dir))
 
         if start_date:
-            df_weather_spark = df_weather_spark.filter(col("timestamp_utc") >= lit(start_date))
+            df_weather_spark = df_weather_spark.filter(to_date(col("timestamp_utc")) >= lit(start_date[:10]))
         if end_date:
-            df_weather_spark = df_weather_spark.filter(col("timestamp_utc") <= lit(end_date))
+            df_weather_spark = df_weather_spark.filter(to_date(col("timestamp_utc")) <= lit(end_date[:10]))
 
         total_weather = df_weather_spark.count()
         logger.info(f"Loaded {total_weather:,} hourly weather observations into PySpark.")
@@ -161,7 +161,7 @@ def join_silver_datasets(
     ]
     df_311_pruned = df_311_spark.drop(*[c for c in cols_to_drop_311 if c in df_311_spark.columns])
 
-    # 4. True PySpark broadcast() Join (Lab 3 requirement)
+    # 4. PySpark broadcast() Join.
     logger.info("Executing PySpark Broadcast Join (311 [Fact] LEFT JOIN broadcast(Weather) [Dimension])...")
     with profiler.measure_step("unified_fact_join", "broadcast_hash_join_execution", input_rows=total_311) as step_join:
         df_w_alias = broadcast(df_w_sub).alias("w")
@@ -170,7 +170,7 @@ def join_silver_datasets(
         join_cond = (col("t.grid_id") == col("w.grid_id")) & (col("t.weather_join_hour_utc") == col("w.timestamp_utc"))
         df_joined_spark = df_311_alias.join(df_w_alias, join_cond, how="left").drop(col("w.grid_id"))
 
-        # Log Catalyst execution plan (Lab 3 optimization verification)
+        # Log Catalyst execution plan.
         logger.info("PySpark Catalyst Plan for Broadcast Join:")
         df_joined_spark.explain(False)
 
@@ -184,7 +184,7 @@ def join_silver_datasets(
                 f"Weather dimension contains duplicate (grid_id, timestamp_utc) keys."
             )
 
-        # 1. Native PySpark nullable type casting (Zero toPandas Anti-Pattern)
+        # 1. Native PySpark nullable type casting.
         for int16_col in ["weather_code", "relative_humidity_2m", "wind_direction_10m", "rolling_24h_hours_count"]:
             if int16_col in df_joined_spark.columns:
                 df_joined_spark = df_joined_spark.withColumn(int16_col, col(int16_col).cast("smallint"))
@@ -198,7 +198,7 @@ def join_silver_datasets(
                 "incident_first_created_at_utc", col("incident_first_created_at_utc").cast("timestamp")
             )
 
-        # 2. Add match status, metadata, and partition columns in pure Catalyst expressions
+        # 2. Add match status, metadata, and partition columns.
         df_joined_spark = (
             df_joined_spark
             .withColumn("is_weather_matched", col("temperature_2m").isNotNull())
@@ -209,7 +209,7 @@ def join_silver_datasets(
         )
         step_join.set_output_rows(joined_rows)
 
-    # 3. Audit match status natively in PySpark (1-row summary tuple over Py4J, zero driver data collection)
+    # 3. Audit match status.
     with profiler.measure_step("unified_fact_join", "reconciliation_audit", input_rows=total_311) as step_audit:
         audit_row = df_joined_spark.select(
             spark_sum(when(col("is_weather_matched"), 1).otherwise(0)).alias("matched_count")
@@ -223,7 +223,7 @@ def join_silver_datasets(
         f"Join Results: {matched_count:,} matched ({match_rate}%) | {unmatched_count:,} unmatched."
     )
 
-    # 5. Write Partitioned Fact Table directly with PySpark distributed write
+    # 5. Write Partitioned Fact Table.
     with profiler.measure_step("unified_fact_join", "fact_table_partition_write", input_rows=total_311) as step_write:
         output_joined_dir.mkdir(parents=True, exist_ok=True)
         (

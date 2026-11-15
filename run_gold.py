@@ -62,8 +62,8 @@ def main():
             end_date=args.end_date,
             bronze_dir=bronze_311_dir,
         )
-        if len(windows) > 1:
-            logger.info(f"Gold Batching Plan: Processing {len(windows)} monthly slices sequentially: {[f'{w[0]}->{w[1]}' for w in windows]}")
+        if windows:
+            logger.info(f"Gold Batching Plan: Processing {len(windows)} monthly slice(s) sequentially: {[f'{w[0]}->{w[1]}' for w in windows]}")
             for idx, (w_start, w_end) in enumerate(windows, 1):
                 logger.info(f"=== Processing Gold Partition Slice {idx}/{len(windows)}: [{w_start} -> {w_end}] ===")
                 run_gold_pipeline(start_date=w_start, end_date=w_end)

@@ -152,7 +152,7 @@ def cluster_citizen_call_bursts(
       2. Groups and repartitions by (loc_key, complaint_type) using PySpark Arrow streaming.
       3. Uses Ticket-1 anchored window cutoff: max(T_0 + burst_window_hours, Ticket_1_closed_at_utc).
       4. Appends cluster attributes directly within the Arrow stream, completely eliminating the post-clustering self-join.
-      5. Operates on contiguous C++ memory buffers with zero Python row pickling, zero Pandas overhead, and zero worker crashes.
+      5. Operates on contiguous C++ memory buffers.
     """
     cols = set(df.columns)
     if "complaint_type" not in cols:
@@ -162,7 +162,7 @@ def cluster_citizen_call_bursts(
     if "closed_at_utc" not in cols:
         df = df.withColumn("closed_at_utc", lit(None).cast("timestamp"))
 
-    burst_window_micros = int(burst_window_hours * 3600 * 1_000_000)
+    burst_window_micros = int(burst_window_hours * 3600 * 1_000_000) #Microseconds.
 
     # 1. Split locatable records from unlocatable records
     df_loc = df.filter(col("loc_key").isNotNull())

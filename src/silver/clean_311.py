@@ -34,6 +34,7 @@ from pyspark.sql.functions import (
     greatest,
     hour,
     initcap,
+    input_file_name,
     length,
     lit,
     month as spark_month,
@@ -174,17 +175,6 @@ def normalize_timestamps_and_durations(df: DataFrame, now_epoch: int) -> DataFra
         "open_ticket_age_days",
         when(~col("is_ticket_closed"), spark_round(open_age_secs / 86400.0, 2)).otherwise(lit(None).cast("double")),
     )
-
-    # Source timestamps normalization (Socrata :created_at)
-    if "source_created_at" in cols:
-        src_cr_ts = to_timestamp(col("source_created_at"))
-        df_proc = df_proc.withColumn("source_created_at", src_cr_ts)
-        intake_lag_secs = src_cr_ts.cast("long") - col("created_at_utc").cast("long")
-        df_proc = df_proc.withColumn(
-            "source_intake_lag_hours",
-            when(src_cr_ts.isNotNull() & col("created_at_utc").isNotNull(), spark_round(intake_lag_secs / 3600.0, 2))
-            .otherwise(lit(None).cast("double")),
-        )
 
     # Hourly join key for UTC weather alignment
     df_proc = df_proc.withColumn("weather_join_hour_utc", date_trunc("hour", col("created_at_utc")))
@@ -715,6 +705,16 @@ def clean_and_validate_311(
         logger.info(f"Loading Bronze 311 partition data into PySpark from {bronze_311_dir}...")
         spark = get_spark_session("DAT535-Silver-Clean-311")
         df_raw = spark.read.parquet(str(bronze_311_dir))
+
+        # Attach file-level lineage dynamically if not present in raw row
+        if "_source_file" not in df_raw.columns:
+            df_raw = df_raw.withColumn("_source_file", input_file_name())
+        if "_batch_id" not in df_raw.columns:
+            extracted_id = regexp_extract(col("_source_file"), r"(311_\d{8}_\d{3})", 1)
+            df_raw = df_raw.withColumn(
+                "_batch_id",
+                when(extracted_id != "", extracted_id).otherwise(lit("batch_unknown"))
+            )
 
         # Optional partition pruning if date range is specified
         if start_date:

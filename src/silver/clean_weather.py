@@ -25,10 +25,12 @@ from pyspark.sql.functions import (
     concat_ws,
     count as spark_count,
     date_format,
+    input_file_name,
     isnan,
     lit,
     max as spark_max,
     min as spark_min,
+    regexp_extract,
     round as spark_round,
     row_number,
     substring,
@@ -47,6 +49,7 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
+from src.utils.config import ERA5_NYC_GRID_POINTS
 from src.silver.config import (
     BRONZE_DIR,
     PROJECT_ROOT,
@@ -545,6 +548,30 @@ def clean_and_validate_weather(
         logger.info(f"Loading Bronze weather data from {bronze_weather_dir} into PySpark...")
 
         df_raw = spark.read.parquet(str(bronze_weather_dir))
+
+        # Attach file-level lineage dynamically if not present in raw row
+        if "_source_file" not in df_raw.columns:
+            df_raw = df_raw.withColumn("_source_file", input_file_name())
+        if "_batch_id" not in df_raw.columns:
+            extracted_id = regexp_extract(col("_source_file"), r"(weather_\d{8}_\d{3})", 1)
+            df_raw = df_raw.withColumn(
+                "_batch_id",
+                when(extracted_id != "", extracted_id).otherwise(lit("weather_batch"))
+            )
+
+        # Derive grid_id and borough_hint from coordinates if not present in Bronze
+        if "grid_id" not in df_raw.columns:
+            lat_c = col("latitude") if "latitude" in df_raw.columns else (col("grid_lat") if "grid_lat" in df_raw.columns else None)
+            lon_c = col("longitude") if "longitude" in df_raw.columns else (col("grid_lon") if "grid_lon" in df_raw.columns else None)
+            if lat_c is not None and lon_c is not None:
+                df_raw = df_raw.withColumn(
+                    "grid_id",
+                    concat(lit("GRID_"), spark_round(lat_c, 1).cast("string"), lit("_"), spark_round(lon_c, 1).cast("string"))
+                )
+                b_expr = lit("UNKNOWN")
+                for pt in ERA5_NYC_GRID_POINTS:
+                    b_expr = when(col("grid_id") == pt["grid_id"], lit(pt["borough_hint"])).otherwise(b_expr)
+                df_raw = df_raw.withColumn("borough_hint", b_expr)
 
         # Optional partition pruning if date range is specified
         raw_cols = set(df_raw.columns)

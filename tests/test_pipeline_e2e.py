@@ -60,7 +60,6 @@ class TestPipelineEndToEnd(unittest.TestCase):
                     "latitude": "40.7500",
                     "longitude": "-73.9900",
                     "status": "Closed",
-                    "_batch_id": "batch_e2e_001",
                 },
                 # Valid Closed complaint in Brooklyn
                 {
@@ -75,7 +74,6 @@ class TestPipelineEndToEnd(unittest.TestCase):
                     "latitude": "40.6900",
                     "longitude": "-73.9900",
                     "status": "Closed",
-                    "_batch_id": "batch_e2e_001",
                 },
                 # Valid Open ticket (closed_date is None)
                 {
@@ -90,7 +88,6 @@ class TestPipelineEndToEnd(unittest.TestCase):
                     "latitude": "40.7200",
                     "longitude": "-73.8400",
                     "status": "Open",
-                    "_batch_id": "batch_e2e_001",
                 },
                 # Invalid record to test quarantine routing (negative duration: closed before created)
                 {
@@ -105,7 +102,6 @@ class TestPipelineEndToEnd(unittest.TestCase):
                     "latitude": "40.8200",
                     "longitude": "-73.9200",
                     "status": "Closed",
-                    "_batch_id": "batch_e2e_001",
                 },
             ]
 
@@ -113,8 +109,8 @@ class TestPipelineEndToEnd(unittest.TestCase):
             with gzip.open(gz_path, "wb") as f:
                 f.write(json.dumps(records_311).encode("utf-8"))
 
-            # Seed Corresponding Bronze Weather Observations for those hours & grid
-            bronze_weather_part = bronze_dir / "weather" / "grid_id=GRID_40.8_-74.0" / "year=2024"
+            # Seed Pure Raw Weather Observations (Open-Meteo physical coordinates, no synthetic keys/metadata)
+            bronze_weather_part = bronze_dir / "weather" / "year=2024"
             bronze_weather_part.mkdir(parents=True)
             weather_hours = pd.date_range("2024-10-18 00:00:00", "2024-10-18 23:00:00", freq="h", tz="UTC")
             df_mock_weather = pd.DataFrame({
@@ -124,14 +120,11 @@ class TestPipelineEndToEnd(unittest.TestCase):
                 "wind_speed_10m": [12.0 for _ in range(len(weather_hours))],
                 "wind_gusts_10m": [14.0 for _ in range(len(weather_hours))],
                 "relative_humidity_2m": [65 for _ in range(len(weather_hours))],
-                "grid_id": "GRID_40.8_-74.0",
-                "grid_lat": 40.8,
-                "grid_lon": -74.0,
-                "_batch_id": "weather_batch_001",
-                "_ingested_at_utc": "2024-10-18T23:59:00Z",
-                "_bronze_status": "valid",
+                "latitude": 40.8,
+                "longitude": -74.0,
+                "elevation": 10.0,
             })
-            df_mock_weather.to_parquet(bronze_weather_part / "part_weather_0000.parquet", index=False)
+            df_mock_weather.to_parquet(bronze_weather_part / "part_weather_weather_20241018_001.parquet", index=False)
 
             # -------------------------------------------------------------
             # Stage 2: Execute PySpark Landing-to-Bronze Ingestion
@@ -140,8 +133,6 @@ class TestPipelineEndToEnd(unittest.TestCase):
                 landing_batch_dir=landing_dir,
                 base_bronze_dir=bronze_dir / "nyc311",
                 batch_id="batch_e2e_001",
-                retrieved_at_utc="2024-10-18T23:59:00Z",
-                extraction_mode="incremental",
             )
             self.assertTrue(len(written_bronze) > 0)
             self.assertEqual(sum(f["rows"] for f in written_bronze), 4)
@@ -267,7 +258,6 @@ class TestPipelineEndToEnd(unittest.TestCase):
                 "longitude": ["-73.9800", "-73.8200"],
                 "incident_zip": ["11201", "11375"],
                 "vehicle_type": ["Commercial Box Truck", "Sedan"],
-                "_batch_id": ["batch_2024_01", "batch_2024_01"],
             })
             df_2024.to_parquet(part_2024 / "part_2024.parquet", index=False)
 

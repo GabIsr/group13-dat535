@@ -9,7 +9,6 @@ Author: Group 13
 
 import argparse
 import gzip
-import hashlib
 import json
 import logging
 import os
@@ -28,6 +27,8 @@ from pyspark.sql.functions import (
     col,
     date_format,
     lit,
+    max as spark_max,
+    min as spark_min,
     to_timestamp,
     when,
 )
@@ -40,7 +41,6 @@ from src.utils.config import (
     MANIFESTS_DIR,
     PROJECT_ROOT,
     PROJECT_START_DATE,
-    SCHEMA_VERSION,
     SOCRATA_311_ENDPOINT,
     SOCRATA_DATASET_ID,
     SOURCE_NAME_311,
@@ -48,13 +48,13 @@ from src.utils.config import (
 from src.utils.manifest import (
     compute_file_sha256,
     compute_schema_fingerprint,
-    compute_uncovered_date_intervals,
     create_manifest_dict,
     generate_batch_id,
     get_git_commit_hash,
     get_latest_pipeline_run_timestamp,
     get_latest_schema_fingerprint,
     get_latest_watermark,
+    get_manifest_by_batch_id,
     is_batch_completed,
     is_date_range_completed,
     save_manifest,
@@ -75,7 +75,7 @@ def get_relative_path(p: Path) -> str:
 def fetch_socrata_page(
     where_clause: Optional[str] = None,
     order_clause: str = "created_date ASC, unique_key ASC",
-    select_clause: str = "*, :created_at",
+    select_clause: str = "*",
     limit: int = 50000,
     offset: int = 0,
     app_token: Optional[str] = None,
@@ -173,7 +173,7 @@ def fetch_311_to_landing(
             records, raw_bytes = fetch_socrata_page(
                 where_clause=where_clause,
                 order_clause=order_clause,
-                select_clause="*, :created_at",
+                select_clause="*",
                 limit=current_limit,
                 offset=offset,
                 app_token=app_token,
@@ -325,29 +325,25 @@ def convert_landing_to_bronze_pyspark(
     landing_batch_dir: Path,
     base_bronze_dir: Path,
     batch_id: str,
-    retrieved_at_utc: str,
-    extraction_mode: str = "incremental",
     return_schema: bool = False,
-) -> Union[List[Dict[str, Any]], Tuple[List[Dict[str, Any]], str]]:
+    return_date_bounds: bool = False,
+) -> Union[List[Dict[str, Any]], Tuple[Any, ...]]:
     """
-    Read compressed JSON landing files via Apache PySpark, compute vectorized SHA-256 row hashes,
-    inject Tier 2 system metadata, write partitioned Bronze Parquet files (year=YYYY / month=MM)
-    into an isolated batch staging path, audit output, and publish.
+    Read compressed JSON landing files via Apache PySpark, preserve pure raw 1:1 upstream schemas,
+    derive year/month partition columns for Hive storage, write into an isolated batch staging path,
+    audit output via Write-Audit-Publish (WAP), and atomically publish to base_bronze_dir.
 
     Partitioning Strategy:
-    - Eliminates coalesce(1) bottleneck.
-    - Applies volume-aware repartitioning and maxRecordsPerFile=250000 to prevent both skew and tiny files.
+    - Eliminates coalesce(1) bottleneck with volume-aware repartitioning and maxRecordsPerFile=250000.
+    - Pure Raw Store: Zero schema mutation, no type casts, and no row-level metadata injection.
 
-    Row Hashing Strategy:
-    - Uses deterministic sorted column names with struct() and to_json(..., ignoreNullFields=false).
-    - Preserves null distinctness and column boundaries.
-    - Explicitly excludes system metadata and partition columns.
-
-    Returns published file metadata (and optionally spark_schema_json if return_schema=True).
+    Returns published file metadata (and optionally spark_schema_json and date bounds).
     """
     landing_files = sorted(list(landing_batch_dir.glob("*.json.gz")))
     if not landing_files:
         logger.warning(f"No landing .json.gz files found in {landing_batch_dir}")
+        if return_date_bounds and return_schema:
+            return [], "", ("N/A", "N/A")
         return ([], "") if return_schema else []
 
     logger.info(f"PySpark Landing-to-Bronze: Processing {len(landing_files)} landing file(s) for batch {batch_id}...")
@@ -357,29 +353,23 @@ def convert_landing_to_bronze_pyspark(
     total_rows = df_raw.count()
     if total_rows == 0:
         logger.warning(f"Landing files for batch {batch_id} contain 0 records.")
+        if return_date_bounds and return_schema:
+            return [], "", ("N/A", "N/A")
         return ([], "") if return_schema else []
 
-    # Standardize Socrata system metadata (:created_at) before hashing
-    if ":created_at" in df_raw.columns:
-        df_raw = df_raw.withColumnRenamed(":created_at", "source_created_at")
-    if "source_created_at" in df_raw.columns:
-        cr_c = col("source_created_at")
-        df_raw = df_raw.withColumn(
-            "source_created_at",
-            when(cr_c.cast("long").isNotNull() & (cr_c.cast("long") > 100000000), cr_c.cast("long").cast("timestamp"))
-            .otherwise(to_timestamp(cr_c))
-        )
+    # Optional extraction of date bounds directly from raw JSON
+    source_min_date = "N/A"
+    source_max_date = "N/A"
+    if return_date_bounds and "created_date" in df_raw.columns:
+        date_agg = df_raw.select(spark_min("created_date"), spark_max("created_date")).first()
+        if date_agg:
+            if date_agg[0] is not None:
+                source_min_date = str(date_agg[0])
+            if date_agg[1] is not None:
+                source_max_date = str(date_agg[1])
 
-    source_file_rel = get_relative_path(landing_batch_dir)
-    df_bronze = (
-        df_raw.withColumn("_batch_id", lit(batch_id))
-        .withColumn("_ingested_at_utc", lit(retrieved_at_utc))
-        .withColumn("_source_file", lit(source_file_rel))
-        .withColumn("_source_name", lit(SOURCE_NAME_311))
-        .withColumn("_extraction_mode", lit(extraction_mode))
-        .withColumn("_schema_version", lit(SCHEMA_VERSION))
-        .withColumn("_bronze_status", lit("valid"))
-    )
+    # Preserve pure, untampered raw schema from Socrata
+    df_bronze = df_raw
 
     # Derive partition columns
     if "created_date" in df_bronze.columns:
@@ -425,6 +415,8 @@ def convert_landing_to_bronze_pyspark(
         expected_rows=total_rows,
     )
 
+    if return_date_bounds and return_schema:
+        return published_files, spark_schema_json, (source_min_date, source_max_date)
     if return_schema:
         return published_files, spark_schema_json
     return published_files
@@ -477,19 +469,20 @@ def build_311_soql_filter(
                 logger.warning(f"Failed to convert last_run_ts ({last_run_ts}) to America/New_York: {e}. Using raw UTC.")
                 last_run_nyc = last_run_ts
 
-        if last_wm and last_run_nyc:
+        intake_start = start_date or last_wm
+        if intake_start and last_run_nyc:
             p_start = project_start_date or PROJECT_START_DATE
             if len(p_start) == 10:
                 p_start += "T00:00:00.000"
 
             logger.info(
                 f"Incremental CDC Strategy (Business Mutation Window): "
-                f"Intake [{last_wm} -> {effective_end}] | "
+                f"Intake [{intake_start} -> {effective_end}] | "
                 f"Mutations & Closures >= {last_run_nyc} "
                 f"(NYC Local Time; Pipeline Run UTC: {last_run})"
             )
             where = (
-                f"((created_date >= '{last_wm}' AND created_date <= '{effective_end}') OR "
+                f"((created_date >= '{intake_start}' AND created_date <= '{effective_end}') OR "
                 f"(resolution_action_updated_date >= '{last_run_nyc}' AND created_date >= '{p_start}') OR "
                 f"(closed_date >= '{last_run_nyc}' AND created_date >= '{p_start}'))"
             )
@@ -532,7 +525,6 @@ def run_from_landing_pipeline(
     Offline execution mode: Discovers Landing JSON batches and converts them to Bronze Parquet.
     """
     start_time = time.time()
-    retrieved_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
     if not landing_root.exists():
         logger.warning(f"Landing root directory does not exist: {landing_root}")
@@ -558,13 +550,26 @@ def run_from_landing_pipeline(
             logger.info(f"Idempotency Guard: Batch {cur_batch_id} has already succeeded. Skipping.")
             continue
 
-        bronze_files, spark_schema_json = convert_landing_to_bronze_pyspark(
+        # Ground truth: recover the true API extraction timestamp from the landing manifest
+        landing_manifest = get_manifest_by_batch_id(cur_batch_id, DATASET_311, manifests_dir=manifests_dir)
+        if landing_manifest and landing_manifest.get("retrieved_at_utc"):
+            batch_retrieved_at = landing_manifest["retrieved_at_utc"]
+            batch_data_start = landing_manifest.get("source_data_start", "N/A")
+            batch_data_end = landing_manifest.get("source_data_end", "N/A")
+        else:
+            # Fallback to file creation timestamp of the landing .json.gz file
+            gz_files = list(l_dir.glob("*.json.gz"))
+            mtime = min(f.stat().st_mtime for f in gz_files) if gz_files else time.time()
+            batch_retrieved_at = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+            batch_data_start = "N/A"
+            batch_data_end = "N/A"
+
+        bronze_files, spark_schema_json, (derived_min_date, derived_max_date) = convert_landing_to_bronze_pyspark(
             landing_batch_dir=l_dir,
             base_bronze_dir=bronze_311_dir,
             batch_id=cur_batch_id,
-            retrieved_at_utc=retrieved_at_utc,
-            extraction_mode="from_landing",
             return_schema=True,
+            return_date_bounds=True,
         )
         all_bronze_files.extend(bronze_files)
         batch_rows = sum(f["rows"] for f in bronze_files)
@@ -573,15 +578,17 @@ def run_from_landing_pipeline(
         if bronze_files:
             code_version = get_git_commit_hash(PROJECT_ROOT)
             schema_fp = compute_schema_fingerprint(spark_schema_json)
+            m_start = batch_data_start if batch_data_start != "N/A" else derived_min_date
+            m_end = batch_data_end if batch_data_end != "N/A" else derived_max_date
             m_dict = create_manifest_dict(
                 batch_id=cur_batch_id,
                 dataset_name=DATASET_311,
                 source_name=SOURCE_NAME_311,
                 source_dataset_id=SOCRATA_DATASET_ID,
                 source_url=SOCRATA_311_ENDPOINT,
-                retrieved_at_utc=retrieved_at_utc,
-                source_data_start="N/A",
-                source_data_end="N/A",
+                retrieved_at_utc=batch_retrieved_at,
+                source_data_start=m_start,
+                source_data_end=m_end,
                 extraction_mode="from_landing",
                 environment=env,
                 code_version=code_version,
@@ -622,7 +629,6 @@ def run_311_ingestion(
     from_landing_only: bool = False,
     landing_batch: Optional[str] = None,
     bronze_dir: Optional[Path] = None,
-    use_spark_bronze: bool = True,
     batch_id: Optional[str] = None,
     force: bool = False,
 ) -> Optional[Dict[str, Any]]:
@@ -707,8 +713,6 @@ def run_311_ingestion(
             landing_batch_dir=landing_batch_dir,
             base_bronze_dir=bronze_311_dir,
             batch_id=active_batch_id,
-            retrieved_at_utc=retrieved_at_utc,
-            extraction_mode=mode,
             return_schema=True,
         )
         manifest_files_list.extend(bronze_meta)

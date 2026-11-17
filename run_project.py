@@ -13,6 +13,7 @@ import time
 import warnings
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 # Suppress known external library deprecations (Pandas 2/3 and PySpark 3.5 bridge)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -61,7 +62,12 @@ def run_tests():
         return False
 
 
-def run_bronze(env: str = "dev", mode: str = "incremental"):
+def run_bronze(
+    env: str = "dev",
+    mode: str = "incremental",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+):
     """Execute Bronze Landing and Ingestion."""
     logger.info("=" * 70)
     logger.info("EXECUTING BRONZE LAYER (LANDING & PRESERVATION)")
@@ -69,26 +75,47 @@ def run_bronze(env: str = "dev", mode: str = "incremental"):
     from run_ingestion import main as ingestion_main
     # Call ingestion
     cmd = [sys.executable, "run_ingestion.py", "--dataset", "all", "--mode", mode, "--env", env]
+    if start_date:
+        cmd.extend(["--start-date", start_date])
+    if end_date:
+        cmd.extend(["--end-date", end_date])
     res = subprocess.run(cmd)
     return res.returncode == 0
 
 
-def run_silver(env: str = "dev", mode: str = "incremental"):
+def run_silver(
+    env: str = "dev",
+    mode: str = "incremental",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+):
     """Execute Silver Cleaning, Validation, Imputation, and Broadcast Join."""
     logger.info("=" * 70)
     logger.info("EXECUTING SILVER LAYER (CLEANING, IMPUTATION & FACT JOIN)")
     logger.info("=" * 70)
     cmd = [sys.executable, "run_silver.py", "--stage", "all", "--env", env, "--mode", mode]
+    if start_date:
+        cmd.extend(["--start-date", start_date])
+    if end_date:
+        cmd.extend(["--end-date", end_date])
     res = subprocess.run(cmd)
     return res.returncode == 0
 
 
-def run_gold(env: str = "dev"):
+def run_gold(
+    env: str = "dev",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+):
     """Execute Gold Business Marts Generation."""
     logger.info("=" * 70)
     logger.info("EXECUTING GOLD LAYER (BUSINESS ANALYTICAL MARTS)")
     logger.info("=" * 70)
     cmd = [sys.executable, "run_gold.py", "--env", env]
+    if start_date:
+        cmd.extend(["--start-date", start_date])
+    if end_date:
+        cmd.extend(["--end-date", end_date])
     res = subprocess.run(cmd)
     return res.returncode == 0
 
@@ -132,6 +159,18 @@ def main():
         action="store_true",
         help="Run partition compaction on Bronze after ingestion",
     )
+    parser.add_argument(
+        "--start-date",
+        type=str,
+        default=None,
+        help="Optional start date window (YYYY-MM-DD)",
+    )
+    parser.add_argument(
+        "--end-date",
+        type=str,
+        default=None,
+        help="Optional end date window (YYYY-MM-DD)",
+    )
 
     args = parser.parse_args()
     total_start = time.time()
@@ -152,7 +191,12 @@ def main():
         sys.exit(0)
 
     if args.action in ["all", "bronze"]:
-        if not run_bronze(env=args.env, mode=args.mode):
+        if not run_bronze(
+            env=args.env,
+            mode=args.mode,
+            start_date=args.start_date,
+            end_date=args.end_date,
+        ):
             logger.error("Bronze layer failed. Halting pipeline.")
             sys.exit(1)
 
@@ -160,12 +204,21 @@ def main():
         run_compaction()
 
     if args.action in ["all", "silver"]:
-        if not run_silver(env=args.env, mode=args.mode):
+        if not run_silver(
+            env=args.env,
+            mode=args.mode,
+            start_date=args.start_date,
+            end_date=args.end_date,
+        ):
             logger.error("Silver layer failed. Halting pipeline.")
             sys.exit(1)
 
     if args.action in ["all", "gold"]:
-        if not run_gold(env=args.env):
+        if not run_gold(
+            env=args.env,
+            start_date=args.start_date,
+            end_date=args.end_date,
+        ):
             logger.error("Gold layer failed. Halting pipeline.")
             sys.exit(1)
 

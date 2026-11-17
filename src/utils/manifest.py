@@ -126,7 +126,12 @@ def get_latest_watermark(dataset_name: str, manifests_dir: Path = MANIFESTS_DIR)
         try:
             with open(mf, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            if data.get("status") == "success" and data.get("source_data_end"):
+            if (
+                data.get("status") == "success"
+                and data.get("source_data_end")
+                and str(data["source_data_end"]) != "N/A"
+                and str(data["source_data_end"])[0].isdigit()
+            ):
                 end_val = str(data["source_data_end"])
                 if latest_watermark is None or end_val > latest_watermark:
                     latest_watermark = end_val
@@ -196,17 +201,47 @@ def get_latest_pipeline_run_timestamp(dataset_name: str, manifests_dir: Path = M
     return latest_run_ts
 
 
+def get_manifest_by_batch_id(
+    batch_id: str,
+    dataset_name: Optional[str] = None,
+    manifests_dir: Path = MANIFESTS_DIR,
+) -> Optional[Dict[str, Any]]:
+    """
+    Retrieve and parse the JSON manifest document for a specific batch ID.
+    Enables external lookup of batch provenance, source URLs, code version, and schema fingerprints.
+    """
+    manifests_dir = Path(manifests_dir)
+    if not manifests_dir.exists():
+        return None
+
+    if dataset_name:
+        direct_path = manifests_dir / f"{dataset_name}_{batch_id}.json"
+        if direct_path.exists():
+            try:
+                with open(direct_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                return None
+
+    # Fallback / glob search if dataset_name is None or direct path not found
+    pattern = f"*{batch_id}.json"
+    matches = list(manifests_dir.glob(pattern))
+    for m_path in matches:
+        try:
+            with open(m_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("batch_id") == batch_id:
+                return data
+        except Exception:
+            continue
+
+    return None
+
+
 def is_batch_completed(batch_id: str, dataset_name: str, manifests_dir: Path = MANIFESTS_DIR) -> bool:
     """Check if an ingestion batch manifest already exists with status 'success' (idempotency check)."""
-    manifest_path = Path(manifests_dir) / f"{dataset_name}_{batch_id}.json"
-    if not manifest_path.exists():
-        return False
-    try:
-        with open(manifest_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data.get("status") == "success"
-    except Exception:
-        return False
+    manifest_data = get_manifest_by_batch_id(batch_id, dataset_name=dataset_name, manifests_dir=manifests_dir)
+    return manifest_data is not None and manifest_data.get("status") == "success"
 
 
 def _parse_manifest_date(val: Optional[str], is_end: bool = False) -> Optional[datetime]:
@@ -302,6 +337,56 @@ def is_date_range_completed(
     """Check if the requested date range [start_date, end_date] is 100% covered by successful manifests."""
     uncovered = compute_uncovered_date_intervals(dataset_name, start_date, end_date, manifests_dir=manifests_dir)
     return len(uncovered) == 0
+
+
+def get_manifests_for_date_range(
+    dataset_name: str,
+    start_date: str,
+    end_date: str,
+    manifests_dir: Path = MANIFESTS_DIR,
+) -> List[Dict[str, Any]]:
+    """
+    Retrieve all successful manifest documents whose coverage interval overlaps with [start_date, end_date].
+    """
+    manifests_dir = Path(manifests_dir)
+    if not manifests_dir.exists():
+        return []
+
+    req_start = _parse_manifest_date(start_date, is_end=False)
+    req_end = _parse_manifest_date(end_date, is_end=True)
+    if not req_start or not req_end:
+        return []
+
+    pattern = f"{dataset_name}_*.json"
+    overlapping: List[Dict[str, Any]] = []
+
+    for mf in sorted(manifests_dir.glob(pattern)):
+        try:
+            with open(mf, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("status") != "success":
+                continue
+            m_start = _parse_manifest_date(data.get("source_data_start"), is_end=False)
+            m_end = _parse_manifest_date(data.get("source_data_end") or data.get("target_coverage_end"), is_end=True)
+            if m_start and m_end:
+                # Overlap condition: req_start <= m_end and req_end >= m_start
+                if req_start <= m_end and req_end >= m_start:
+                    overlapping.append(data)
+        except Exception:
+            continue
+
+    return overlapping
+
+
+def get_batch_ids_for_date_range(
+    dataset_name: str,
+    start_date: str,
+    end_date: str,
+    manifests_dir: Path = MANIFESTS_DIR,
+) -> List[str]:
+    """Retrieve list of batch IDs whose manifests overlap with [start_date, end_date]."""
+    manifests = get_manifests_for_date_range(dataset_name, start_date, end_date, manifests_dir=manifests_dir)
+    return [m["batch_id"] for m in manifests if "batch_id" in m]
 
 
 def create_manifest_dict(

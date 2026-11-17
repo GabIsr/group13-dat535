@@ -143,16 +143,16 @@ While incremental runs on small partitions (e.g., CI runner processing ~12,000 r
 * **Pandas 3 In-Memory Allocation Overhead:** Inside `_sessionize_partition_udf`, element-by-element assignment (`cluster_first_ts.iloc[i] = anchor_cr`) and post-loop `.groupby("incident_cluster_id")["unique_key"].transform("count")` on 800,000 heap-allocated strings causes extreme memory pressure.
 * **Worker Module Import Isolation:** When worker subprocesses are spawned on Windows, unless `PYTHONPATH` or a site-packages `.pth` link explicitly targets the repository root (`group13-dat535`), unpickling in `pyspark/worker.py` fails with `ModuleNotFoundError: No module named 'src.silver.incident_clustering'`, immediately resetting the Py4J socket.
 
-### 1.2 The Pure PySpark RDD `mapPartitions` Solution
+### 1.2 The Final Solution: Zero-Copy C++ Arrow Streaming (`mapInArrow`) & Self-Join Elimination
 
-#### Why Naive PySpark SQL Windowing Cannot Model Ticket-1 Anchoring
+#### Why Standard PySpark SQL Windowing Cannot Model Ticket-1 Anchoring
 A naive attempt to use Catalyst window functions (`lag("created_at_utc", 1)`) fails because citizen call burst clustering requires **Ticket-1 anchored sessionization**:
 1. When the initial ticket ($T_1$) in an incident wave arrives at $t_1$, it sets an anchor cutoff: $\text{cutoff} = \max(t_1 + \text{window}, \text{ticket}_1\text{\_closed})$.
 2. Any subsequent ticket $T_i$ arriving before this cutoff belongs to $T_1$'s cluster. However, $T_i$ does **not** slide the cutoff window forward for subsequent calls.
 3. Standard SQL window functions (`lag(1)` or `sum(is_new_wave)`) can only compute pairwise gaps between adjacent tickets ($t_i - t_{i-1}$), which causes a false cascading chain (tickets $T_2, T_3, \dots, T_k$ keep chaining forever as long as the gap between consecutive calls is under 6 hours, even if $T_k$ arrives 3 days after $T_1$).
 4. Because the cutoff depends on the state of the *cluster anchor* rather than the immediately preceding row, it requires a stateful scan per location.
 
-#### The Production Implementation: Zero-Copy C++ Arrow Streaming (`mapInArrow`) & Self-Join Elimination
+#### Production Implementation Architecture in `incident_clustering.py`
 In [`src/silver/incident_clustering.py`](file:///C:/Media/UiS/DAT535/group13-dat535/src/silver/incident_clustering.py#L240-L340), Group 13 implemented an in-memory streaming partition worker executed via PySpark’s native `DataFrame.mapInArrow`:
 
 ```python

@@ -8,7 +8,6 @@ Author: Group 13
 
 import argparse
 import gzip
-import hashlib
 import json
 import logging
 import shutil
@@ -34,7 +33,6 @@ from src.utils.config import (
     OPEN_METEO_ARCHIVE_ENDPOINT,
     OPEN_METEO_DATASET_ID,
     PROJECT_ROOT,
-    SCHEMA_VERSION,
     SOURCE_NAME_WEATHER,
     WEATHER_HOURLY_VARIABLES,
 )
@@ -282,21 +280,10 @@ def run_weather_ingestion(
             if df_grid.empty:
                 continue
 
-            # Spatial enrichment (Section 4 of spec)
-            df_grid["grid_id"] = target_grid["grid_id"]
-            df_grid["grid_lat"] = target_grid["grid_lat"]
-            df_grid["grid_lon"] = target_grid["grid_lon"]
-            df_grid["borough_hint"] = target_grid["borough_hint"]
-            df_grid["model_elevation"] = loc_data.get("elevation", 0.0)
-
-            # Tier 2 Row-Level System Lineage Columns
-            df_grid["_batch_id"] = active_batch_id
-            df_grid["_ingested_at_utc"] = retrieved_at_utc
-            df_grid["_source_file"] = get_relative_path(landing_file)
-            df_grid["_source_name"] = SOURCE_NAME_WEATHER
-            df_grid["_extraction_mode"] = mode
-            df_grid["_schema_version"] = SCHEMA_VERSION
-            df_grid["_bronze_status"] = "valid"
+            # Preserve pure Open-Meteo raw observation attributes
+            df_grid["latitude"] = loc_data.get("latitude", target_grid["grid_lat"])
+            df_grid["longitude"] = loc_data.get("longitude", target_grid["grid_lon"])
+            df_grid["elevation"] = loc_data.get("elevation", 0.0)
 
             # Track schema fingerprint
             for col in df_grid.columns:

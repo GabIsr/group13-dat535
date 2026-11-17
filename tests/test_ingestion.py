@@ -22,11 +22,14 @@ from src.utils.manifest import (
     compute_uncovered_date_intervals,
     create_manifest_dict,
     generate_batch_id,
+    get_batch_ids_for_date_range,
     get_committed_files,
     get_earliest_watermark,
     get_latest_pipeline_run_timestamp,
     get_latest_schema_fingerprint,
     get_latest_watermark,
+    get_manifest_by_batch_id,
+    get_manifests_for_date_range,
     is_batch_completed,
     is_date_range_completed,
     save_manifest,
@@ -130,6 +133,81 @@ class TestIngestionPipeline(unittest.TestCase):
             b2_id = generate_batch_id("311", date_str="20261023", manifests_dir=tmp_path)
             self.assertTrue(b2_id.endswith("_002"))
 
+    def test_manifest_external_lookup_and_batch_selection(self):
+        """Verify external lookup of manifests by batch ID and date range batch selection."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+
+            # 1. Non-existent batch returns None
+            self.assertIsNone(get_manifest_by_batch_id("311_20261026_999", manifests_dir=tmp_path))
+
+            # 2. Save two manifests for 311 covering distinct intervals
+            m1 = create_manifest_dict(
+                batch_id="311_20261026_001",
+                dataset_name="nyc_311",
+                source_name="nyc_open_data",
+                source_dataset_id="erm2-nwe9",
+                source_url="https://data.cityofnewyork.us/resource/erm2-nwe9.json",
+                retrieved_at_utc="2026-10-26T10:00:00Z",
+                source_data_start="2026-10-20",
+                source_data_end="2026-10-22",
+                extraction_mode="incremental",
+                environment="dev",
+                code_version="git_test",
+                duration_seconds=2.0,
+                byte_size=1024,
+                row_count=100,
+                schema_fingerprint="sha256:pure_raw_311",
+                status="success",
+                files=[],
+            )
+            m2 = create_manifest_dict(
+                batch_id="311_20261026_002",
+                dataset_name="nyc_311",
+                source_name="nyc_open_data",
+                source_dataset_id="erm2-nwe9",
+                source_url="https://data.cityofnewyork.us/resource/erm2-nwe9.json",
+                retrieved_at_utc="2026-10-26T12:00:00Z",
+                source_data_start="2026-10-23",
+                source_data_end="2026-10-25",
+                extraction_mode="incremental",
+                environment="dev",
+                code_version="git_test",
+                duration_seconds=2.5,
+                byte_size=2048,
+                row_count=200,
+                schema_fingerprint="sha256:pure_raw_311",
+                status="success",
+                files=[],
+            )
+            save_manifest(m1, output_dir=tmp_path)
+            save_manifest(m2, output_dir=tmp_path)
+
+            # 3. Lookup by batch_id directly
+            retrieved = get_manifest_by_batch_id("311_20261026_001", dataset_name="nyc_311", manifests_dir=tmp_path)
+            self.assertIsNotNone(retrieved)
+            self.assertEqual(retrieved["row_count"], 100)
+            self.assertEqual(retrieved["schema_fingerprint"], "sha256:pure_raw_311")
+
+            # Fallback lookup without dataset_name
+            retrieved_no_dataset = get_manifest_by_batch_id("311_20261026_002", manifests_dir=tmp_path)
+            self.assertIsNotNone(retrieved_no_dataset)
+            self.assertEqual(retrieved_no_dataset["row_count"], 200)
+
+            # 4. Range-based batch discovery
+            batches_overlap_all = get_batch_ids_for_date_range("nyc_311", "2026-10-20", "2026-10-25", manifests_dir=tmp_path)
+            self.assertEqual(sorted(batches_overlap_all), ["311_20261026_001", "311_20261026_002"])
+
+            batches_overlap_m1 = get_batch_ids_for_date_range("nyc_311", "2026-10-21", "2026-10-21", manifests_dir=tmp_path)
+            self.assertEqual(batches_overlap_m1, ["311_20261026_001"])
+
+            batches_overlap_m2 = get_batch_ids_for_date_range("nyc_311", "2026-10-24", "2026-10-25", manifests_dir=tmp_path)
+            self.assertEqual(batches_overlap_m2, ["311_20261026_002"])
+
+            # 5. Out of range returns empty list
+            batches_out_of_range = get_batch_ids_for_date_range("nyc_311", "2026-10-01", "2026-10-05", manifests_dir=tmp_path)
+            self.assertEqual(batches_out_of_range, [])
+
     def test_pyspark_landing_to_bronze_conversion_and_idempotency(self):
         """Verify that PySpark converts landing JSON.GZ to partitioned Bronze Parquet with row-level hashes."""
         import gzip
@@ -150,7 +228,6 @@ class TestIngestionPipeline(unittest.TestCase):
                     "complaint_type": "Noise",
                     "latitude": "40.71",
                     "longitude": "-74.00",
-                    ":created_at": 1729245000,
                 },
                 {
                     "unique_key": "1002",
@@ -158,7 +235,6 @@ class TestIngestionPipeline(unittest.TestCase):
                     "complaint_type": "Illegal Parking",
                     "latitude": "40.75",
                     "longitude": "-73.98",
-                    ":created_at": "2026-10-19T14:30:00.000Z",
                 },
             ]
             gz_path = landing_dir / "raw_part_0000.json.gz"
@@ -169,8 +245,6 @@ class TestIngestionPipeline(unittest.TestCase):
                 landing_batch_dir=landing_dir,
                 base_bronze_dir=bronze_dir,
                 batch_id="311_20261029_001",
-                retrieved_at_utc="2026-10-29T10:00:00Z",
-                extraction_mode="incremental",
             )
 
             self.assertTrue(len(written_files) > 0)
@@ -181,12 +255,14 @@ class TestIngestionPipeline(unittest.TestCase):
             self.assertEqual(len(parquet_files), 1)
             df_bronze = pd.read_parquet(parquet_files[0])
             self.assertEqual(len(df_bronze), 2)
-            self.assertIn("_batch_id", df_bronze.columns)
-            self.assertEqual(df_bronze["_batch_id"].iloc[0], "311_20261029_001")
+            # Pure Raw Store assertion: Bronze schema must NOT contain injected internal metadata
+            self.assertNotIn("_batch_id", df_bronze.columns)
+            # Batch ID is preserved in the published filename and manifest
+            self.assertTrue(parquet_files[0].name.startswith("311_20261029_001"))
 
-            # Verify colon column :created_at was cleanly renamed to standard Bronze identifier
-            self.assertIn("source_created_at", df_bronze.columns)
-            self.assertNotIn(":created_at", df_bronze.columns)
+            # Verify source columns are preserved as-is
+            self.assertIn("unique_key", df_bronze.columns)
+            self.assertIn("created_date", df_bronze.columns)
 
     def test_pipeline_run_timestamp_manifest_tracking(self):
         """Verify watermark tracking and pipeline run timestamp tracking across backfill and incremental manifests."""
@@ -469,8 +545,6 @@ class TestIngestionPipeline(unittest.TestCase):
                 landing_batch_dir=landing_dir,
                 base_bronze_dir=bronze_dir,
                 batch_id="batch_multi_part",
-                retrieved_at_utc="2026-11-01T01:00:00Z",
-                extraction_mode="incremental",
                 return_schema=True,
             )
 

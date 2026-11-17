@@ -1121,7 +1121,6 @@ class TestSilverLayerPipeline(unittest.TestCase):
                     "borough": "MANHATTAN",
                     "latitude": "40.7500",
                     "longitude": "-73.9900",
-                    "source_created_at": "2025-12-20T15:05:00.000Z",
                     "_ingested_at_utc": "2026-10-30T10:00:00Z",
                     "_batch_id": "b_2026",
                 },
@@ -1136,7 +1135,6 @@ class TestSilverLayerPipeline(unittest.TestCase):
                     "borough": "MANHATTAN",
                     "latitude": "40.7500",
                     "longitude": "-73.9900",
-                    "source_created_at": "2025-12-20T15:05:00.000Z",
                     "_ingested_at_utc": "2026-10-30T12:00:00Z",
                     "_batch_id": "b_2025",
                 },
@@ -1155,8 +1153,6 @@ class TestSilverLayerPipeline(unittest.TestCase):
             # The 2026 update MUST win because closed_date was 2026-01-15!
             self.assertEqual(winner["status"], "CLOSED")
             self.assertEqual(str(winner["_batch_id"]), "b_2026")
-            self.assertIn("source_intake_lag_hours", df_res.columns)
-            self.assertAlmostEqual(winner["source_intake_lag_hours"], 0.08, delta=0.05)
 
     def test_weather_soil_and_cloud_cover_bounds_and_flags(self):
         """

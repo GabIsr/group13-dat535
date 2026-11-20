@@ -15,7 +15,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -130,6 +130,24 @@ def fetch_open_meteo_batch(
             time.sleep(wait_time)
 
 
+def get_annual_chunks(start_str: str, end_str: str) -> List[Tuple[str, str]]:
+    """
+    Split a temporal interval [start_str, end_str] into annual calendar segments
+    (<= 365/366 days), aligning chunks to calendar year boundaries.
+    This guarantees requests do not exceed Open-Meteo's practical payload thresholds
+    and maps cleanly to Hive partitions (year=YYYY).
+    """
+    start_dt = datetime.strptime(start_str, "%Y-%m-%d").date()
+    end_dt = datetime.strptime(end_str, "%Y-%m-%d").date()
+    chunks = []
+    curr = start_dt
+    while curr <= end_dt:
+        chunk_end = min(date(curr.year, 12, 31), end_dt)
+        chunks.append((curr.strftime("%Y-%m-%d"), chunk_end.strftime("%Y-%m-%d")))
+        curr = chunk_end + timedelta(days=1)
+    return chunks
+
+
 def run_weather_ingestion(
     mode: str = "incremental",
     start_date: Optional[str] = None,
@@ -227,88 +245,114 @@ def run_weather_ingestion(
     logger.info(f"Starting Weather Ingestion | Batch ID: {active_batch_id} | Mode: {mode} | Env: {env}")
     logger.info(f"Temporal interval for acquisition: {effective_start} to {effective_end}")
 
-    # Step 1: Fetch raw data in a single multi-location API call
-    locations_data, raw_bytes = fetch_open_meteo_batch(
-        grid_points=ERA5_NYC_GRID_POINTS,
-        start_date=effective_start,
-        end_date=effective_end,
-        hourly_vars=WEATHER_HOURLY_VARIABLES,
-    )
+    # Split ingestion interval into <=1-year calendar chunks to prevent oversized requests/timeouts
+    date_chunks = get_annual_chunks(effective_start, effective_end)
+    if len(date_chunks) > 1:
+        logger.info(
+            f"Temporal range spans multiple years; split into {len(date_chunks)} annual chunk(s): {date_chunks}"
+        )
 
-    # Step 2: Write raw payload to landing zone
+    # Initialize landing & staging directories
     landing_batch_dir = LANDING_DIR / "weather" / f"batch_{active_batch_id}"
     landing_batch_dir.mkdir(parents=True, exist_ok=True)
-    landing_file = landing_batch_dir / "raw_weather_grid19.json.gz"
 
-    compressed_bytes = gzip.compress(raw_bytes)
-    with open(landing_file, "wb") as f:
-        f.write(compressed_bytes)
-
-    landing_sha256 = compute_file_sha256(landing_file)
-    landing_bytes = landing_file.stat().st_size
-
-    manifest_files_list: List[Dict[str, Any]] = [
-        {
-            "file_name": landing_file.name,
-            "relative_path": get_relative_path(landing_file),
-            "layer": "landing",
-            "rows": sum(len(loc.get("hourly", {}).get("time", [])) for loc in locations_data),
-            "bytes": landing_bytes,
-            "sha256": landing_sha256,
-        }
-    ]
-
-    # Step 3: Unpack, enrich with spatial metadata, and write Bronze Parquet via staging
     bronze_weather_dir = BRONZE_DIR / "weather"
     staging_batch_dir = bronze_weather_dir.parent / "_staging_weather" / f"batch_{active_batch_id}"
     if staging_batch_dir.exists():
         shutil.rmtree(staging_batch_dir)
     staging_batch_dir.mkdir(parents=True, exist_ok=True)
 
+    manifest_files_list: List[Dict[str, Any]] = []
     staged_files: List[Tuple[Path, Path, int]] = []
+    total_raw_bytes = 0
     total_rows = 0
     all_col_types: Dict[str, str] = {}
 
     try:
-        for idx, loc_data in enumerate(locations_data):
-            target_grid = ERA5_NYC_GRID_POINTS[idx]
-            hourly = loc_data.get("hourly", {})
-            if not hourly or "time" not in hourly:
-                continue
-
-            df_grid = pd.DataFrame(hourly)
-            if df_grid.empty:
-                continue
-
-            # Preserve pure Open-Meteo raw observation attributes
-            df_grid["latitude"] = loc_data.get("latitude", target_grid["grid_lat"])
-            df_grid["longitude"] = loc_data.get("longitude", target_grid["grid_lon"])
-            df_grid["elevation"] = loc_data.get("elevation", 0.0)
-
-            # Track schema fingerprint
-            for col in df_grid.columns:
-                all_col_types[col] = str(df_grid[col].dtype)
-
-            # Stage partitioned Parquet: grid_id=GRID_XX_YY / year=YYYY / part_{active_batch_id}.parquet
-            df_grid["_year"] = pd.to_datetime(df_grid["time"]).dt.strftime("%Y")
-            for year, year_group in df_grid.groupby("_year"):
-                staged_part_dir = staging_batch_dir / f"grid_id={target_grid['grid_id']}" / f"year={year}"
-                staged_part_dir.mkdir(parents=True, exist_ok=True)
-                staged_file = staged_part_dir / f"part_{active_batch_id}.parquet"
-                dest_file = bronze_weather_dir / f"grid_id={target_grid['grid_id']}" / f"year={year}" / f"part_{active_batch_id}.parquet"
-
-                clean_sub_df = year_group.drop(columns=["_year"])
-                table = pa.Table.from_pandas(clean_sub_df, preserve_index=False)
-                pq.write_table(
-                    table,
-                    staged_file,
-                    compression="snappy",
-                    coerce_timestamps="us",
-                    allow_truncated_timestamps=True,
+        for chunk_idx, (chunk_start, chunk_end) in enumerate(date_chunks, start=1):
+            if len(date_chunks) > 1:
+                logger.info(
+                    f"Fetching annual chunk {chunk_idx}/{len(date_chunks)}: [{chunk_start} -> {chunk_end}]"
                 )
-                staged_files.append((staged_file, dest_file, len(year_group)))
 
-        # Validation passed across all 19 grid points -> Publish atomically to destination partitions
+            # Step 1: Fetch raw data for current annual chunk
+            locations_data, raw_bytes = fetch_open_meteo_batch(
+                grid_points=ERA5_NYC_GRID_POINTS,
+                start_date=chunk_start,
+                end_date=chunk_end,
+                hourly_vars=WEATHER_HOURLY_VARIABLES,
+            )
+            total_raw_bytes += len(raw_bytes)
+
+            # Step 2: Write raw payload to landing zone
+            landing_filename = (
+                "raw_weather_grid19.json.gz"
+                if len(date_chunks) == 1
+                else f"raw_weather_grid19_chunk{chunk_idx}.json.gz"
+            )
+            landing_file = landing_batch_dir / landing_filename
+
+            compressed_bytes = gzip.compress(raw_bytes)
+            with open(landing_file, "wb") as f:
+                f.write(compressed_bytes)
+
+            landing_sha256 = compute_file_sha256(landing_file)
+            landing_bytes = landing_file.stat().st_size
+
+            manifest_files_list.append({
+                "file_name": landing_file.name,
+                "relative_path": get_relative_path(landing_file),
+                "layer": "landing",
+                "rows": sum(len(loc.get("hourly", {}).get("time", [])) for loc in locations_data),
+                "bytes": landing_bytes,
+                "sha256": landing_sha256,
+            })
+
+            # Step 3: Unpack, enrich with spatial metadata, and write Bronze Parquet via staging
+            for idx, loc_data in enumerate(locations_data):
+                target_grid = ERA5_NYC_GRID_POINTS[idx]
+                hourly = loc_data.get("hourly", {})
+                if not hourly or "time" not in hourly:
+                    continue
+
+                df_grid = pd.DataFrame(hourly)
+                if df_grid.empty:
+                    continue
+
+                # Preserve pure Open-Meteo raw observation attributes
+                df_grid["latitude"] = loc_data.get("latitude", target_grid["grid_lat"])
+                df_grid["longitude"] = loc_data.get("longitude", target_grid["grid_lon"])
+                df_grid["elevation"] = loc_data.get("elevation", 0.0)
+
+                # Track schema fingerprint
+                for col in df_grid.columns:
+                    all_col_types[col] = str(df_grid[col].dtype)
+
+                # Stage partitioned Parquet: grid_id=GRID_XX_YY / year=YYYY / part_{active_batch_id}.parquet
+                df_grid["_year"] = pd.to_datetime(df_grid["time"]).dt.strftime("%Y")
+                for year, year_group in df_grid.groupby("_year"):
+                    staged_part_dir = staging_batch_dir / f"grid_id={target_grid['grid_id']}" / f"year={year}"
+                    staged_part_dir.mkdir(parents=True, exist_ok=True)
+                    part_name = (
+                        f"part_{active_batch_id}.parquet"
+                        if len(date_chunks) == 1
+                        else f"part_{active_batch_id}_chunk{chunk_idx}.parquet"
+                    )
+                    staged_file = staged_part_dir / part_name
+                    dest_file = bronze_weather_dir / f"grid_id={target_grid['grid_id']}" / f"year={year}" / part_name
+
+                    clean_sub_df = year_group.drop(columns=["_year"])
+                    table = pa.Table.from_pandas(clean_sub_df, preserve_index=False)
+                    pq.write_table(
+                        table,
+                        staged_file,
+                        compression="snappy",
+                        coerce_timestamps="us",
+                        allow_truncated_timestamps=True,
+                    )
+                    staged_files.append((staged_file, dest_file, len(year_group)))
+
+        # Validation passed across all annual chunks and grid points -> Publish atomically to destination partitions
         for staged_file, dest_file, row_count in staged_files:
             dest_file.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(staged_file), str(dest_file))
@@ -344,7 +388,7 @@ def run_weather_ingestion(
         environment=env,
         code_version=code_version,
         duration_seconds=duration,
-        byte_size=len(raw_bytes),
+        byte_size=total_raw_bytes,
         row_count=total_rows,
         schema_fingerprint=schema_fingerprint,
         status="success" if total_rows > 0 else "failed",

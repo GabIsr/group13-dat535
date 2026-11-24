@@ -137,6 +137,20 @@ def build_agency_resolution_performance_mart(
                     2
                 ).alias("phantom_closure_rate_pct")
             )
+        has_outcome = "resolution_outcome_category" in cols_311
+        if has_outcome:
+            closure_aggs.extend([
+                spark_sum(when(col("resolution_outcome_category") == "DUPLICATE_CONSOLIDATED", 1).otherwise(0)).alias("duplicate_consolidated_closed_today"),
+                spark_sum(when(col("resolution_outcome_category") == "DEFERRED_PENDING_ACTION", 1).otherwise(0)).alias("deferred_pending_closed_today"),
+                spark_sum(when(col("resolution_outcome_category") == "ACCESS_DENIED_UNABLE_TO_LOCATE", 1).otherwise(0)).alias("access_denied_closed_today"),
+                spark_sum(when(col("resolution_outcome_category") == "ADMINISTRATIVE_DISMISSAL", 1).otherwise(0)).alias("admin_dismissed_closed_today"),
+                spark_sum(when(col("resolution_outcome_category") == "ACTION_TAKEN_REMEDIED", 1).otherwise(0)).alias("remedied_closed_today"),
+                spark_sum(when(col("resolution_outcome_category") == "NO_VIOLATION_FOUND", 1).otherwise(0)).alias("no_violation_closed_today"),
+            ])
+        if "is_instant_closure" in cols_311:
+            closure_aggs.append(
+                spark_sum(when(col("is_instant_closure") == True, 1).otherwise(0)).alias("instant_closed_today")
+            )
         has_unclass = "is_unclassified_resolution" in cols_311
         if has_unclass:
             closure_aggs.append(
@@ -170,6 +184,19 @@ def build_agency_resolution_performance_mart(
         if has_phantom:
             select_cols.append(lit(0).alias("phantom_closed_today"))
             select_cols.append(lit(0.0).alias("phantom_closure_rate_pct"))
+        if "resolution_outcome_category" in cols_311:
+            select_cols.extend([
+                lit(0).alias("duplicate_consolidated_closed_today"),
+                lit(0).alias("deferred_pending_closed_today"),
+                lit(0).alias("access_denied_closed_today"),
+                lit(0).alias("admin_dismissed_closed_today"),
+                lit(0).alias("remedied_closed_today"),
+                lit(0).alias("no_violation_closed_today"),
+            ])
+        if "is_instant_closure" in cols_311:
+            select_cols.append(lit(0).alias("instant_closed_today"))
+        if "is_unclassified_resolution" in cols_311:
+            select_cols.append(lit(0).alias("unclassified_closed_today"))
         if has_field_hours:
             select_cols.append(lit(None).cast("double").alias("median_field_remediation_hours"))
             select_cols.append(lit(None).cast("double").alias("p90_field_remediation_hours"))
@@ -184,7 +211,20 @@ def build_agency_resolution_performance_mart(
         how="outer",
     ).fillna(0, subset=["tickets_created_today", "tickets_closed_today"])
 
-    zero_fill_cols = [c for c in ["field_verified_closed_today", "phantom_closed_today"] if c in df_perf_spark.columns]
+    zero_fill_cols = [
+        c for c in [
+            "field_verified_closed_today",
+            "phantom_closed_today",
+            "duplicate_consolidated_closed_today",
+            "deferred_pending_closed_today",
+            "access_denied_closed_today",
+            "admin_dismissed_closed_today",
+            "remedied_closed_today",
+            "no_violation_closed_today",
+            "instant_closed_today",
+            "unclassified_closed_today",
+        ] if c in df_perf_spark.columns
+    ]
     if zero_fill_cols:
         df_perf_spark = df_perf_spark.fillna(0, subset=zero_fill_cols)
 

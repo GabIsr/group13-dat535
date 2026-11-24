@@ -80,6 +80,7 @@ from src.silver.config import (
     KNOWN_NYC_AGENCIES,
     NYC_COUNCIL_DISTRICT_MAX,
     NYC_COUNCIL_DISTRICT_MIN,
+    NYC_311_LAUNCH_DATE,
     NYC_LAT_MAX,
     NYC_LAT_MIN,
     NYC_LON_MAX,
@@ -211,7 +212,8 @@ def quarantine_invalid_311_records(
     Routes corrupted, unkeyed, negative-duration, or future records to quarantine Parquet
     BEFORE deduplication so corrupted records are never collapsed as nulls.
     """
-    launch_epoch = int(datetime(2003, 3, 1, tzinfo=timezone.utc).timestamp())
+    launch_dt = datetime.fromisoformat(NYC_311_LAUNCH_DATE.replace("Z", "+00:00"))
+    launch_epoch = int(launch_dt.timestamp())
     future_grace_epoch = now_epoch + 7200
 
     cond_missing_created = col("created_at_utc").isNull()
@@ -302,7 +304,6 @@ def enrich_temporal_metrics(df: DataFrame, now_epoch: int) -> DataFrame:
     is_closed = col("closed_at_utc").isNotNull()
     duration_secs = col("closed_at_utc").cast("long") - col("created_at_utc").cast("long")
     duration_hours = spark_round(duration_secs / 3600.0, 2)
-    open_age_secs = lit(now_epoch) - col("created_at_utc").cast("long")
     local_ts = from_utc_timestamp(col("created_at_utc"), "America/New_York")
     status = coalesce(col("status"), lit("UNKNOWN"))
     open_with_closed_date = is_closed & status.isin(OPEN_STATUSES)
@@ -315,7 +316,6 @@ def enrich_temporal_metrics(df: DataFrame, now_epoch: int) -> DataFrame:
         .withColumn("is_extreme_duration", is_closed & (duration_hours > EXTREME_DURATION_HOURS))
         .withColumn("ticket_status_category", when(is_closed, lit("CLOSED")).otherwise(lit("OPEN")))
         .withColumn("resolution_duration_hours", when(is_closed, duration_hours))
-        .withColumn("open_ticket_age_days", when(~is_closed, spark_round(open_age_secs / 86400.0, 2)))
         .withColumn("weather_join_hour_utc", date_trunc("hour", col("created_at_utc")))
         .withColumn("created_hour_utc", hour(col("created_at_utc")))
         .withColumn("created_hour_local", hour(local_ts))
@@ -726,23 +726,28 @@ def clean_and_validate_311(
                 when(extracted_id != "", extracted_id).otherwise(lit("batch_unknown")),
             )
 
-        # Optional partition pruning if date range is specified
-        if start_date:
-            logger.info(f"Applying start_date filter on Bronze 311: created_date >= {start_date}")
-            df_raw = df_raw.filter(substring(col("created_date").cast("string"), 1, 10) >= lit(start_date[:10]))
-        if end_date:
-            logger.info(f"Applying end_date filter on Bronze 311: created_date <= {end_date}")
-            df_raw = df_raw.filter(substring(col("created_date").cast("string"), 1, 10) <= lit(end_date[:10]))
+        # Step 1: Universal 100% Schema Conformance & Type Casting
+        df_conformed = conform_and_cast_311_schema(df_raw)
 
-        input_rows = df_raw.count()
+        # Optional date range filtering on conformed UTC timestamp
+        # (Preserve NULL created_at_utc so corrupted records are properly quarantined in Step 2)
+        if start_date:
+            logger.info(f"Applying start_date filter on conformed UTC timestamp: created_at_utc >= {start_date[:10]}")
+            df_conformed = df_conformed.filter(
+                col("created_at_utc").isNull() | (to_date(col("created_at_utc")) >= lit(start_date[:10]))
+            )
+        if end_date:
+            logger.info(f"Applying end_date filter on conformed UTC timestamp: created_at_utc <= {end_date[:10]}")
+            df_conformed = df_conformed.filter(
+                col("created_at_utc").isNull() | (to_date(col("created_at_utc")) <= lit(end_date[:10]))
+            )
+
+        input_rows = df_conformed.count()
         step_scan.set_input_rows(input_rows)
         step_scan.set_output_rows(input_rows)
     logger.info(f"Loaded {input_rows:,} raw 311 records from Bronze via PySpark.")
 
     with profiler.measure_step("silver_311", "schema_conformance_and_quarantine", input_rows=input_rows) as step_quar:
-        # Step 1: Universal 100% Schema Conformance & Type Casting
-        df_conformed = conform_and_cast_311_schema(df_raw)
-
         # Step 2: Strict Boundary Quarantine Validation (Evaluated on typed fields)
         df_valid_candidates, quarantined_count = quarantine_invalid_311_records(
             df_conformed, now_epoch, quarantine_dir

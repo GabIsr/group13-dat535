@@ -55,12 +55,12 @@ def main():
         f"Starting Gold Pipeline Orchestrator | Env: {args.env} | "
         f"Window: [{args.start_date or 'ALL'} -> {args.end_date or 'ALL'}]"
     )
-    bronze_311_dir = PROJECT_ROOT / "data" / "bronze" / "nyc311"
+    silver_311_dir = PROJECT_ROOT / "data" / "silver" / "nyc311"
     if args.start_date or args.end_date:
         windows = get_monthly_execution_windows(
             start_date=args.start_date,
             end_date=args.end_date,
-            bronze_dir=bronze_311_dir,
+            bronze_dir=silver_311_dir,
         )
         if windows:
             logger.info(f"Gold Batching Plan: Processing {len(windows)} monthly slice(s) sequentially: {[f'{w[0]}->{w[1]}' for w in windows]}")

@@ -422,6 +422,40 @@ def convert_landing_to_bronze_pyspark(
     return published_files
 
 
+def to_nyc_iso(dt_str: Optional[str], is_end_of_day: bool = False) -> Optional[str]:
+    """
+    Convert an incoming UTC date/timestamp string to an America/New_York local time string
+    formatted for Socrata floating timestamp queries (%Y-%m-%dT%H:%M:%S.000).
+    """
+    if not dt_str:
+        return dt_str
+
+    cleaned = dt_str.rstrip("Z").strip()
+    if len(cleaned) == 10:  # YYYY-MM-DD
+        if is_end_of_day:
+            cleaned += "T23:59:59.000"
+        else:
+            cleaned += "T00:00:00.000"
+
+    try:
+        dt = datetime.fromisoformat(cleaned)
+    except ValueError:
+        for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                dt = datetime.strptime(cleaned, fmt)
+                break
+            except ValueError:
+                pass
+        else:
+            return dt_str
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+
+    dt_nyc = dt.astimezone(ZoneInfo("America/New_York"))
+    return dt_nyc.strftime("%Y-%m-%dT%H:%M:%S.000")
+
+
 def build_311_soql_filter(
     mode: str = "incremental",
     start_date: Optional[str] = None,
@@ -452,6 +486,7 @@ def build_311_soql_filter(
 
     default_end = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
     effective_end = end_date if mode == "backfill" else (end_date or f"{default_end}T23:59:59.000")
+    effective_end_nyc = to_nyc_iso(effective_end, is_end_of_day=True)
 
     if mode == "incremental":
         last_wm = get_latest_watermark(DATASET_311, manifests_dir=manifests_dir)
@@ -469,46 +504,54 @@ def build_311_soql_filter(
                 logger.warning(f"Failed to convert last_run_ts ({last_run_ts}) to America/New_York: {e}. Using raw UTC.")
                 last_run_nyc = last_run_ts
 
-        intake_start = start_date or last_wm
+        # Determine intake start:
+        # If start_date was explicitly provided (in UTC), convert to NYC local time.
+        # Otherwise use last_wm (which is already in NYC local time from Bronze created_date).
+        if start_date:
+            intake_start = to_nyc_iso(start_date, is_end_of_day=False)
+        else:
+            intake_start = last_wm
+
         if intake_start and last_run_nyc:
             p_start = project_start_date or PROJECT_START_DATE
-            if len(p_start) == 10:
-                p_start += "T00:00:00.000"
+            p_start_nyc = to_nyc_iso(p_start, is_end_of_day=False)
 
             logger.info(
                 f"Incremental CDC Strategy (Business Mutation Window): "
-                f"Intake [{intake_start} -> {effective_end}] | "
+                f"Intake [{intake_start} -> {effective_end_nyc}] | "
                 f"Mutations & Closures >= {last_run_nyc} "
                 f"(NYC Local Time; Pipeline Run UTC: {last_run})"
             )
             where = (
-                f"((created_date >= '{intake_start}' AND created_date <= '{effective_end}') OR "
-                f"(resolution_action_updated_date >= '{last_run_nyc}' AND created_date >= '{p_start}') OR "
-                f"(closed_date >= '{last_run_nyc}' AND created_date >= '{p_start}'))"
+                f"((created_date >= '{intake_start}' AND created_date <= '{effective_end_nyc}') OR "
+                f"(resolution_action_updated_date >= '{last_run_nyc}' AND created_date >= '{p_start_nyc}') OR "
+                f"(closed_date >= '{last_run_nyc}' AND created_date >= '{p_start_nyc}'))"
             )
             return where, order_clause, effective_end
 
-        start = last_wm or start_date
+        start = intake_start
         if not start:
             days = lookback_days or 7
             end_dt = datetime.strptime(effective_end[:10], "%Y-%m-%d")
-            start = (end_dt - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00.000")
+            start_utc = (end_dt - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00.000")
+            start = to_nyc_iso(start_utc, is_end_of_day=False)
             logger.warning(
                 f"No previous watermark found for incremental mode. "
-                f"Ingesting past {days} days ({start}) up to {effective_end}."
+                f"Ingesting past {days} days ({start}) up to {effective_end_nyc}."
             )
         elif last_wm:
-            logger.info(f"Discovered initial created_date watermark: {last_wm}. Streaming up to {effective_end}.")
+            logger.info(f"Discovered initial created_date watermark: {last_wm}. Streaming up to {effective_end_nyc}.")
         else:
-            logger.info(f"Using explicitly specified start_date for incremental intake: {start_date}")
+            logger.info(f"Using explicitly specified start_date for incremental intake: {intake_start}")
     else:
-        start = start_date
+        # Backfill mode: convert start_date (UTC) to NYC local time
+        start = to_nyc_iso(start_date, is_end_of_day=False) if start_date else None
 
     conditions = []
     if start:
         conditions.append(f"created_date >= '{start}'")
-    if effective_end:
-        conditions.append(f"created_date <= '{effective_end}'")
+    if effective_end_nyc:
+        conditions.append(f"created_date <= '{effective_end_nyc}'")
 
     return (" AND ".join(conditions) if conditions else None), order_clause, effective_end
 

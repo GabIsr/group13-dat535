@@ -275,13 +275,11 @@ class TestSilverLayerPipeline(unittest.TestCase):
             self.assertTrue(row_closed["is_ticket_closed"])
             self.assertEqual(row_closed["ticket_status_category"], "CLOSED")
             self.assertEqual(row_closed["resolution_duration_hours"], 1.5)
-            self.assertTrue(pd.isna(row_closed["open_ticket_age_days"]))
 
             row_open = df_res[df_res["unique_key"] == 2002].iloc[0]
             self.assertFalse(row_open["is_ticket_closed"])
             self.assertEqual(row_open["ticket_status_category"], "OPEN")
             self.assertTrue(pd.isna(row_open["resolution_duration_hours"]))
-            self.assertTrue(row_open["open_ticket_age_days"] > 0)
 
     def test_cumulative_and_lagged_weather_features(self):
         """Verify rolling precipitation and wind gust window aggregations in Silver weather."""

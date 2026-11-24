@@ -71,9 +71,9 @@ BOROUGH_CENTROIDS: Dict[str, Tuple[float, float, str]] = {
 # NYC 311 Institutional & Legal Boundaries
 # -------------------------------------------------------------------------
 
-# NYC 311 launch date: March 9, 2003 (Mayor Michael Bloomberg administration)
-# Any complaint timestamp prior to March 2003 represents a corrupted epoch/default artifact.
-NYC_311_LAUNCH_DATE = "2003-03-01T00:00:00Z"
+# NYC 311 Historical Data Floor (Earliest published archive on NYC Open Data: 2004-01-01)
+# Any complaint timestamp prior to 2004 represents a corrupted epoch/default artifact.
+NYC_311_LAUNCH_DATE = "2004-01-01T00:00:00Z"
 
 # NYC 5 Boroughs (Legal administrative divisions of the City of New York)
 # Source: NYC Charter Title 1, Chapter 1 §2; 2025 NYC 311 Data Dictionary

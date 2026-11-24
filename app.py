@@ -1,26 +1,41 @@
 """
-NYC 311 & Weather Medallion Lakehouse Intelligence Platform
-DAT535 - Group 13 | Data-Driven Decision Making & Municipal Operations
-Executive-Grade Decision Support Dashboard & Operational Audit Engine.
+NYC 311 Service Requests & Weather - Decision Dashboard (v2)
+DAT535 - Group 13
+
+Design rules for this dashboard
+-------------------------------
+1. ONE time scope (All time / Month / Week / Day) in the sidebar drives every
+   page. Every page repeats the active scope in a banner at the top.
+   Anything that cannot follow the scope says so explicitly.
+2. Plain language. No internal pipeline jargon on the screen.
+3. Every number is computed from the Gold marts with the grain respected:
+     demand mart  : one row per day x weather-grid-cell x borough x complaint type
+     agency mart  : one row per day x borough x agency
+     ZIP mart     : one row per ZIP x complaint type, whole period (NO date column)
+4. No made-up data. If a mart is missing, the app says so and stops.
+
+Run:  streamlit run app-v2.py
 """
 
-from datetime import date, datetime
+from __future__ import annotations
+
 import json
+from datetime import date, timedelta
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
+
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import pydeck as pdk
 import streamlit as st
 
 # =============================================================================
-# 1. PAGE SETUP & MODERN EXECUTIVE STYLING
+# 1. PAGE SETUP
 # =============================================================================
 st.set_page_config(
-    page_title="NYC 311 Lakehouse Intelligence",
+    page_title="NYC 311 Decision Dashboard",
     page_icon="🗽",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -29,1192 +44,1237 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    .metric-card {
-        background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%);
-        color: white;
-        border-radius: 10px;
-        padding: 18px;
-        border: 1px solid #334155;
-        box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);
+    .scope-banner {
+        background: #eff6ff; border: 1px solid #bfdbfe; border-left: 6px solid #2563eb;
+        border-radius: 8px; padding: 10px 16px; margin: 4px 0 14px 0; color: #1e3a8a;
+        font-size: 0.95rem;
     }
-    .metric-label {
-        font-size: 0.85rem;
-        color: #94a3b8;
-        font-weight: 500;
-        text-transform: uppercase;
-        letter-spacing: 0.5px;
+    .scope-banner b { color: #1e40af; }
+    .scope-warning {
+        background: #fffbeb; border: 1px solid #fde68a; border-left: 6px solid #f59e0b;
+        border-radius: 8px; padding: 10px 16px; margin: 4px 0 14px 0; color: #78350f;
+        font-size: 0.95rem;
     }
-    .metric-val {
-        font-size: 1.8rem;
-        font-weight: 700;
-        color: #f8fafc;
-        margin: 4px 0;
+    .takeaway {
+        background: #f8fafc; border-left: 4px solid #64748b; border-radius: 6px;
+        padding: 8px 14px; margin: 6px 0 14px 0; color: #334155; font-size: 0.93rem;
     }
-    .metric-sub {
-        font-size: 0.8rem;
-        color: #38bdf8;
+    div[data-testid="stMetric"] {
+        background: linear-gradient(135deg, #1e293b 0%, #0f172a 100%) !important;
+        border: 1px solid #334155 !important;
+        border-radius: 10px !important;
+        padding: 14px 18px !important;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2), 0 2px 4px -1px rgba(0, 0, 0, 0.1) !important;
     }
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 16px;
-        border-bottom: 2px solid #e2e8f0;
+    div[data-testid="stMetricLabel"] {
+        color: #94a3b8 !important;
     }
-    .stTabs [data-baseweb="tab"] {
-        height: 52px;
-        font-weight: 600;
-        font-size: 1rem;
+    div[data-testid="stMetricLabel"] > div,
+    div[data-testid="stMetricLabel"] p,
+    div[data-testid="stMetricLabel"] label {
+        color: #94a3b8 !important;
+        font-size: 0.82rem !important;
+        font-weight: 600 !important;
+        text-transform: uppercase !important;
+        letter-spacing: 0.5px !important;
     }
-    .insight-box {
-        background-color: #f0fdf4;
-        border-left: 5px solid #22c55e;
-        padding: 14px 18px;
-        border-radius: 6px;
-        margin: 12px 0 20px 0;
+    div[data-testid="stMetricLabel"] svg {
+        fill: #94a3b8 !important;
+        color: #94a3b8 !important;
     }
-    .alert-box {
-        background-color: #fef2f2;
-        border-left: 5px solid #ef4444;
-        padding: 14px 18px;
-        border-radius: 6px;
-        margin: 12px 0 20px 0;
+    div[data-testid="stMetricValue"],
+    div[data-testid="stMetricValue"] > div {
+        color: #f8fafc !important;
+        font-size: 1.85rem !important;
+        font-weight: 700 !important;
     }
+    div[data-testid="stMetricDelta"] {
+        font-weight: 600 !important;
+    }
+    div[data-testid="stMetricDelta"] svg {
+        fill: currentColor !important;
+    }
+    .stTabs [data-baseweb="tab"] { font-weight: 600; font-size: 1rem; }
     </style>
-""",
+    """,
     unsafe_allow_html=True,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_ROOT / "data"
-GOLD_MARTS_DIR = DATA_DIR / "gold" / "marts"
-METADATA_DIR = DATA_DIR / "metadata" / "quality"
+MARTS_DIR = DATA_DIR / "gold" / "marts"
+QUALITY_DIR = DATA_DIR / "metadata" / "quality"
 REF_DIR = DATA_DIR / "reference"
 
+BLUE, DARK_BLUE, ORANGE, RED, GREEN, GREY = (
+    "#60a5fa", "#1d4ed8", "#f59e0b", "#dc2626", "#16a34a", "#94a3b8",
+)
+
+# Friendly labels (internal code  ->  what a reader understands)
+SERVICE_AREA_LABELS = {
+    "ACOUSTIC_DISTURBANCE": "Noise",
+    "RESIDENTIAL_HABITABILITY": "Housing conditions",
+    "STREET_TRAFFIC_INFRASTRUCTURE": "Streets & traffic",
+    "SOLID_WASTE_SANITATION": "Sanitation & waste",
+    "PARKS_FORESTRY": "Parks & trees",
+    "CIVIC_REGULATION_CONSUMER": "Business & building rules",
+    "PUBLIC_HEALTH_ENVIRONMENT": "Public health & environment",
+    "WATER_INFRASTRUCTURE": "Water supply",
+    "SEWER_STORMWATER": "Sewers & flooding",
+    "SOCIAL_SERVICES_HOMELESSNESS": "Social services & homelessness",
+    "OTHER_CIVIC_SERVICES": "Other services",
+}
+AGENCY_LABELS = {
+    "NYPD": "Police (NYPD)",
+    "HPD": "Housing Preservation (HPD)",
+    "DSNY": "Sanitation (DSNY)",
+    "DOT": "Transportation (DOT)",
+    "DEP": "Environmental Protection (DEP)",
+    "DOB": "Buildings (DOB)",
+    "DPR": "Parks & Recreation (DPR)",
+    "DOHMH": "Health (DOHMH)",
+    "DHS": "Homeless Services (DHS)",
+    "DCWP": "Consumer & Worker Protection (DCWP)",
+    "TLC": "Taxi & Limousine (TLC)",
+    "DOE": "Education (DOE)",
+    "EDC": "Economic Development (EDC)",
+    "OTI": "Technology (OTI)",
+}
+WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+WEATHER_CONDITIONS = ["Dry (under 1 mm)", "Wet (1-15 mm)", "Storm (15 mm or more)"]
+LONG_OPEN_DAYS = 7  # matches LONG_OPEN_BACKLOG_DAYS in src/gold/config.py
+STORM_MM = 15.0     # matches STORM_PRECIP_THRESHOLD_MM in src/gold/config.py
+
 
 # =============================================================================
-# 2. DATA CACHING & LOADERS
+# 2. DATA LOADING
 # =============================================================================
-@st.cache_data(show_spinner=False)
-def load_gold_data() -> Tuple[
-    Optional[pd.DataFrame],
-    Optional[pd.DataFrame],
-    Optional[pd.DataFrame],
-    Optional[pd.DataFrame],
-]:
-    """Load pre-aggregated Gold marts and spatial reference data."""
-    demand_df, perf_df, vuln_df, centroids_df = None, None, None, None
-
-    cand_demand = [
-        GOLD_MARTS_DIR / "gold_daily_service_demand.parquet",
-        GOLD_MARTS_DIR / "gold_daily_service_demand",
-        GOLD_MARTS_DIR / "daily_service_demand.parquet",
-        GOLD_MARTS_DIR / "daily_service_demand",
-    ]
-    p_demand = next((p for p in cand_demand if p.exists()), cand_demand[0])
-
-    cand_perf = [
-        GOLD_MARTS_DIR / "gold_agency_resolution_performance.parquet",
-        GOLD_MARTS_DIR / "gold_agency_resolution_performance",
-        GOLD_MARTS_DIR / "agency_resolution_performance.parquet",
-        GOLD_MARTS_DIR / "agency_resolution_performance",
-    ]
-    p_perf = next((p for p in cand_perf if p.exists()), cand_perf[0])
-
-    cand_vuln = [
-        GOLD_MARTS_DIR / "gold_zip_infrastructure_vulnerability.parquet",
-        GOLD_MARTS_DIR / "gold_zip_infrastructure_vulnerability",
-        GOLD_MARTS_DIR / "zip_infrastructure_vulnerability.parquet",
-        GOLD_MARTS_DIR / "zip_infrastructure_vulnerability",
-    ]
-    p_vuln = next((p for p in cand_vuln if p.exists()), cand_vuln[0])
-    p_centroids = REF_DIR / "nyc_zip_centroids.parquet"
-
-    if p_demand.exists():
-        try:
-            demand_df = pd.read_parquet(p_demand)
-            if "date" in demand_df.columns:
-                demand_df["date"] = pd.to_datetime(demand_df["date"])
-        except Exception:
-            pass
-
-    if p_perf.exists():
-        try:
-            perf_df = pd.read_parquet(p_perf)
-            if "reporting_date" in perf_df.columns:
-                perf_df["reporting_date"] = pd.to_datetime(
-                    perf_df["reporting_date"]
-                )
-        except Exception:
-            pass
-
-    if p_vuln.exists():
-        try:
-            vuln_df = pd.read_parquet(p_vuln)
-        except Exception:
-            pass
-
-    if p_centroids.exists():
-        try:
-            centroids_df = pd.read_parquet(p_centroids)
-        except Exception:
-            pass
-
-    return demand_df, perf_df, vuln_df, centroids_df
-
-
-@st.cache_data(show_spinner=False)
-def load_observability_data() -> Tuple[
-    Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame]
-]:
-    """Load metadata quality ledgers."""
-    sensor_df, taxonomy_ledger_df, resolutions_ledger_df = None, None, None
-
-    p_sensor = METADATA_DIR / "sensor_anomaly_ledger.parquet"
-    p_tax = METADATA_DIR / "unmapped_complaint_taxonomy_ledger.parquet"
-    p_res = METADATA_DIR / "unclassified_resolutions_ledger.parquet"
-
-    if p_sensor.exists():
-        try:
-            sensor_df = pd.read_parquet(p_sensor)
-        except Exception:
-            pass
-
-    if p_tax.exists():
-        try:
-            taxonomy_ledger_df = pd.read_parquet(p_tax)
-        except Exception:
-            pass
-
-    if p_res.exists():
-        try:
-            resolutions_ledger_df = pd.read_parquet(p_res)
-        except Exception:
-            pass
-
-    return sensor_df, taxonomy_ledger_df, resolutions_ledger_df
-
-
-@st.cache_data(show_spinner=False)
-def load_latest_quality_report() -> Optional[dict]:
-    """Load the most recent automated Silver quality report JSON."""
-    if not METADATA_DIR.exists():
-        return None
-    reports = sorted(
-        METADATA_DIR.glob("silver_quality_*.json"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    if reports:
-        try:
-            with open(reports[0], "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
+def _find_mart(name: str) -> Optional[Path]:
+    for candidate in (MARTS_DIR / f"{name}.parquet", MARTS_DIR / name):
+        if candidate.exists():
+            return candidate
     return None
 
 
-@st.cache_data(show_spinner=False)
-def load_borough_boundaries() -> Optional[dict]:
-    """Load official NYC Borough GIS boundaries GeoJSON."""
-    p_geojson = REF_DIR / "borough_boundaries.geojson"
-    if p_geojson.exists():
-        try:
-            with open(p_geojson, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return None
-
-
-# =============================================================================
-# 3. STATISTICAL SYNTHESIS MODEL (When pipeline has not yet run locally)
-# =============================================================================
-def get_mock_data():
-    """Generates a realistic empirical preview model mirroring the project's real Gold marts."""
-    np.random.seed(42)
-    dates = pd.date_range("2026-07-01", "2026-10-31", freq="D")
-    boroughs = ["MANHATTAN", "BROOKLYN", "QUEENS", "BRONX", "STATEN ISLAND"]
-    agencies = ["NYPD", "DEP", "DOT", "DSNY", "HPD", "DOB"]
-
-    # Mock Mart 1: Demand & Weather
-    rows = []
-    for d in dates:
-        # Simulate realistic weather events
-        is_rain = np.random.rand() < 0.28
-        precip = (
-            np.random.exponential(scale=12.0)
-            if is_rain
-            else np.random.uniform(0.0, 0.4)
-        )
-        precip = round(float(precip), 2)
-        is_storm = precip >= 15.0
-        temp = round(float(22.0 + 6.0 * np.sin(d.dayofyear / 20.0) + np.random.normal(0, 2)), 1)
-        wind_gust = round(float(8.0 + (precip * 0.6) + np.random.exponential(3.0)), 1)
-
-        for b in boroughs:
-            b_mult = {
-                "MANHATTAN": 1.4,
-                "BROOKLYN": 1.8,
-                "QUEENS": 1.6,
-                "BRONX": 1.2,
-                "STATEN ISLAND": 0.5,
-            }[b]
-            # Non-linear hydrological surge: heavy storms produce exponential sewer calls
-            surge = 1.0 + (3.4 * (precip / 15.0) ** 1.8 if precip > 8.0 else 0.0)
-            base_calls = int((160 + np.random.normal(0, 20)) * b_mult * surge)
-            base_calls = max(25, base_calls)
-
-            # Burst deflation: During rain, panic callers call multiple times for the same street flood
-            burst_ratio = min(0.68, 0.15 + (0.025 * precip))
-            dup_calls = int(base_calls * burst_ratio)
-            distinct_inc = base_calls - dup_calls
-
-            rows.append(
-                {
-                    "date": d,
-                    "borough": b,
-                    "complaint_type": "Sewer Maintenance" if is_storm else "Noise - Residential",
-                    "complaint_count": base_calls,
-                    "distinct_incidents_count": distinct_inc,
-                    "duplicate_burst_calls_count": dup_calls,
-                    "total_precipitation_mm": precip,
-                    "avg_temperature_c": temp,
-                    "max_wind_gust_ms": wind_gust,
-                    "is_extreme_weather_day": is_storm or (wind_gust > 17.0),
-                }
-            )
-    mock_demand = pd.DataFrame(rows)
-
-    # Mock Mart 2: Agency Performance & Phantom Closures
-    p_rows = []
-    for d in dates[::2]:
-        for b in boroughs:
-            for a in agencies:
-                created = int(np.random.normal(90, 25))
-                closed = int(created * np.random.uniform(0.85, 1.08))
-                active_backlog = int(closed * np.random.uniform(3.5, 7.0))
-                long_open = int(active_backlog * np.random.uniform(0.12, 0.32))
-
-                # Real-world discrepancy: NYPD/DEP close fast administratively, DOT does heavy field work
-                if a == "NYPD":
-                    phantom_rate = round(float(np.random.normal(68.0, 4.0)), 1)
-                    reported_sla = 2.4
-                    true_sla = 28.5
-                elif a == "DEP":
-                    phantom_rate = round(float(np.random.normal(52.0, 5.0)), 1)
-                    reported_sla = 14.0
-                    true_sla = 56.0
-                elif a == "DOT":
-                    phantom_rate = round(float(np.random.normal(18.0, 3.0)), 1)
-                    reported_sla = 46.0
-                    true_sla = 52.0
-                else:
-                    phantom_rate = round(float(np.random.normal(35.0, 6.0)), 1)
-                    reported_sla = 24.0
-                    true_sla = 48.0
-
-                phantom_closed = int(closed * (phantom_rate / 100.0))
-                p_rows.append(
-                    {
-                        "reporting_date": d,
-                        "borough": b,
-                        "agency": a,
-                        "tickets_created_today": max(10, created),
-                        "tickets_closed_today": max(8, closed),
-                        "active_open_backlog_count": max(40, active_backlog),
-                        "long_open_backlog_count": max(5, long_open),
-                        "phantom_closed_today": phantom_closed,
-                        "phantom_closure_rate_pct": phantom_rate,
-                        "reported_sla_hours": reported_sla,
-                        "median_field_remediation_hours": true_sla,
-                        "p90_field_remediation_hours": round(true_sla * 2.8, 1),
-                    }
-                )
-    mock_perf = pd.DataFrame(p_rows)
-
-    return mock_demand, mock_perf
-
-
-# Load Data
-df_demand, df_perf, df_vuln, df_centroids = load_gold_data()
-df_sensor, df_tax_ledger, df_res_ledger = load_observability_data()
-quality_report = load_latest_quality_report()
-geojson_boroughs = load_borough_boundaries()
-
-is_using_mock = df_demand is None or df_perf is None
-if is_using_mock:
-    df_demand, df_perf = get_mock_data()
-
-
-# =============================================================================
-# 4. SIDEBAR CONTROLS & GLOBAL FILTERS
-# =============================================================================
-st.sidebar.image(
-    "https://upload.wikimedia.org/wikipedia/commons/thumb/b/ba/Flag_of_New_York_City.svg/320px-Flag_of_New_York_City.svg.png",
-    width=140,
-)
-st.sidebar.title("Operational Controls")
-st.sidebar.caption("DAT535 Medallion Platform | Group 13")
-
-if is_using_mock:
-    st.sidebar.warning(
-        "⚠️ Showing statistical preview model. Run `python run_gold.py --env dev` to stream local lakehouse data."
-    )
-
-# Date Filter
-min_date = df_demand["date"].min().date()
-max_date = df_demand["date"].max().date()
-date_range = st.sidebar.date_input(
-    "Observation Window",
-    value=(min_date, max_date),
-    min_value=min_date,
-    max_value=max_date,
-)
-
-start_date, end_date = (
-    date_range if isinstance(date_range, tuple) and len(date_range) == 2 else (min_date, max_date)
-)
-
-# Borough Filter
-all_boroughs = sorted(df_demand["borough"].dropna().unique().tolist())
-selected_boroughs = st.sidebar.multiselect(
-    "Municipal Boroughs", options=all_boroughs, default=all_boroughs
-)
-if not selected_boroughs:
-    selected_boroughs = all_boroughs
-
-# Agency Filter
-all_agencies = sorted(df_perf["agency"].dropna().unique().tolist())
-selected_agencies = st.sidebar.multiselect(
-    "City Agencies", options=all_agencies, default=all_agencies
-)
-if not selected_agencies:
-    selected_agencies = all_agencies
-
-# 10 Canonical Invariant Domains (Notebook 15)
-st.sidebar.markdown("---")
-st.sidebar.subheader("Conformed Service Domain")
-canonical_domains = [
-    "ALL MUNICIPAL DOMAINS",
-    "WATER_INFRASTRUCTURE (DEP)",
-    "SEWER_STORMWATER (DEP)",
-    "ACOUSTIC_DISTURBANCE (NYPD/DEP)",
-    "RESIDENTIAL_HABITABILITY (HPD)",
-    "STREET_TRAFFIC_INFRASTRUCTURE (DOT)",
-    "SOLID_WASTE_SANITATION (DSNY)",
-    "PUBLIC_HEALTH_ENVIRONMENT (DOHMH)",
-    "PARKS_FORESTRY (DPR)",
-    "SOCIAL_SERVICES_HOMELESSNESS (DHS)",
-    "CIVIC_REGULATION_CONSUMER (DCWP/DOB)",
-]
-selected_domain = st.sidebar.selectbox(
-    "Semantic Taxonomy Domain",
-    options=canonical_domains,
-    help="Conformed Semantic Architecture from Notebook 15. Prevents schema drift across agencies.",
-)
-# Apply Filter Masks
-mask_demand = (
-    (df_demand["date"].dt.date >= start_date)
-    & (df_demand["date"].dt.date <= end_date)
-    & (df_demand["borough"].isin(selected_boroughs))
-)
-if selected_domain != "ALL MUNICIPAL DOMAINS":
-    domain_code = selected_domain.split()[0]
-    st.sidebar.info(f"Targeting: `{domain_code}`")
-    if "canonical_service_domain" in df_demand.columns:
-        mask_demand = mask_demand & (df_demand["canonical_service_domain"] == domain_code)
-
-filtered_demand = df_demand[mask_demand]
-
-mask_perf = (
-    (df_perf["reporting_date"].dt.date >= start_date)
-    & (df_perf["reporting_date"].dt.date <= end_date)
-    & (df_perf["borough"].isin(selected_boroughs))
-    & (df_perf["agency"].isin(selected_agencies))
-)
-filtered_perf = df_perf[mask_perf]
-
-
-# =============================================================================
-# 5. EXECUTIVE METRICS RIBBON
-# =============================================================================
-st.title("🗽 New York City 311 Operational Intelligence & Climate Resilience")
-st.markdown(
-    "**Course DAT535: Data-Driven Decision Making** | Architecture: *Medallion Lakehouse (Bronze $\\to$ Silver $\\to$ Gold)*"
-)
-st.markdown("---")
-
-tot_calls = filtered_demand["complaint_count"].sum()
-tot_incidents = (
-    filtered_demand["distinct_incidents_count"].sum()
-    if "distinct_incidents_count" in filtered_demand.columns
-    else tot_calls
-)
-tot_burst_dups = (
-    filtered_demand["duplicate_burst_calls_count"].sum()
-    if "duplicate_burst_calls_count" in filtered_demand.columns
-    else 0
-)
-deflation_pct = round((tot_burst_dups / tot_calls) * 100, 1) if tot_calls > 0 else 0.0
-peak_rain = (
-    filtered_demand["total_precipitation_mm"].max()
-    if "total_precipitation_mm" in filtered_demand.columns
-    else 0.0
-)
-avg_phantom = (
-    filtered_perf["phantom_closure_rate_pct"].mean()
-    if "phantom_closure_rate_pct" in filtered_perf.columns
-    else 48.5
-)
-active_backlog = (
-    filtered_perf["active_open_backlog_count"].iloc[-1]
-    if not filtered_perf.empty
-    else 0
-)
-
-# Custom KPI Grid
-kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
-
-with kpi1:
-    st.markdown(
-        f"""
-        <div class="metric-card">
-            <div class="metric-label">Total Citizen Inflow</div>
-            <div class="metric-val">{tot_calls:,}</div>
-            <div class="metric-sub">Raw Calls Received</div>
-        </div>
-    """,
-        unsafe_allow_html=True,
-    )
-
-with kpi2:
-    st.markdown(
-        f"""
-        <div class="metric-card">
-            <div class="metric-label">True Field Incidents</div>
-            <div class="metric-val">{tot_incidents:,}</div>
-            <div class="metric-sub">Distinct Physical Events</div>
-        </div>
-    """,
-        unsafe_allow_html=True,
-    )
-
-with kpi3:
-    st.markdown(
-        f"""
-        <div class="metric-card">
-            <div class="metric-label">Call Deflation Ratio</div>
-            <div class="metric-val">-{deflation_pct}%</div>
-            <div class="metric-sub">{tot_burst_dups:,} Panic Calls Filtered</div>
-        </div>
-    """,
-        unsafe_allow_html=True,
-    )
-
-with kpi4:
-    st.markdown(
-        f"""
-        <div class="metric-card">
-            <div class="metric-label">Peak 24h Rainfall</div>
-            <div class="metric-val">{peak_rain:.1f} mm</div>
-            <div class="metric-sub">ERA5-Land Grid Reanalysis</div>
-        </div>
-    """,
-        unsafe_allow_html=True,
-    )
-
-with kpi5:
-    st.markdown(
-        f"""
-        <div class="metric-card">
-            <div class="metric-label">Phantom Closure Rate</div>
-            <div class="metric-val" style="color: #f87171;">{avg_phantom:.1f}%</div>
-            <div class="metric-sub">Closed Without Field Work</div>
-        </div>
-    """,
-        unsafe_allow_html=True,
-    )
-
-st.markdown("")
-
-# =============================================================================
-# 6. DASHBOARD TABS
-# =============================================================================
-tab1, tab2, tab3, tab4 = st.tabs(
-    [
-        "📈 Hydrological Elasticity & Surge",
-        "⚖️ Agency Accountability & Phantom Closures",
-        "🗺️ Neighborhood Climate Fragility",
-        "🛡️ Lakehouse Observability & Drift Governance",
-    ]
-)
-
-
-# =============================================================================
-# TAB 1: HYDROLOGICAL ELASTICITY & METEOROLOGICAL SURGE (MART 1)
-# =============================================================================
-with tab1:
-    st.subheader(
-        "Spatiotemporal Service Demand vs. Meteorological Surge (Mart 1)"
-    )
-    st.markdown(
-        "Combines citizen call volume with high-resolution hourly ERA5-Land reanalysis to measure municipal sensitivity to environmental shocks."
-    )
-
-    daily_trend = (
-        filtered_demand.groupby("date")
-        .agg(
-            total_calls=("complaint_count", "sum"),
-            distinct_incidents=("distinct_incidents_count", "sum"),
-            duplicate_bursts=("duplicate_burst_calls_count", "sum"),
-            rainfall=("total_precipitation_mm", "mean"),
-            avg_temp=("avg_temperature_c", "mean"),
-            max_wind=("max_wind_gust_ms", "max"),
-            is_extreme=("is_extreme_weather_day", lambda x: any(x)),
-        )
-        .reset_index()
-    )
-
-    # 1. Dual-Axis Interactive Timeline (Plotly)
-    st.markdown("#### Dual-Axis Time Series: Citizen Calls vs. Precipitation Surge")
-    fig_timeline = make_subplots(specs=[[{"secondary_y": True}]])
-
-    # Left: Total Calls & Distinct Incidents
-    fig_timeline.add_trace(
-        go.Bar(
-            x=daily_trend["date"],
-            y=daily_trend["total_calls"],
-            name="Raw 311 Inflow",
-            marker_color="#93c5fd",
-            opacity=0.65,
-            hovertemplate="<b>Date:</b> %{x|%Y-%m-%d}<br><b>Raw Calls:</b> %{y:,}<extra></extra>",
-        ),
-        secondary_y=False,
-    )
-    fig_timeline.add_trace(
-        go.Scatter(
-            x=daily_trend["date"],
-            y=daily_trend["distinct_incidents"],
-            name="Distinct Physical Incidents",
-            line=dict(color="#1d4ed8", width=3),
-            hovertemplate="<b>Date:</b> %{x|%Y-%m-%d}<br><b>Physical Incidents:</b> %{y:,}<extra></extra>",
-        ),
-        secondary_y=False,
-    )
-
-    # Right: Rainfall (mm)
-    fig_timeline.add_trace(
-        go.Bar(
-            x=daily_trend["date"],
-            y=daily_trend["rainfall"],
-            name="Daily Rainfall (mm)",
-            marker_color="#0284c7",
-            opacity=0.8,
-            hovertemplate="<b>Date:</b> %{x|%Y-%m-%d}<br><b>Precipitation:</b> %{y:.1f} mm<extra></extra>",
-        ),
-        secondary_y=True,
-    )
-
-    fig_timeline.update_layout(
-        title=dict(text="Daily Complaint Inflow Coupled with Meteorological Reanalysis", font=dict(size=14)),
-        hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        margin=dict(l=40, r=40, t=50, b=40),
-        height=450,
-    )
-    fig_timeline.update_xaxes(title_text="Calendar Date", showgrid=True, gridcolor="#f1f5f9")
-    fig_timeline.update_yaxes(title_text="Citizen Call Volume (Tickets/Day)", secondary_y=False, showgrid=True)
-    fig_timeline.update_yaxes(title_text="Precipitation (mm/Day)", secondary_y=True, showgrid=False, range=[0, max(50, daily_trend["rainfall"].max() * 1.6)])
-
-    st.plotly_chart(fig_timeline, use_container_width=True)
-
-    st.markdown(
-        """
-        <div class="insight-box">
-            <b>💡 Key Data Engineering Insight (Hydrological Lag & Surge):</b><br>
-            Notice the immediate vertical spikes on days exceeding <b>15.0 mm of precipitation</b>. 
-            While physical incidents rise by ~65%, total citizen call volume expands by over <b>+300%</b>. 
-            The Medallion Silver burst-deduplication engine isolates the true dispatch workload, preventing first responders from handling redundant tickets.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # 2. Deep Dive: The Non-Linear Tipping Point Analysis
-    c_left, c_right = st.columns([1.4, 1.0])
-
-    with c_left:
-        st.markdown("#### Hydrological Tipping Point: Rainfall Intensity vs. Inflow")
-        st.caption("Demonstrates the critical non-linear threshold where municipal storm drainage saturates.")
-
-        fig_scatter = px.scatter(
-            daily_trend,
-            x="rainfall",
-            y="total_calls",
-            color="is_extreme",
-            color_discrete_map={True: "#ef4444", False: "#3b82f6"},
-            labels={"rainfall": "Daily Rainfall (mm)", "total_calls": "Daily 311 Inflow", "is_extreme": "Extreme Storm Day"},
-            hover_data={"date": "|%Y-%m-%d", "max_wind": ":.1f m/s", "rainfall": ":.1f mm"},
-        )
-
-        # Pure NumPy trendline without requiring extra statsmodels package
-        if len(daily_trend) > 1:
-            try:
-                x_vals = daily_trend["rainfall"].astype(float).values
-                y_vals = daily_trend["total_calls"].astype(float).values
-                slope, intercept = np.polyfit(x_vals, y_vals, 1)
-                x_line = np.linspace(x_vals.min(), x_vals.max(), 40)
-                y_line = slope * x_line + intercept
-                fig_scatter.add_trace(
-                    go.Scatter(
-                        x=x_line,
-                        y=y_line,
-                        mode="lines",
-                        name=f"Trendline (slope: +{slope:.1f} calls/mm)",
-                        line=dict(color="#475569", width=2, dash="dash"),
-                    )
-                )
-            except Exception:
-                pass
-
-        fig_scatter.add_vline(x=15.0, line_dash="dash", line_color="#ef4444", annotation_text="NYC Drainage Threshold (15mm)")
-        fig_scatter.update_layout(height=380, margin=dict(l=20, r=20, t=30, b=20))
-        st.plotly_chart(fig_scatter, use_container_width=True)
-
-    with c_right:
-        st.markdown("#### Severe Weather Impact Matrix")
-        st.caption("Empirical comparison: Dry Baseline vs. Storm Days.")
-
-        dry_days = daily_trend[daily_trend["rainfall"] < 2.0]
-        mod_days = daily_trend[(daily_trend["rainfall"] >= 2.0) & (daily_trend["rainfall"] < 15.0)]
-        storm_days = daily_trend[daily_trend["rainfall"] >= 15.0]
-
-        avg_dry = dry_days["total_calls"].mean() if not dry_days.empty else 1.0
-        avg_mod = mod_days["total_calls"].mean() if not mod_days.empty else 1.0
-        avg_storm = storm_days["total_calls"].mean() if not storm_days.empty else 1.0
-
-        surge_mod_pct = ((avg_mod - avg_dry) / avg_dry) * 100
-        surge_storm_pct = ((avg_storm - avg_dry) / avg_dry) * 100
-
-        matrix_df = pd.DataFrame(
-            [
-                {"Weather Condition": "☀️ Dry Baseline (<2mm)", "Avg Calls/Day": f"{avg_dry:,.0f}", "Surge %": "0.0% (Baseline)", "Panic Call Share": f"{dry_days['duplicate_bursts'].sum()/max(1, dry_days['total_calls'].sum())*100:.1f}%"},
-                {"Weather Condition": "🌧️ Moderate Rain (2-15mm)", "Avg Calls/Day": f"{avg_mod:,.0f}", "Surge %": f"+{surge_mod_pct:.1f}%", "Panic Call Share": f"{mod_days['duplicate_bursts'].sum()/max(1, mod_days['total_calls'].sum())*100:.1f}%"},
-                {"Weather Condition": "⛈️ Severe Storm (>15mm)", "Avg Calls/Day": f"{avg_storm:,.0f}", "Surge %": f"+{surge_storm_pct:.1f}%", "Panic Call Share": f"{storm_days['duplicate_bursts'].sum()/max(1, storm_days['total_calls'].sum())*100:.1f}%"},
-            ]
-        )
-        st.dataframe(matrix_df, hide_index=True, use_container_width=True)
-
-        st.info(
-            f"⚡ **Decision Recommendation for OEM**: City infrastructure encounters severe congestion at **15mm/24h**. Emergency crews should pre-deploy vacuum trucks once forecast exceeds this threshold."
-        )
-
-
-# =============================================================================
-# TAB 2: AGENCY ACCOUNTABILITY & PHANTOM CLOSURES (MART 2)
-# =============================================================================
-with tab2:
-    st.subheader("Agency Operational Throughput & SLA Integrity (Mart 2)")
-    st.markdown(
-        "Audits municipal resolution veracity by cross-referencing unstructured closure text against field verified physical remediations."
-    )
-
-    agency_summary = (
-        filtered_perf.groupby("agency")
-        .agg(
-            created=("tickets_created_today", "sum"),
-            closed=("tickets_closed_today", "sum"),
-            active_backlog=("active_open_backlog_count", "mean"),
-            long_open=("long_open_backlog_count", "mean"),
-            phantom_closed=("phantom_closed_today", "sum"),
-            phantom_rate=("phantom_closure_rate_pct", "mean"),
-            reported_sla=(
-                "median_resolution_duration_hours"
-                if "median_resolution_duration_hours" in filtered_perf.columns
-                else (
-                    "avg_resolution_duration_hours"
-                    if "avg_resolution_duration_hours" in filtered_perf.columns
-                    else (
-                        "reported_sla_hours"
-                        if "reported_sla_hours" in filtered_perf.columns
-                        else "tickets_closed_today"
-                    )
-                ),
-                "mean",
-            ),
-            remediation_sla=(
-                "median_field_remediation_hours",
-                "mean",
-            ),
-            p90_sla=(
-                "p90_field_remediation_hours",
-                "mean",
-            ),
-        )
-        .reset_index()
-    )
-
-    # 1. The Accountability Divide: Reported SLA vs. True Remediation SLA
-    st.markdown("#### The Accountability Divide: Official Reported SLA vs. Verified Remediation SLA")
-    st.caption("Contrasts the official reported resolution time against the actual duration required when physical work is carried out.")
-
-    fig_sla = go.Figure()
-    fig_sla.add_trace(
-        go.Bar(
-            x=agency_summary["agency"],
-            y=agency_summary["reported_sla"],
-            name="Official Reported SLA (Includes Administrative Dismissals)",
-            marker_color="#94a3b8",
-            hovertemplate="<b>%{x}</b><br>Official SLA: %{y:.1f} hrs<extra></extra>",
-        )
-    )
-    fig_sla.add_trace(
-        go.Bar(
-            x=agency_summary["agency"],
-            y=agency_summary["remediation_sla"],
-            name="True Verified Field Remediation SLA (Physical Work Completed)",
-            marker_color="#ef4444",
-            hovertemplate="<b>%{x}</b><br>True Remediation SLA: %{y:.1f} hrs<extra></extra>",
-        )
-    )
-
-    fig_sla.update_layout(
-        barmode="group",
-        height=400,
-        margin=dict(l=30, r=30, t=40, b=30),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-        yaxis=dict(title="Duration to Resolution (Hours)", showgrid=True),
-        xaxis=dict(title="City Agency"),
-    )
-    st.plotly_chart(fig_sla, use_container_width=True)
-
-    st.markdown(
-        """
-        <div class="alert-box">
-            <b>🚨 Critical Finding (The 'Phantom Closure' Discrepancy):</b><br>
-            Agencies such as NYPD and DEP appear to have rapid resolution times (<3 hours) when evaluated using traditional total ticket metrics.
-            However, our Notebook 14 text mining reveals that <b>over 60% of these tickets are closed administratively</b> ('Officer observed no condition' or 'Referred to website'). 
-            When physical field work is required, true resolution SLA expands to <b>28 to 56 hours</b>.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # 2. Closure Taxonomy Breakdown & Backlog Waterfall
-    col_pie, col_waterfall = st.columns([1.1, 1.3])
-
-    with col_pie:
-        st.markdown("#### Municipal Resolution Semantic Breakdown")
-        st.caption("Distribution of resolution categories across audited tickets.")
-
-        res_labels = [
-            "Verified Field Remediation",
-            "Police/Inspector 'No Violation'",
-            "Administrative Dismissal / Website",
-            "Duplicate Consolidated",
-        ]
-        res_values = [18.2, 43.5, 23.1, 15.2]
-        donut_colors = ["#22c55e", "#38bdf8", "#ef4444", "#64748b", "#f59e0b"]
-
-        if quality_report and "stages" in quality_report and "311_cleaning" in quality_report["stages"]:
-            rtm = quality_report["stages"]["311_cleaning"].get("resolution_text_mining", {})
-            ob = rtm.get("outcome_breakdown", {})
-            if ob:
-                field_remed = ob.get("ACTION_TAKEN_REMEDIED", 0)
-                no_viol = ob.get("NO_VIOLATION_FOUND", 0)
-                admin_defer = (
-                    ob.get("ADMINISTRATIVE_DISMISSAL", 0)
-                    + ob.get("DEFERRED_PENDING_ACTION", 0)
-                    + ob.get("ACCESS_DENIED_UNABLE_TO_LOCATE", 0)
-                )
-                dup_consol = ob.get("DUPLICATE_CONSOLIDATED", 0)
-                unclass = ob.get("UNCLASSIFIED_OR_GENERIC", 0)
-                tot_eval = field_remed + no_viol + admin_defer + dup_consol + unclass
-                if tot_eval > 0:
-                    res_labels = [
-                        f"Action Taken / Remedied ({field_remed/tot_eval*100:.1f}%)",
-                        f"No Violation Found ({no_viol/tot_eval*100:.1f}%)",
-                        f"Administrative / Deferred ({admin_defer/tot_eval*100:.1f}%)",
-                        f"Duplicate Consolidated ({dup_consol/tot_eval*100:.1f}%)",
-                        f"Novel / Unclassified ({unclass/tot_eval*100:.1f}%)",
-                    ]
-                    res_values = [field_remed, no_viol, admin_defer, dup_consol, unclass]
-
-        fig_donut = go.Figure(
-            data=[
-                go.Pie(
-                    labels=res_labels,
-                    values=res_values,
-                    hole=0.55,
-                    marker=dict(colors=donut_colors[:len(res_labels)]),
-                )
-            ]
-        )
-        fig_donut.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="v", x=1.0, y=0.5))
-        st.plotly_chart(fig_donut, use_container_width=True)
-
-    with col_waterfall:
-        st.markdown("#### Agency Backlog Accumulation & Zombie Tickets")
-        st.caption("Separates operational rolling workload from unaddressed tickets open >7 days.")
-
-        fig_backlog = go.Figure()
-        fig_backlog.add_trace(
-            go.Bar(
-                x=agency_summary["agency"],
-                y=agency_summary["active_backlog"] - agency_summary["long_open"],
-                name="Active Working Backlog (≤7 Days)",
-                marker_color="#3b82f6",
-            )
-        )
-        fig_backlog.add_trace(
-            go.Bar(
-                x=agency_summary["agency"],
-                y=agency_summary["long_open"],
-                name="Stagnant 'Zombie' Backlog (>7 Days)",
-                marker_color="#dc2626",
-            )
-        )
-        fig_backlog.update_layout(
-            barmode="stack",
-            height=340,
-            margin=dict(l=10, r=10, t=10, b=10),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            yaxis=dict(title="Ticket Count"),
-        )
-        st.plotly_chart(fig_backlog, use_container_width=True)
-
-    # 3. Agency SLA Scorecard
-    st.markdown("#### Complete Agency SLA & Performance Scorecard")
-    st.dataframe(
-        agency_summary.style.format(
-            {
-                "created": "{:,.0f}",
-                "closed": "{:,.0f}",
-                "active_backlog": "{:,.0f}",
-                "long_open": "{:,.0f}",
-                "phantom_closed": "{:,.0f}",
-                "phantom_rate": "{:.1f}%",
-                "reported_sla": "{:.1f} hrs",
-                "remediation_sla": "{:.1f} hrs",
-                "p90_sla": "{:.1f} hrs",
-            }
-        ),
-        use_container_width=True,
-    )
-
-
-# =============================================================================
-# TAB 3: NEIGHBORHOOD CLIMATE FRAGILITY & SPATIAL SCORECARD (MART 3)
-# =============================================================================
-with tab3:
-    st.subheader(
-        "ZIP-Code Infrastructure Fragility & Spatial Precision (Mart 3)"
-    )
-    st.markdown(
-        "Combines localized hourly complaint frequency with Census ZCTA geometry to rank NYC neighborhoods by environmental vulnerability."
-    )
-
-    # Prepare Real or Synthetic Vulnerability Points
-    has_real_vuln = (
-        df_vuln is not None
-        and not df_vuln.empty
-        and df_centroids is not None
-        and not df_centroids.empty
-    )
-
-    if has_real_vuln:
-        top_vuln = df_vuln.sort_values(by="storm_sensitivity_multiplier", ascending=False).head(30)
-        map_pts = top_vuln.merge(df_centroids, left_on="incident_zip", right_on="zip5", how="inner")
-        if not map_pts.empty:
-            map_pts["latitude"] = map_pts["centroid_lat"]
-            map_pts["longitude"] = map_pts["centroid_lon"]
-            map_pts["storm_mult_str"] = map_pts["storm_sensitivity_multiplier"].apply(lambda x: f"{x:.1f}x")
-            map_pts["radius"] = map_pts["storm_sensitivity_multiplier"] * 100
-            map_pts["boroname"] = map_pts["borough"]
-        else:
-            has_real_vuln = False
-
-    if not has_real_vuln:
-        # High-Fidelity Neighborhood Set with Real Coordinates
-        high_risk_zips = [
-            ("11368", "Corona / Flushing", "QUEENS", 7.8, 480, 40.7498, -73.8622),
-            ("11211", "Williamsburg", "BROOKLYN", 6.2, 540, 40.7126, -73.9510),
-            ("11430", "JFK Catchment Basin", "QUEENS", 8.4, 210, 40.6438, -73.7820),
-            ("10451", "Concourse / Mott Haven", "BRONX", 5.9, 390, 40.8208, -73.9242),
-            ("10029", "East Harlem", "MANHATTAN", 4.3, 310, 40.7917, -73.9442),
-            ("10305", "South Beach / Midland", "STATEN ISLAND", 7.1, 180, 40.5960, -74.0740),
-            ("11224", "Coney Island Coastal", "BROOKLYN", 6.9, 290, 40.5755, -73.9890),
-            ("11385", "Ridgewood / Glendale", "QUEENS", 5.4, 420, 40.7005, -73.8966),
-            ("10001", "Midtown West", "MANHATTAN", 2.8, 620, 40.7506, -73.9971),
-            ("10468", "Jerome Park / Fordham", "BRONX", 6.4, 340, 40.8670, -73.8988),
-            ("10314", "Bloomfield / Fresh Kills", "STATEN ISLAND", 4.9, 220, 40.6040, -74.1650),
-        ]
-        map_pts = pd.DataFrame(
-            high_risk_zips,
-            columns=["incident_zip", "neighborhood", "boroname", "storm_sensitivity_multiplier", "total_complaints", "latitude", "longitude"],
-        )
-        map_pts["storm_mult_str"] = map_pts["storm_sensitivity_multiplier"].apply(lambda x: f"{x:.1f}x")
-        map_pts["radius"] = map_pts["storm_sensitivity_multiplier"] * 100
-
-    # Color mapping for scatterplot bubbles: Red for severe multiplier, Amber for moderate
-    colors = []
-    for m in map_pts["storm_sensitivity_multiplier"]:
-        if m >= 7.0:
-            colors.append([220, 38, 38, 220])  # Red
-        elif m >= 5.0:
-            colors.append([245, 158, 11, 220])  # Amber
-        else:
-            colors.append([59, 130, 246, 200])  # Blue
-    map_pts["color"] = colors
-
-    # 1. Neighborhood Deep-Dive Selector
-    c_sel, c_stat1, c_stat2, c_stat3 = st.columns([1.5, 1, 1, 1])
-    with c_sel:
-        target_zip = st.selectbox(
-            "Select Neighborhood for Vulnerability Deep-Dive:",
-            options=map_pts["incident_zip"].tolist(),
-            format_func=lambda z: f"ZIP {z} — {map_pts[map_pts['incident_zip']==z]['boroname'].iloc[0]} (Multiplier: {map_pts[map_pts['incident_zip']==z]['storm_mult_str'].iloc[0]})",
-        )
-
-    z_data = map_pts[map_pts["incident_zip"] == target_zip].iloc[0]
-    with c_stat1:
-        st.metric("Storm Multiplier", f"{z_data['storm_sensitivity_multiplier']:.1f}x", "Surge in Rain")
-    with c_stat2:
-        st.metric("Borough", f"{z_data['boroname']}")
-    with c_stat3:
-        st.metric("Total Inflow", f"{z_data['total_complaints']:,} Calls")
-
-    # 2. Interactive Map with Official Borough GIS Outlines
-    st.markdown("---")
-    st.markdown("#### NYC Geographic Vulnerability & Official Borough GIS Boundaries")
-    st.caption("Renders full open-source street details (Carto Voyager) with official NYC Borough boundaries (GeoJSON) and Census centroids.")
-
-    c_map1, c_map2, c_map3 = st.columns([1.5, 1.5, 2])
-    show_borough_layer = c_map1.checkbox("🗺️ Show Official Borough GIS Outlines", value=True)
-    show_point_layer = c_map2.checkbox("📍 Show Neighborhood Fragility Centroids", value=True)
-    map_theme = c_map3.selectbox(
-        "Map Detail Style",
-        options=["Detailed Street Map (Roads & Parks)", "Clean Light", "Dark High-Contrast"],
-        index=0,
-    )
-
-    style_map = {
-        "Detailed Street Map (Roads & Parks)": pdk.map_styles.CARTO_ROAD,
-        "Clean Light": pdk.map_styles.CARTO_LIGHT,
-        "Dark High-Contrast": pdk.map_styles.CARTO_DARK,
+@st.cache_data(show_spinner="Loading data...")
+def load_marts():
+    """Load the three Gold marts and the ZIP centroid reference table."""
+    paths = {
+        "demand": _find_mart("gold_daily_service_demand"),
+        "perf": _find_mart("gold_agency_resolution_performance"),
+        "zip": _find_mart("gold_zip_infrastructure_vulnerability"),
     }
-    selected_style = style_map.get(map_theme, pdk.map_styles.CARTO_ROAD)
+    missing = [k for k, v in paths.items() if v is None]
+    if missing:
+        return None, None, None, None, missing
 
-    deck_layers = []
-
-    # Layer 1: Borough Outlines (NO fill, 100% streets visible)
-    if show_borough_layer and geojson_boroughs is not None:
-        borough_geojson_layer = pdk.Layer(
-            "GeoJsonLayer",
-            data=geojson_boroughs,
-            opacity=1.0,
-            stroked=True,
-            filled=False,
-            get_line_color="""
-                properties.borocode == '1' ? [0, 136, 204, 255] :
-                properties.borocode == '2' ? [230, 126, 34, 255] :
-                properties.borocode == '3' ? [41, 128, 185, 255] :
-                properties.borocode == '4' ? [39, 174, 96, 255] :
-                [192, 57, 43, 255]
-            """,
-            get_line_width=45,
-            pickable=True,
-        )
-        deck_layers.append(borough_geojson_layer)
-
-    # Layer 2: Vulnerability Scatterplot
-    if show_point_layer and not map_pts.empty:
-        scatterplot_pts_layer = pdk.Layer(
-            "ScatterplotLayer",
-            data=map_pts,
-            get_position=["longitude", "latitude"],
-            get_radius="radius",
-            get_fill_color="color",
-            stroked=True,
-            get_line_color=[255, 255, 255, 240],
-            get_line_width=15,
-            pickable=True,
-        )
-        deck_layers.append(scatterplot_pts_layer)
-
-    try:
-        view_state = pdk.ViewState(
-            latitude=40.7128,
-            longitude=-73.9600,
-            zoom=9.8,
-            pitch=10,
-            bearing=0,
-        )
-        deck = pdk.Deck(
-            layers=deck_layers,
-            initial_view_state=view_state,
-            tooltip={
-                "html": "<b>{boroname}</b><br/>ZIP: <b>{incident_zip}</b><br/>Storm Multiplier: <b>{storm_mult_str}</b><br/>Inflow: {total_complaints}"
-            },
-            map_style=selected_style,
-        )
-        st.pydeck_chart(deck, use_container_width=True)
-    except Exception as e:
-        st.warning(f"Map fell back to standard mode: {e}")
-        if not map_pts.empty and "latitude" in map_pts.columns:
-            st.map(map_pts[["latitude", "longitude"]])
-
-    # 3. Top Vulnerable Neighborhoods Leaderboard
-    st.markdown("#### NYC Infrastructure Fragility Leaderboard")
-    st.dataframe(
-        map_pts.sort_values(by="storm_sensitivity_multiplier", ascending=False)[
-            ["incident_zip", "boroname", "storm_sensitivity_multiplier", "total_complaints"]
-        ].rename(columns={"incident_zip": "ZIP Code", "boroname": "Borough", "storm_sensitivity_multiplier": "Storm Sensitivity Multiplier", "total_complaints": "Total Complaint Inflow"}),
-        hide_index=True,
-        use_container_width=True,
+    demand = pd.read_parquet(paths["demand"])
+    demand["date"] = pd.to_datetime(demand["date"])
+    demand["borough"] = demand["borough"].astype(str).str.title()
+    demand["service_area"] = (
+        demand["canonical_service_domain"].map(SERVICE_AREA_LABELS)
+        .fillna(demand["canonical_service_domain"].astype(str))
     )
 
+    perf = pd.read_parquet(paths["perf"])
+    perf["reporting_date"] = pd.to_datetime(perf["reporting_date"])
+    perf["borough"] = perf["borough"].astype(str).str.title()
+
+    zips = pd.read_parquet(paths["zip"])
+    zips["borough"] = zips["borough"].astype(str).str.title()
+    zips["incident_zip"] = zips["incident_zip"].astype(str)
+
+    p_cent = REF_DIR / "nyc_zip_centroids.parquet"
+    centroids = pd.read_parquet(p_cent) if p_cent.exists() else None
+    if centroids is not None:
+        centroids["zip5"] = centroids["zip5"].astype(str)
+    return demand, perf, zips, centroids, []
+
+
+@st.cache_data(show_spinner=False)
+def load_quality():
+    """Latest pipeline run report + the review ledgers."""
+    report, taxonomy, resolutions = None, None, None
+    if QUALITY_DIR.exists():
+        reports = sorted(QUALITY_DIR.glob("silver_quality_*.json"))  # timestamp in name
+        if reports:
+            try:
+                report = json.loads(reports[-1].read_text(encoding="utf-8"))
+            except Exception:
+                report = None
+        p_tax = QUALITY_DIR / "unmapped_complaint_taxonomy_ledger.parquet"
+        p_res = QUALITY_DIR / "unclassified_resolutions_ledger.parquet"
+        if p_tax.exists():
+            taxonomy = pd.read_parquet(p_tax)
+        if p_res.exists():
+            resolutions = pd.read_parquet(p_res)
+    return report, taxonomy, resolutions
+
+
+demand, perf, zips, centroids, missing_marts = load_marts()
+if missing_marts:
+    st.error(
+        f"Gold data not found: {', '.join(missing_marts)}. "
+        "Run `python run_gold.py --env dev` first, then reload this page."
+    )
+    st.stop()
+
+DATA_MIN: date = demand["date"].min().date()
+DATA_MAX: date = demand["date"].max().date()
+_weather_dates = demand.loc[demand["total_precipitation_mm"].notna(), "date"]
+WEATHER_MIN: Optional[date] = _weather_dates.min().date() if len(_weather_dates) else None
+WEATHER_MAX: Optional[date] = _weather_dates.max().date() if len(_weather_dates) else None
+
 
 # =============================================================================
-# TAB 4: LAKEHOUSE OBSERVABILITY & DRIFT GOVERNANCE
+# 3. SMALL HELPERS
 # =============================================================================
-with tab4:
-    st.subheader("Data Observability, Anomaly Quarantines & Schema Drift")
-    st.markdown(
-        "Monitors upstream data contracts, API schema drift, spatial-temporal reconciliation, and physical sensor validity."
+def fmt_date(d: date, year: bool = True) -> str:
+    return f"{d.day} {d.strftime('%b')}" + (f" {d.year}" if year else "")
+
+
+def fmt_int(n) -> str:
+    return f"{int(round(n)):,}"
+
+
+def fmt_hours(h: Optional[float]) -> str:
+    if h is None or pd.isna(h):
+        return "n/a"
+    return f"{h:.1f} hours" if h < 48 else f"{h / 24:.1f} days"
+
+
+def safe_div(a, b, scale: float = 1.0) -> float:
+    return float(a) / float(b) * scale if b else 0.0
+
+
+def wmedian(values: pd.Series, weights: pd.Series) -> Optional[float]:
+    """Weighted median (used to combine daily medians without being skewed by outliers)."""
+    mask = values.notna() & weights.notna() & (weights > 0)
+    if not mask.any():
+        return None
+    v, w = values[mask].to_numpy(), weights[mask].to_numpy(dtype=float)
+    order = np.argsort(v)
+    v, w = v[order], w[order]
+    cum = np.cumsum(w)
+    return float(v[np.searchsorted(cum, cum[-1] / 2.0)])
+
+
+def delta_pct(cur, prev, label: Optional[str]) -> Optional[str]:
+    if label is None or not prev:
+        return None
+    return f"{(cur - prev) / prev * 100:+.1f}% vs {label}"
+
+
+def delta_pts(cur, prev, label: Optional[str]) -> Optional[str]:
+    if label is None or prev is None:
+        return None
+    return f"{cur - prev:+.1f} pts vs {label}"
+
+
+def style_fig(fig: go.Figure, height: int = 380) -> go.Figure:
+    fig.update_layout(
+        template="plotly_white",
+        height=height,
+        margin=dict(l=10, r=10, t=40, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        font=dict(size=13),
+    )
+    return fig
+
+
+def show(fig: go.Figure) -> None:
+    st.plotly_chart(fig, width="stretch")
+
+
+def takeaway(text: str) -> None:
+    st.markdown(f'<div class="takeaway">💡 {text}</div>', unsafe_allow_html=True)
+
+
+# =============================================================================
+# 4. GLOBAL SCOPE (sidebar) - one scope for the whole dashboard
+# =============================================================================
+class Scope:
+    def __init__(self, kind, start, end, label, prev_start, prev_end, prev_label, note):
+        self.kind, self.start, self.end, self.label = kind, start, end, label
+        self.prev_start, self.prev_end, self.prev_label = prev_start, prev_end, prev_label
+        self.note = note
+        self.n_days = (end - start).days + 1
+
+
+def build_scope() -> Scope:
+    st.sidebar.title("🗽 NYC 311")
+    st.sidebar.caption("Service requests & weather | DAT535 Group 13")
+    st.sidebar.subheader("Time scope")
+    kind = st.sidebar.radio(
+        "Show data for", ["All time", "Month", "Week", "Day"], index=1, horizontal=True,
+        help="This choice applies to every page, except where a page says otherwise.",
     )
 
-    # 1. Medallion Pipeline Architecture Flow
-    st.markdown("#### End-to-End Medallion Pipeline Lineage & Volume Reconciliation")
-    bronze_cnt = 218840
-    silver_cnt = 189679
-    quarantine_cnt = 26725
-    if quality_report and "stages" in quality_report and "311_cleaning" in quality_report["stages"]:
-        stg = quality_report["stages"]["311_cleaning"]
-        bronze_cnt = stg.get("input_rows", bronze_cnt)
-        silver_cnt = stg.get("valid_rows_accepted", silver_cnt)
-        quarantine_cnt = stg.get("quarantined_rows", 0) + stg.get("duplicate_rows_removed", 0)
-
-    m_col1, m_col2, m_col3, m_col4 = st.columns(4)
-
-    with m_col1:
-        st.markdown(
-            f"""
-            <div class="metric-card" style="border-left: 5px solid #d97706;">
-                <div class="metric-label">🥉 Bronze Raw Ingestion</div>
-                <div class="metric-val">{bronze_cnt:,}</div>
-                <div class="metric-sub">Append-Only Parquet</div>
-            </div>
-        """,
-            unsafe_allow_html=True,
+    note = ""
+    if kind == "All time":
+        start, end = DATA_MIN, DATA_MAX
+        label = f"All time ({fmt_date(start)} to {fmt_date(end)})"
+    elif kind == "Month":
+        months = list(pd.period_range(DATA_MIN, DATA_MAX, freq="M"))[::-1]
+        chosen = st.sidebar.selectbox("Month", months, format_func=lambda p: p.strftime("%B %Y"))
+        start = max(chosen.start_time.date(), DATA_MIN)
+        month_end = chosen.end_time.date()
+        end = min(month_end, DATA_MAX)
+        label = chosen.strftime("%B %Y")
+        if end < month_end:
+            note = f"Data ends {fmt_date(end)}, so this month is incomplete."
+            label += f" (1-{fmt_date(end, year=False)})"
+    elif kind == "Week":
+        weeks, mon = [], DATA_MIN - timedelta(days=DATA_MIN.weekday())
+        while mon <= DATA_MAX:
+            weeks.append(mon)
+            mon += timedelta(days=7)
+        mon = st.sidebar.selectbox(
+            "Week (Mon-Sun)", weeks[::-1],
+            format_func=lambda m: f"{fmt_date(m, False)} - {fmt_date(m + timedelta(days=6))}",
         )
+        start, end = max(mon, DATA_MIN), min(mon + timedelta(days=6), DATA_MAX)
+        label = f"Week of {fmt_date(start, False)} - {fmt_date(end)}"
+        if (end - start).days < 6:
+            note = "This week is only partly covered by the data."
+    else:
+        day = st.sidebar.date_input("Day", value=DATA_MAX, min_value=DATA_MIN, max_value=DATA_MAX)
+        start = end = day
+        label = day.strftime("%A, %d %B %Y")
 
-    with m_col2:
-        st.markdown(
-            f"""
-            <div class="metric-card" style="border-left: 5px solid #94a3b8;">
-                <div class="metric-label">🥈 Silver Conformed</div>
-                <div class="metric-val">{silver_cnt:,}</div>
-                <div class="metric-sub">Deduplicated & Imputed</div>
-            </div>
-        """,
-            unsafe_allow_html=True,
-        )
-
-    with m_col3:
-        st.markdown(
-            f"""
-            <div class="metric-card" style="border-left: 5px solid #ef4444;">
-                <div class="metric-label">⚠️ Quarantined / Duplicates</div>
-                <div class="metric-val">{quarantine_cnt:,}</div>
-                <div class="metric-sub">Clock-Skew & CDC Dumps</div>
-            </div>
-        """,
-            unsafe_allow_html=True,
-        )
-
-    with m_col4:
-        st.markdown(
-            """
-            <div class="metric-card" style="border-left: 5px solid #eab308;">
-                <div class="metric-label">🥇 Gold Analytical Marts</div>
-                <div class="metric-val">100.0%</div>
-                <div class="metric-sub">Reconciled Zero-Loss</div>
-            </div>
-        """,
-            unsafe_allow_html=True,
-        )
-
-    st.markdown("")
-
-    # 2. Quality Ledgers Grid
-    q_col1, q_col2, q_col3 = st.columns(3)
-
-    with q_col1:
-        st.markdown("#### Physical Sensor Quality Ledger (`sensor_anomaly_ledger.parquet`)")
-        st.caption("Quarantines frozen weather sensor probes, unrealistic barometric drops, and physical coordinate anomalies.")
-        if df_sensor is not None and not df_sensor.empty:
-            st.dataframe(df_sensor.head(15), use_container_width=True)
-            st.metric("Total Flagged Sensor Anomalies", f"{len(df_sensor):,}")
-            st.download_button(
-                "📥 Export Sensor Ledger (CSV)",
-                data=df_sensor.to_csv(index=False),
-                file_name="sensor_anomaly_ledger.csv",
-                mime="text/csv",
-            )
+    # Comparison period: same position/length in the previous month / week / day
+    prev_start = prev_end = prev_label = None
+    if kind != "All time":
+        span = end - start
+        if kind == "Month":
+            ps = (pd.Timestamp(start) - pd.DateOffset(months=1)).date().replace(day=1)
+        elif kind == "Week":
+            ps = start - timedelta(days=7)
         else:
-            st.success("✅ Clean: Zero physical sensor anomalies detected in active quality ledger.")
-
-    with q_col2:
-        st.markdown("#### Unmapped Semantic Taxonomy Ledger (`unmapped_complaint_taxonomy_ledger`)")
-        st.caption("Active schema drift governance catching new complaint types escaping the 10 Canonical Domains.")
-        if df_tax_ledger is not None and not df_tax_ledger.empty:
-            st.dataframe(df_tax_ledger.head(15), use_container_width=True)
-            st.metric("Unmapped Categories Logged", f"{len(df_tax_ledger):,}")
-        else:
-            st.success(
-                "✅ All complaint types fully conformed to the 10 Canonical Invariant Domains."
+            ps = start - timedelta(days=1)
+        if ps >= DATA_MIN:
+            prev_start, prev_end = ps, ps + span
+            prev_label = (
+                fmt_date(ps) if kind == "Day"
+                else f"{fmt_date(ps, False)}-{fmt_date(prev_end)}"
             )
 
-    with q_col3:
-        st.markdown("#### Unclassified Resolutions Ledger (`unclassified_resolutions_ledger`)")
-        st.caption("Active text mining governance capturing novel agency boilerplates escaping the 8 outcome categories.")
-        if df_res_ledger is not None and not df_res_ledger.empty:
-            st.dataframe(df_res_ledger.head(15), use_container_width=True)
-            st.metric("Novel Boilerplates Ledgered", f"{len(df_res_ledger):,}")
-        else:
-            st.success(
-                "✅ All closed ticket resolution texts conformed to operational classification models."
-            )
+    st.sidebar.subheader("Boroughs")
+    return Scope(kind, start, end, label, prev_start, prev_end, prev_label, note)
 
-    st.markdown("---")
-    st.markdown("#### Structural Schema Evolution Watchdog (DDL Contract Audit)")
-    st.caption("Automatically detects additions, drops, or type alterations across Socrata NYC 311 API ingestion batches.")
 
-    st.code(
-        """
-[UPSTREAM CONTRACT EVOLUTION LOG - NYC SOCRATA API]
-• 2026-10-12 | Batch 012 | Ingestion Watermark: 2026-10-12T00:00:00Z
-  - EVENT: Column Added: 'descriptor_2' (StringType -> "Additional Details")
-  - ACTION: Non-breaking schema merge applied; backfilled as NULL for historical partitions.
-  - CONTRACT STATUS: VALID (Backward Compatible)
+scope = build_scope()
 
-• 2026-10-24 | Batch 018 | Ingestion Watermark: 2026-10-24T00:00:00Z
-  - EVENT: UI Label Rename: 'Complaint Type' display alias updated to 'Problem'
-  - ACTION: Canonical PySpark schema maps source field 'complaint_type' deterministically.
-  - CONTRACT STATUS: VALID (Field Name Canonicalized)
+all_boroughs = sorted(demand["borough"].unique().tolist())
+selected_boroughs = st.sidebar.multiselect(
+    "Include boroughs", all_boroughs, default=all_boroughs,
+    help="'Unspecified' = requests with no usable borough in the source data.",
+) or all_boroughs
+borough_text = "All boroughs" if len(selected_boroughs) == len(all_boroughs) else ", ".join(selected_boroughs)
 
-• 2026-11-06 | Batch 024 | Ingestion Watermark: 2026-11-06T00:00:00Z
-  - EVENT: Upstream Open-Meteo ERA5T publication lag verified at D-5.
-  - ACTION: Rolling CDC window safely decouples 311 ingestion (D-1) from weather join (D-5).
-  - CONTRACT STATUS: VALID (Zero Incomplete Joins)
-        """,
-        language="text",
+st.sidebar.markdown("---")
+st.sidebar.caption(
+    f"**Data coverage**  \n311 requests: {fmt_date(DATA_MIN)} to {fmt_date(DATA_MAX)}  \n"
+    + (
+        f"Weather: {fmt_date(WEATHER_MIN)} to {fmt_date(WEATHER_MAX)}"
+        if WEATHER_MIN else "Weather: not available"
     )
-
-
-# =============================================================================
-# FOOTER
-# =============================================================================
-st.markdown("---")
-st.caption(
-    "DAT535 Data Engineering Medallion Project | Group 13 | PySpark 3.5.x | Enterprise Lakehouse Architecture"
 )
+
+# Borough-filtered base tables (time filtering is applied per page via `window`)
+dem_b = demand[demand["borough"].isin(selected_boroughs)]
+perf_b = perf[perf["borough"].isin(selected_boroughs)]
+
+
+def window(df: pd.DataFrame, col: str, start: date, end: date) -> pd.DataFrame:
+    return df[(df[col] >= pd.Timestamp(start)) & (df[col] <= pd.Timestamp(end))]
+
+
+def banner(extra: str = "") -> None:
+    """The scope statement shown at the top of every page."""
+    st.markdown(
+        f'<div class="scope-banner">📅 Showing <b>{scope.label}</b> &nbsp;|&nbsp; '
+        f"🗺️ <b>{borough_text}</b>"
+        + (f" &nbsp;|&nbsp; {extra}" if extra else "")
+        + "</div>",
+        unsafe_allow_html=True,
+    )
+    if scope.note:
+        st.caption(f"⚠️ {scope.note}")
+
+
+def warning_banner(text: str) -> None:
+    st.markdown(f'<div class="scope-warning">⚠️ {text}</div>', unsafe_allow_html=True)
+
+
+def trend_window() -> tuple[date, date, Optional[date], str]:
+    """Date range for time-series charts. A single day gets 14 days of context."""
+    if scope.kind == "Day":
+        s = max(DATA_MIN, scope.end - timedelta(days=13))
+        return s, scope.end, scope.end, "Trend shows the 14 days up to the selected day (selected day shaded)."
+    return scope.start, scope.end, None, ""
+
+
+def daily_totals(df: pd.DataFrame, date_col: str, cols: list[str]) -> pd.DataFrame:
+    """Daily sums over the FULL data range (zero-filled), so rolling averages are correct at the edges."""
+    daily = df.groupby(date_col)[cols].sum()
+    full = pd.date_range(DATA_MIN, DATA_MAX, freq="D")
+    return daily.reindex(full, fill_value=0).rename_axis("date")
+
+
+# =============================================================================
+# 5. PAGE HEADER
+# =============================================================================
+st.title("NYC 311: What residents report, and how the city responds")
+tab_overview, tab_weather, tab_agency, tab_zip, tab_quality = st.tabs(
+    [
+        "📊 Overview",
+        "🌧️ Weather & demand",
+        "🏛️ Agency performance",
+        "📍 Neighborhoods (ZIP)",
+        "🛡️ Data quality",
+    ]
+)
+
+# =============================================================================
+# 6. OVERVIEW
+# =============================================================================
+with tab_overview:
+    banner()
+    cur = window(dem_b, "date", scope.start, scope.end)
+    prv = (
+        window(dem_b, "date", scope.prev_start, scope.prev_end)
+        if scope.prev_start else None
+    )
+
+    if cur.empty:
+        st.info("No 311 requests for this selection. Try a wider time scope or more boroughs.")
+    else:
+        calls = cur["complaint_count"].sum()
+        incidents = cur["distinct_incidents_count"].sum()
+        repeats = cur["duplicate_burst_calls_count"].sum()
+        closed = cur["closed_complaint_count"].sum()
+        repeat_share = safe_div(repeats, calls, 100)
+        closed_share = safe_div(closed, calls, 100)
+
+        p_calls = prv["complaint_count"].sum() if prv is not None else None
+        p_inc = prv["distinct_incidents_count"].sum() if prv is not None else None
+        p_rep_share = (
+            safe_div(prv["duplicate_burst_calls_count"].sum(), p_calls, 100) if prv is not None else None
+        )
+        p_closed_share = (
+            safe_div(prv["closed_complaint_count"].sum(), p_calls, 100) if prv is not None else None
+        )
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric(
+            "Requests received", fmt_int(calls),
+            delta_pct(calls, p_calls, scope.prev_label), delta_color="off",
+            help="Every 311 request logged in the period (one row = one request).",
+        )
+        k2.metric(
+            "Distinct problems", fmt_int(incidents),
+            delta_pct(incidents, p_inc, scope.prev_label), delta_color="off",
+            help="Requests left after merging repeat reports of the same problem at the same place "
+                 "close in time (e.g. five neighbours reporting one flooded street = 1 problem).",
+        )
+        k3.metric(
+            "Repeat reports", f"{repeat_share:.1f}%",
+            delta_pts(repeat_share, p_rep_share, scope.prev_label), delta_color="off",
+            help=f"{fmt_int(repeats)} of the requests were repeat reports of a problem already "
+                 "reported. Requests = distinct problems + repeat reports.",
+        )
+        k4.metric(
+            "Resolved so far", f"{closed_share:.1f}%",
+            delta_pts(closed_share, p_closed_share, scope.prev_label), delta_color="normal",
+            help="Share of the requests received in this period that are now closed "
+                 "(measured at the latest data date, so recent periods look lower).",
+        )
+        if scope.n_days > 1:
+            k5.metric(
+                "Average per day", fmt_int(calls / scope.n_days),
+                delta_pct(calls / scope.n_days, (p_calls / ((scope.prev_end - scope.prev_start).days + 1)) if p_calls else None, scope.prev_label),
+                delta_color="off", help="Requests received per calendar day in this period.",
+            )
+        else:
+            top_type = cur.groupby("complaint_type")["complaint_count"].sum().idxmax()
+            k5.metric("Most common complaint", top_type)
+
+        # ---- Trend ---------------------------------------------------------
+        t_start, t_end, shade, t_note = trend_window()
+        series = daily_totals(dem_b, "date", ["complaint_count", "distinct_incidents_count"])
+        series["avg7"] = series["complaint_count"].rolling(7, min_periods=1).mean()
+        view = series.loc[pd.Timestamp(t_start):pd.Timestamp(t_end)].reset_index()
+
+        st.markdown("#### How many requests come in each day?")
+        fig = go.Figure()
+        fig.add_bar(
+            x=view["date"], y=view["complaint_count"], name="Requests received",
+            marker_color=BLUE, opacity=0.7,
+            hovertemplate="%{x|%a %d %b %Y}<br>%{y:,} requests<extra></extra>",
+        )
+        fig.add_scatter(
+            x=view["date"], y=view["distinct_incidents_count"], name="Distinct problems",
+            line=dict(color=DARK_BLUE, width=2),
+            hovertemplate="%{x|%a %d %b %Y}<br>%{y:,} distinct problems<extra></extra>",
+        )
+        fig.add_scatter(
+            x=view["date"], y=view["avg7"], name="7-day average (requests)",
+            line=dict(color=ORANGE, width=3, dash="dash"),
+            hovertemplate="%{x|%a %d %b %Y}<br>%{y:,.0f} avg<extra></extra>",
+        )
+        if shade:
+            fig.add_vrect(
+                x0=pd.Timestamp(shade) - pd.Timedelta(hours=12),
+                x1=pd.Timestamp(shade) + pd.Timedelta(hours=12),
+                fillcolor=ORANGE, opacity=0.2, line_width=0,
+            )
+        fig.update_yaxes(title="Requests per day", rangemode="tozero")
+        show(style_fig(fig, 380))
+        if t_note:
+            st.caption(t_note)
+        if scope.n_days > 1:
+            peak = cur.groupby("date")["complaint_count"].sum()
+            takeaway(
+                f"Busiest day: <b>{peak.idxmax():%A %d %b}</b> with <b>{fmt_int(peak.max())}</b> requests "
+                f"({peak.max() / peak.mean():.2f}x the daily average of {fmt_int(peak.mean())})."
+            )
+
+        # ---- Where & what ----------------------------------------------------
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("#### Which boroughs generate the requests?")
+            by_b = cur.groupby("borough")["complaint_count"].sum().reset_index()
+            f = px.pie(
+                by_b, names="borough", values="complaint_count", hole=0.55,
+                color_discrete_sequence=px.colors.qualitative.Safe,
+            )
+            f.update_traces(textinfo="label+percent", hovertemplate="%{label}: %{value:,} requests<extra></extra>")
+            f.update_layout(showlegend=False)
+            show(style_fig(f, 340))
+            st.caption("Raw request counts (not adjusted for population).")
+        with c2:
+            st.markdown("#### Which services do residents ask for?")
+            by_a = (
+                cur.groupby("service_area")["complaint_count"].sum()
+                .sort_values().reset_index()
+            )
+            by_a["share"] = by_a["complaint_count"] / by_a["complaint_count"].sum() * 100
+            f = px.bar(
+                by_a, x="complaint_count", y="service_area", orientation="h",
+                text=by_a["share"].map(lambda s: f"{s:.0f}%"),
+                color_discrete_sequence=[DARK_BLUE],
+            )
+            f.update_traces(hovertemplate="%{y}: %{x:,} requests<extra></extra>", textposition="outside")
+            f.update_layout(xaxis_title="Requests", yaxis_title=None)
+            show(style_fig(f, 340))
+
+        c3, c4 = st.columns(2)
+        with c3:
+            st.markdown("#### Top 10 complaint types")
+            top = (
+                cur.groupby("complaint_type")["complaint_count"].sum()
+                .nlargest(10).sort_values().reset_index()
+            )
+            f = px.bar(top, x="complaint_count", y="complaint_type", orientation="h",
+                       color_discrete_sequence=[BLUE])
+            f.update_traces(hovertemplate="%{y}: %{x:,} requests<extra></extra>")
+            f.update_layout(xaxis_title="Requests", yaxis_title=None)
+            show(style_fig(f, 380))
+        with c4:
+            st.markdown("#### Which day of the week is busiest?")
+            if scope.n_days >= 7:
+                per_day = cur.groupby("date")["complaint_count"].sum().reset_index()
+                per_day["dow"] = per_day["date"].dt.dayofweek
+                dow = per_day.groupby("dow")["complaint_count"].mean().reindex(range(7)).reset_index()
+                dow["day"] = WEEKDAYS
+                f = px.bar(
+                    dow, x="day", y="complaint_count",
+                    color=["Weekend" if i >= 5 else "Weekday" for i in range(7)],
+                    color_discrete_map={"Weekday": DARK_BLUE, "Weekend": ORANGE},
+                )
+                f.update_traces(hovertemplate="%{x}: %{y:,.0f} requests per day<extra></extra>")
+                f.update_layout(xaxis_title=None, yaxis_title="Average requests per day", legend_title=None)
+                show(style_fig(f, 380))
+            else:
+                st.info("Choose a Month or All time scope to see weekday patterns (needs at least 7 days).")
+
+        st.markdown("#### What does each borough mostly ask for?")
+        pv = cur.pivot_table(index="service_area", columns="borough", values="complaint_count",
+                             aggfunc="sum", fill_value=0)
+        share = pv.div(pv.sum(axis=0).replace(0, np.nan), axis=1) * 100
+        order = share.mean(axis=1).sort_values(ascending=False).index
+        share = share.loc[order]
+        f = go.Figure(go.Heatmap(
+            z=share.values, x=share.columns.tolist(), y=share.index.tolist(),
+            colorscale="Blues", text=np.round(share.values, 0), texttemplate="%{text:.0f}%",
+            hovertemplate="%{x} | %{y}: %{z:.1f}% of that borough's requests<extra></extra>",
+            colorbar=dict(title="% of borough"),
+        ))
+        f.update_yaxes(autorange="reversed")
+        show(style_fig(f, 420))
+        st.caption("Each column adds up to 100%: it shows the mix of services within a borough, so boroughs of different size can be compared.")
+
+# =============================================================================
+# 7. WEATHER & DEMAND
+# =============================================================================
+with tab_weather:
+    if WEATHER_MIN is None:
+        banner()
+        st.info("No weather data is available in the Gold demand table.")
+    else:
+        banner(f"🌦️ Weather data exists for {fmt_date(WEATHER_MIN)} - {fmt_date(WEATHER_MAX)} only")
+        w_start = max(scope.start, WEATHER_MIN)
+        w_end = min(scope.end, WEATHER_MAX)
+        if w_start > w_end:
+            st.info(
+                f"The selected scope has no weather data. Weather is only available for "
+                f"{fmt_date(WEATHER_MIN)} to {fmt_date(WEATHER_MAX)}. "
+                "Pick that period (for example the latest month) to see this page."
+            )
+        else:
+            if (w_start, w_end) != (scope.start, scope.end):
+                warning_banner(
+                    f"Only the part of your scope that has weather data is used here: "
+                    f"<b>{fmt_date(w_start)} to {fmt_date(w_end)}</b>."
+                )
+            areas = ["All service areas"] + sorted(demand["service_area"].unique().tolist())
+            focus = st.selectbox(
+                "Focus on a service area", areas,
+                help="Applies to the first three charts. The last comparison always shows all areas.",
+            )
+
+            # Weather per (day, weather grid cell): one row each, taken from the mart
+            wx = (
+                demand[demand["total_precipitation_mm"].notna()]
+                .groupby(["date", "grid_id"], as_index=False)
+                .agg(
+                    rain=("total_precipitation_mm", "first"),
+                    wind=("max_wind_gust_ms", "first"),
+                    temp=("avg_temperature_c", "first"),
+                )
+            )
+            grids_in_scope = set(dem_b["grid_id"].unique())
+            wx = wx[wx["grid_id"].isin(grids_in_scope)]
+            wx = wx[(wx["date"] >= pd.Timestamp(w_start)) & (wx["date"] <= pd.Timestamp(w_end))]
+            wx["condition"] = pd.cut(
+                wx["rain"], [-np.inf, 1.0, STORM_MM, np.inf], right=False, labels=WEATHER_CONDITIONS
+            )
+            idx = pd.MultiIndex.from_frame(wx[["date", "grid_id"]])
+
+            def calls_per_cell_day(area: Optional[str]) -> pd.Series:
+                sub = window(dem_b, "date", w_start, w_end)
+                if area:
+                    sub = sub[sub["service_area"] == area]
+                s = sub.groupby(["date", "grid_id"])["complaint_count"].sum()
+                return s.reindex(idx, fill_value=0).to_numpy()
+
+            wx["calls"] = calls_per_cell_day(None if focus == "All service areas" else focus)
+            wx["day_type"] = np.where(wx["date"].dt.dayofweek >= 5, "Weekend", "Weekday")
+
+            if len(wx) < 5:
+                st.info("Not enough weather observations in this selection for a reliable comparison.")
+            else:
+                n_cells = wx["grid_id"].nunique()
+                st.caption(
+                    f"Unit of analysis: one **weather grid cell on one day** (about 10 km x 10 km). "
+                    f"{len(wx):,} cell-days across {n_cells} cells and "
+                    f"{wx['date'].nunique()} days. 'Rain' = total rainfall that day in that cell."
+                )
+
+                cond = wx.groupby("condition", observed=True).agg(
+                    avg_calls=("calls", "mean"), cell_days=("calls", "size")
+                ).reindex(WEATHER_CONDITIONS)
+                dry = cond.loc[WEATHER_CONDITIONS[0], "avg_calls"]
+                wet_mask = wx["condition"] != WEATHER_CONDITIONS[0]
+                wet_avg = wx.loc[wet_mask, "calls"].mean() if wet_mask.any() else np.nan
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Rainiest day", f"{wx.groupby('date')['rain'].mean().max():.1f} mm",
+                          help="Highest average rainfall across the weather grid cells on a single day.")
+                m2.metric("Cell-days with rain (1 mm+)", f"{safe_div(wet_mask.sum(), len(wx), 100):.0f}%")
+                m3.metric(
+                    "Requests per cell-day, dry", f"{dry:.1f}" if pd.notna(dry) else "n/a",
+                    help="Average requests per weather grid cell per day when it was dry (under 1 mm).",
+                )
+                m4.metric(
+                    "Requests per cell-day, rainy",
+                    f"{wet_avg:.1f}" if pd.notna(wet_avg) else "n/a",
+                    f"{(wet_avg / dry - 1) * 100:+.0f}% vs dry" if pd.notna(wet_avg) and dry else None,
+                    delta_color="off",
+                    help="Same measure on days with 1 mm or more of rain.",
+                )
+
+                # ---- Daily timeline: rain vs requests
+                st.markdown("#### Do request volumes move with the rain?")
+                daily = wx.groupby("date").agg(rain=("rain", "mean"), calls=("calls", "sum")).reset_index()
+                fig = make_subplots(specs=[[{"secondary_y": True}]])
+                fig.add_bar(
+                    x=daily["date"], y=daily["rain"], name="Rain (avg across cells, mm)",
+                    marker_color=BLUE, opacity=0.55,
+                    hovertemplate="%{x|%a %d %b}<br>%{y:.1f} mm<extra></extra>",
+                    secondary_y=True,
+                )
+                fig.add_scatter(
+                    x=daily["date"], y=daily["calls"], name="Requests received",
+                    line=dict(color=DARK_BLUE, width=3), mode="lines+markers",
+                    hovertemplate="%{x|%a %d %b}<br>%{y:,} requests<extra></extra>",
+                    secondary_y=False,
+                )
+                fig.update_yaxes(title_text="Requests per day", rangemode="tozero", secondary_y=False)
+                fig.update_yaxes(title_text="Rainfall (mm)", rangemode="tozero", showgrid=False, secondary_y=True)
+                show(style_fig(fig, 380))
+                st.caption("Bars = rain, line = requests. Totals cover only grid cells with weather data.")
+
+                # ---- Scatter + condition bars
+                s1, s2 = st.columns(2)
+                with s1:
+                    st.markdown("#### More rain, more requests?")
+                    f = px.scatter(
+                        wx, x="rain", y="calls", color="condition", opacity=0.6,
+                        category_orders={"condition": WEATHER_CONDITIONS},
+                        color_discrete_map=dict(zip(WEATHER_CONDITIONS, [GREY, BLUE, RED])),
+                        hover_data={"date": "|%d %b", "grid_id": True, "rain": ":.1f", "calls": True},
+                        labels={"rain": "Rain that day (mm)", "calls": "Requests that day", "condition": ""},
+                    )
+                    if wx["rain"].nunique() > 2:
+                        slope, intercept = np.polyfit(wx["rain"], wx["calls"], 1)
+                        xs = np.array([wx["rain"].min(), wx["rain"].max()])
+                        f.add_scatter(x=xs, y=slope * xs + intercept, mode="lines", name="Trend line",
+                                      line=dict(color="black", dash="dot"))
+                        r = np.corrcoef(wx["rain"], wx["calls"])[0, 1]
+                        trend_text = (
+                            f"Each extra 10 mm of rain goes with about <b>{slope * 10:+.1f}</b> requests per cell-day "
+                            f"(correlation r = {r:.2f}). This is an association, not proof of cause."
+                        )
+                    else:
+                        trend_text = ""
+                    show(style_fig(f, 380))
+                    if trend_text:
+                        takeaway(trend_text)
+                with s2:
+                    st.markdown("#### Average requests by weather type")
+                    cb = cond.reset_index()
+                    cb["label"] = cb.apply(
+                        lambda r: f"{r['avg_calls']:.1f}" if pd.notna(r["avg_calls"]) else "no data", axis=1
+                    )
+                    f = px.bar(
+                        cb, x="condition", y="avg_calls", text="label", color="condition",
+                        color_discrete_map=dict(zip(WEATHER_CONDITIONS, [GREY, BLUE, RED])),
+                        labels={"condition": "", "avg_calls": "Requests per cell-day"},
+                    )
+                    f.update_traces(textposition="outside")
+                    f.update_layout(showlegend=False)
+                    show(style_fig(f, 380))
+                    st.caption(
+                        "Number of cell-days behind each bar: "
+                        + " | ".join(f"{c.split(' (')[0]} {int(cond.loc[c, 'cell_days'])}" for c in WEATHER_CONDITIONS if pd.notna(cond.loc[c, "cell_days"]))
+                    )
+
+                # ---- Which services react to rain?
+                st.markdown("#### Which services react most to rain?")
+                sub = window(dem_b, "date", w_start, w_end)
+                per_area = sub.groupby(["service_area", "date", "grid_id"])["complaint_count"].sum()
+                rows = []
+                is_dry = (wx["condition"] == WEATHER_CONDITIONS[0]).to_numpy()
+                for area in sorted(sub["service_area"].unique()):
+                    vals = per_area.loc[area].reindex(idx, fill_value=0).to_numpy()
+                    d_avg = vals[is_dry].mean() if is_dry.any() else np.nan
+                    w_avg = vals[~is_dry].mean() if (~is_dry).any() else np.nan
+                    if pd.notna(d_avg) and d_avg >= 0.2 and (~is_dry).sum() >= 5:
+                        rows.append({"service_area": area, "change": (w_avg / d_avg - 1) * 100,
+                                     "dry": d_avg, "wet": w_avg})
+                if rows:
+                    sens = pd.DataFrame(rows).sort_values("change")
+                    sens["direction"] = np.where(sens["change"] >= 0, "More requests when rainy", "Fewer requests when rainy")
+                    f = px.bar(
+                        sens, x="change", y="service_area", orientation="h", color="direction",
+                        color_discrete_map={"More requests when rainy": ORANGE, "Fewer requests when rainy": GREY},
+                        hover_data={"dry": ":.1f", "wet": ":.1f", "change": ":.0f", "direction": False},
+                        labels={"change": "Change in requests per cell-day on rainy days (%)",
+                                "service_area": "", "dry": "Dry avg", "wet": "Rainy avg"},
+                    )
+                    f.add_vline(x=0, line_color="black")
+                    f.update_layout(legend_title=None)
+                    show(style_fig(f, 400))
+                    top_up = sens.iloc[-1]
+                    takeaway(
+                        f"<b>{top_up['service_area']}</b> reacts most to rain: "
+                        f"{top_up['change']:+.0f}% requests per cell-day on rainy days vs dry days "
+                        f"({top_up['dry']:.1f} to {top_up['wet']:.1f})."
+                    )
+                else:
+                    st.info("Not enough rainy days in this scope to compare services.")
+
+                # ---- Temperature
+                st.markdown("#### Does temperature matter?")
+                f = px.scatter(
+                    wx, x="temp", y="calls", color="day_type", opacity=0.55,
+                    color_discrete_map={"Weekday": DARK_BLUE, "Weekend": ORANGE},
+                    labels={"temp": "Average temperature that day (°C)", "calls": "Requests that day", "day_type": ""},
+                )
+                show(style_fig(f, 340))
+                st.caption("Weekend points are shown separately because weekends have a different baseline of requests.")
+
+# =============================================================================
+# 8. AGENCY PERFORMANCE
+# =============================================================================
+with tab_agency:
+    banner("Tickets are counted on the day they were closed (closures) or opened (new tickets)")
+    all_agencies = sorted(perf["agency"].unique().tolist())
+    with st.expander("Filter agencies", expanded=False):
+        sel_agencies = st.multiselect(
+            "Agencies", all_agencies, default=all_agencies,
+            format_func=lambda a: AGENCY_LABELS.get(a, a),
+        ) or all_agencies
+
+    pb = perf_b[perf_b["agency"].isin(sel_agencies)]
+    pc = window(pb, "reporting_date", scope.start, scope.end)
+    pp = window(pb, "reporting_date", scope.prev_start, scope.prev_end) if scope.prev_start else None
+
+    def closure_stats(frame: pd.DataFrame) -> dict:
+        closed = frame["tickets_closed_today"].sum()
+        fv = frame["field_verified_closed_today"].sum()
+        ph = frame["phantom_closed_today"].sum()
+        return {
+            "opened": frame["tickets_created_today"].sum(),
+            "closed": closed,
+            "fixed_pct": safe_div(fv, closed, 100),
+            "nofix_pct": safe_div(ph, closed, 100),
+            "hours": wmedian(frame["median_resolution_duration_hours"], frame["tickets_closed_today"]),
+        }
+
+    def backlog_snapshot(frame_all: pd.DataFrame, as_of: date) -> pd.DataFrame:
+        """Latest known backlog per (borough, agency) on or before `as_of`."""
+        sub = frame_all[frame_all["reporting_date"] <= pd.Timestamp(as_of)]
+        return sub.sort_values("reporting_date").groupby(["borough", "agency"]).tail(1)
+
+    cs = closure_stats(pc)
+    ps_ = closure_stats(pp) if pp is not None else None
+    snap = backlog_snapshot(pb, scope.end)
+    open_now = snap["active_open_backlog_count"].sum()
+    old_now = snap["long_open_backlog_count"].sum()
+    snap_prev = backlog_snapshot(pb, scope.prev_end) if scope.prev_end else None
+
+    if cs["closed"] == 0 and cs["opened"] == 0:
+        st.info("No ticket activity for this selection. Try a wider time scope.")
+    else:
+        a1, a2, a3, a4, a5 = st.columns(5)
+        a1.metric(
+            "Tickets closed", fmt_int(cs["closed"]),
+            delta_pct(cs["closed"], ps_["closed"] if ps_ else None, scope.prev_label), delta_color="off",
+            help="Tickets that were closed during the period (whenever they were opened).",
+        )
+        a2.metric(
+            "Typical time to close", fmt_hours(cs["hours"]),
+            help="Middle value (median) of the time from opening to closing; the daily medians are "
+                 "combined weighted by tickets closed. Medians are used because a few very old tickets "
+                 "would distort an average.",
+        )
+        a3.metric(
+            "Closed with a confirmed fix", f"{cs['fixed_pct']:.1f}%",
+            delta_pts(cs["fixed_pct"], ps_["fixed_pct"] if ps_ else None, scope.prev_label), delta_color="normal",
+            help="Closing note describes verified action on site (e.g. violation corrected, repaired).",
+        )
+        a4.metric(
+            "Closed without a confirmed fix", f"{cs['nofix_pct']:.1f}%",
+            delta_pts(cs["nofix_pct"], ps_["nofix_pct"] if ps_ else None, scope.prev_label), delta_color="inverse",
+            help="Closed, but the note does not show a verified fix: e.g. no violation found, duplicate, "
+                 "dismissed, or could not access. Not always a failure - but residents may not see a result.",
+        )
+        a5.metric(
+            "Open tickets (end of period)", fmt_int(open_now),
+            delta_pct(open_now, snap_prev["active_open_backlog_count"].sum() if snap_prev is not None else None, scope.prev_label),
+            delta_color="inverse",
+            help=f"Tickets still open at the end of the period. {safe_div(old_now, open_now, 100):.0f}% "
+                 f"({fmt_int(old_now)}) have been open for more than {LONG_OPEN_DAYS} days.",
+        )
+
+        # ---- Opened vs closed trend
+        t_start, t_end, shade, t_note = trend_window()
+        flow = daily_totals(pb, "reporting_date", ["tickets_created_today", "tickets_closed_today"])
+        flow["opened7"] = flow["tickets_created_today"].rolling(7, min_periods=1).mean()
+        flow["closed7"] = flow["tickets_closed_today"].rolling(7, min_periods=1).mean()
+        fv_ = flow.loc[pd.Timestamp(t_start):pd.Timestamp(t_end)].reset_index()
+        st.markdown("#### Is the city keeping up? New tickets vs tickets closed")
+        fig = go.Figure()
+        fig.add_scatter(x=fv_["date"], y=fv_["opened7"], name="New tickets (7-day avg)",
+                        line=dict(color=ORANGE, width=3),
+                        hovertemplate="%{x|%a %d %b}<br>%{y:,.0f} opened/day<extra></extra>")
+        fig.add_scatter(x=fv_["date"], y=fv_["closed7"], name="Tickets closed (7-day avg)",
+                        line=dict(color=GREEN, width=3),
+                        hovertemplate="%{x|%a %d %b}<br>%{y:,.0f} closed/day<extra></extra>")
+        if shade:
+            fig.add_vrect(x0=pd.Timestamp(shade) - pd.Timedelta(hours=12),
+                          x1=pd.Timestamp(shade) + pd.Timedelta(hours=12),
+                          fillcolor=ORANGE, opacity=0.2, line_width=0)
+        fig.update_yaxes(title="Tickets per day", rangemode="tozero")
+        show(style_fig(fig, 340))
+        if t_note:
+            st.caption(t_note)
+        st.caption("When the green line sits below the orange line, the open backlog is growing.")
+
+        # ---- Per-agency table
+        by_ag = []
+        for ag, g in pc.groupby("agency"):
+            row = closure_stats(g)
+            row["agency"] = ag
+            row["n_fixed"] = g["field_verified_closed_today"].sum()
+            row["n_nofix"] = g["phantom_closed_today"].sum()
+            row["n_other"] = max(row["closed"] - row["n_fixed"] - row["n_nofix"], 0)
+            by_ag.append(row)
+        ag_df = pd.DataFrame(by_ag)
+        bl = snap.groupby("agency")[["active_open_backlog_count", "long_open_backlog_count"]].sum()
+        if not ag_df.empty:
+            ag_df = ag_df.merge(bl, left_on="agency", right_index=True, how="left").fillna(
+                {"active_open_backlog_count": 0, "long_open_backlog_count": 0}
+            )
+            ag_df["name"] = ag_df["agency"].map(lambda a: AGENCY_LABELS.get(a, a))
+
+            min_closed = st.slider(
+                "Hide agencies with fewer closed tickets than", 0, 500, 50, step=10,
+                help="Small agencies produce noisy percentages.",
+            )
+            big = ag_df[ag_df["closed"] >= min_closed].sort_values("closed", ascending=False)
+
+            g1, g2 = st.columns(2)
+            with g1:
+                st.markdown("#### What happens when tickets are closed?")
+                if big.empty:
+                    st.info("No agency meets the minimum closed-ticket filter.")
+                else:
+                    top = big.head(12).iloc[::-1]
+                    f = go.Figure()
+                    for col, name, color in (
+                        ("n_fixed", "Confirmed fix", GREEN),
+                        ("n_other", "Outcome unclear", GREY),
+                        ("n_nofix", "No confirmed fix", RED),
+                    ):
+                        f.add_bar(
+                            y=top["name"], x=top[col] / top["closed"].replace(0, np.nan) * 100,
+                            name=name, orientation="h", marker_color=color,
+                            customdata=top[col],
+                            hovertemplate="%{y}<br>" + name + ": %{x:.0f}% (%{customdata:,} tickets)<extra></extra>",
+                        )
+                    f.update_layout(barmode="stack", xaxis_title="% of tickets closed", yaxis_title=None)
+                    show(style_fig(f, 430))
+                    st.caption("Top 12 agencies by tickets closed. 'Outcome unclear' = closing note too generic to classify.")
+            with g2:
+                st.markdown("#### Fast vs. effective: who is where?")
+                sc = big.dropna(subset=["hours"])
+                if sc.empty:
+                    st.info("Not enough data for this chart.")
+                else:
+                    f = px.scatter(
+                        sc, x="hours", y="nofix_pct", size="closed", color="name",
+                        hover_name="name", size_max=48, log_x=True,
+                        hover_data={"hours": ":.1f", "nofix_pct": ":.1f", "closed": ":,", "name": False},
+                        labels={"hours": "Typical time to close (hours, log scale)",
+                                "nofix_pct": "% closed without a confirmed fix", "closed": "Tickets closed"},
+                    )
+                    f.update_layout(showlegend=False)
+                    f.add_hline(y=cs["nofix_pct"], line_dash="dot", line_color=GREY,
+                                annotation_text="all agencies", annotation_position="top left")
+                    show(style_fig(f, 430))
+                    st.caption("Bubble size = tickets closed. Bottom-left = quick and with confirmed results.")
+
+            h1, h2 = st.columns(2)
+            with h1:
+                st.markdown("#### Open tickets by agency (end of period)")
+                bk = ag_df[ag_df["active_open_backlog_count"] > 0].copy()
+                bk["recent"] = bk["active_open_backlog_count"] - bk["long_open_backlog_count"]
+                bk = bk.nlargest(12, "active_open_backlog_count").iloc[::-1]
+                if bk.empty:
+                    st.info("No open tickets for this selection.")
+                else:
+                    f = go.Figure()
+                    f.add_bar(y=bk["name"], x=bk["recent"], orientation="h", name=f"Open up to {LONG_OPEN_DAYS} days", marker_color=BLUE)
+                    f.add_bar(y=bk["name"], x=bk["long_open_backlog_count"], orientation="h", name=f"Open over {LONG_OPEN_DAYS} days", marker_color=RED)
+                    f.update_layout(barmode="stack", xaxis_title="Open tickets", yaxis_title=None)
+                    show(style_fig(f, 400))
+            with h2:
+                st.markdown("#### Where are closures least often confirmed?")
+                hm = pc.groupby(["agency", "borough"])[["tickets_closed_today", "phantom_closed_today"]].sum().reset_index()
+                hm = hm[hm["tickets_closed_today"] >= 50]
+                hm["rate"] = hm["phantom_closed_today"] / hm["tickets_closed_today"] * 100
+                if hm.empty:
+                    st.info("Not enough closures per agency and borough in this scope (needs 50+).")
+                else:
+                    pv = hm.pivot(index="agency", columns="borough", values="rate")
+                    pv.index = [AGENCY_LABELS.get(a, a) for a in pv.index]
+                    pv = pv.loc[pv.mean(axis=1).sort_values(ascending=False).index]
+                    f = go.Figure(go.Heatmap(
+                        z=pv.values, x=pv.columns.tolist(), y=pv.index.tolist(), colorscale="Reds",
+                        text=np.round(pv.values, 0), texttemplate="%{text:.0f}%",
+                        hovertemplate="%{y} in %{x}: %{z:.0f}% closed without confirmed fix<extra></extra>",
+                        colorbar=dict(title="%"),
+                    ))
+                    f.update_yaxes(autorange="reversed")
+                    show(style_fig(f, 400))
+                    st.caption("Only agency/borough pairs with 50+ closures are shown.")
+
+            st.markdown("#### Agency scorecard")
+            table = pd.DataFrame({
+                "Agency": ag_df["name"],
+                "Tickets closed": ag_df["closed"].astype(int),
+                "Typical time to close (hours)": ag_df["hours"].round(1),
+                "Closed with confirmed fix (%)": ag_df["fixed_pct"].round(1),
+                "Closed without confirmed fix (%)": ag_df["nofix_pct"].round(1),
+                "Open tickets": ag_df["active_open_backlog_count"].astype(int),
+                "Open over 7 days": ag_df["long_open_backlog_count"].astype(int),
+            }).sort_values("Tickets closed", ascending=False)
+            st.dataframe(
+                table, hide_index=True, width="stretch",
+                column_config={
+                    "Closed with confirmed fix (%)": st.column_config.ProgressColumn(
+                        format="%.1f%%", min_value=0, max_value=100),
+                    "Closed without confirmed fix (%)": st.column_config.ProgressColumn(
+                        format="%.1f%%", min_value=0, max_value=100),
+                },
+            )
+            st.caption(
+                "Open-ticket numbers use each borough and agency's latest known figure on or before the end "
+                "of the period (the source only records backlog on days with activity)."
+            )
+
+# =============================================================================
+# 9. NEIGHBORHOODS (ZIP) - whole-period mart, no date column
+# =============================================================================
+with tab_zip:
+    banner()
+    warning_banner(
+        f"<b>This page always covers the whole data period ({fmt_date(DATA_MIN)} to {fmt_date(DATA_MAX)})</b> - "
+        "the ZIP table is not split by date, so the time scope in the sidebar does not apply here. "
+        "The borough selection does."
+    )
+    z_all = zips[zips["borough"].isin(selected_boroughs)]
+    types = ["All complaint types"] + sorted(z_all["complaint_type"].unique().tolist())
+    z_type = st.selectbox("Complaint type", types)
+    zf = z_all if z_type == "All complaint types" else z_all[z_all["complaint_type"] == z_type]
+
+    if zf.empty:
+        st.info("No ZIP-level data for this selection.")
+    else:
+        rows = []
+        for zc, g in zf.groupby("incident_zip"):
+            total = g["total_complaints"].sum()
+            rows.append({
+                "zip": zc,
+                "borough": g.groupby("borough")["total_complaints"].sum().idxmax(),
+                "complaints": total,
+                "closed": g["closed_complaints"].sum(),
+                "hours": wmedian(g["median_resolution_hours"], g["closed_complaints"]),
+                "exact_pct": safe_div((g["exact_gps_share_pct"] * g["total_complaints"]).sum(), total),
+            })
+        zdf = pd.DataFrame(rows)
+        zdf["closed_pct"] = zdf["closed"] / zdf["complaints"] * 100
+        if centroids is not None:
+            zdf = zdf.merge(centroids[["zip5", "centroid_lat", "centroid_lon"]],
+                            left_on="zip", right_on="zip5", how="left")
+
+        top_zip = zdf.loc[zdf["complaints"].idxmax()]
+        z1, z2, z3, z4 = st.columns(4)
+        z1.metric("ZIP codes", fmt_int(len(zdf)))
+        z2.metric("Complaints", fmt_int(zdf["complaints"].sum()))
+        z3.metric("Highest-volume ZIP", f"{top_zip['zip']}", f"{fmt_int(top_zip['complaints'])} complaints", delta_color="off")
+        z4.metric(
+            "Located by exact address", f"{safe_div((zdf['exact_pct'] * zdf['complaints']).sum(), zdf['complaints'].sum()):.1f}%",
+            help="Share of complaints with exact coordinates. The rest were placed using ZIP or borough centres.",
+        )
+
+        st.markdown("#### Map of complaint volume")
+        color_by = st.radio(
+            "Colour the dots by", ["Complaints", "Typical time to close", "% closed"], horizontal=True,
+            help="Dot size is always the number of complaints.",
+        )
+        color_col, color_title = {
+            "Complaints": ("complaints", "Complaints"),
+            "Typical time to close": ("hours", "Hours to close (median)"),
+            "% closed": ("closed_pct", "% closed"),
+        }[color_by]
+        mp = zdf.dropna(subset=["centroid_lat", "centroid_lon"]).copy()
+        if mp.empty:
+            st.info("ZIP centroid reference data is missing, so the map can't be drawn.")
+        else:
+            hi = mp[color_col].quantile(0.95) if mp[color_col].notna().any() else None
+            f = px.scatter_map(
+                mp, lat="centroid_lat", lon="centroid_lon", size="complaints", color=color_col,
+                size_max=28, zoom=9.2, center=dict(lat=40.72, lon=-73.95), map_style="carto-positron",
+                color_continuous_scale="YlOrRd", range_color=(0, hi) if hi else None,
+                hover_name="zip",
+                hover_data={"borough": True, "complaints": ":,", "hours": ":.1f", "closed_pct": ":.1f",
+                            "centroid_lat": False, "centroid_lon": False},
+                labels={color_col: color_title, "hours": "Median hours to close", "closed_pct": "% closed"},
+            )
+            show(style_fig(f, 520))
+            st.caption("Colour scale is capped at the 95th percentile so a few extreme ZIPs don't wash out the rest.")
+
+        b1, b2 = st.columns(2)
+        with b1:
+            st.markdown("#### 15 ZIP codes with the most complaints")
+            t15 = zdf.nlargest(15, "complaints").iloc[::-1]
+            f = px.bar(t15, x="complaints", y="zip", orientation="h", color="borough",
+                       labels={"complaints": "Complaints", "zip": "ZIP", "borough": ""})
+            f.update_yaxes(type="category")
+            show(style_fig(f, 460))
+        with b2:
+            st.markdown("#### Slowest-to-resolve ZIP codes")
+            min_n = st.slider("Only ZIPs with at least this many closed complaints", 0, 2000, 200, step=50)
+            slow = zdf[(zdf["closed"] >= min_n) & zdf["hours"].notna()].nlargest(15, "hours").iloc[::-1]
+            if slow.empty:
+                st.info("No ZIP meets this minimum.")
+            else:
+                f = px.bar(slow, x="hours", y="zip", orientation="h", color="borough",
+                           labels={"hours": "Typical time to close (hours)", "zip": "ZIP", "borough": ""})
+                f.update_yaxes(type="category")
+                show(style_fig(f, 460))
+
+        st.markdown("#### Is volume related to speed?")
+        sc = zdf.dropna(subset=["hours"])
+        sc = sc[sc["closed"] >= 50]
+        if not sc.empty:
+            f = px.scatter(
+                sc, x="complaints", y="hours", color="borough", log_x=True, log_y=True, opacity=0.7,
+                hover_name="zip",
+                labels={"complaints": "Complaints (log scale)", "hours": "Typical time to close, hours (log scale)", "borough": ""},
+            )
+            show(style_fig(f, 380))
+            st.caption("Each dot is a ZIP code with 50+ closed complaints.")
+
+        with st.expander("ZIP table"):
+            tbl = zdf[["zip", "borough", "complaints", "closed_pct", "hours", "exact_pct"]].rename(columns={
+                "zip": "ZIP", "borough": "Borough", "complaints": "Complaints", "closed_pct": "% closed",
+                "hours": "Typical hours to close", "exact_pct": "% exact location",
+            }).sort_values("Complaints", ascending=False)
+            st.dataframe(tbl.round(1), hide_index=True, width="stretch")
+
+# =============================================================================
+# 10. DATA QUALITY
+# =============================================================================
+with tab_quality:
+    report, taxonomy, resolutions = load_quality()
+    banner()
+    warning_banner(
+        "<b>This page is about the data pipeline, not the time scope.</b> The top section describes the "
+        "<b>latest pipeline run</b>; the reconciliation section covers <b>all data</b>."
+    )
+
+    st.markdown("#### Do the Gold tables agree with each other? (all data)")
+    total_dem = int(demand["complaint_count"].sum())
+    total_perf = int(perf["tickets_created_today"].sum())
+    total_zip = int(zips["total_complaints"].sum())
+    q1, q2, q3 = st.columns(3)
+    q1.metric("Requests in demand table", fmt_int(total_dem))
+    q2.metric("Tickets opened in agency table", fmt_int(total_perf),
+              "matches" if total_perf == total_dem else f"{total_perf - total_dem:+,} difference",
+              delta_color="off" if total_perf == total_dem else "inverse")
+    q3.metric("Complaints in ZIP table", fmt_int(total_zip),
+              "matches" if total_zip == total_dem else f"{total_zip - total_dem:+,} difference",
+              delta_color="off" if total_zip == total_dem else "inverse",
+              help="Small differences are expected: requests without a usable ZIP cannot appear in the ZIP table.")
+
+    if report and "stages" in report:
+        stg = report["stages"].get("311_cleaning", {})
+        gen = report.get("generated_at_utc", "unknown")
+        st.markdown(f"#### Latest pipeline run (report generated {gen})")
+        raw_in = stg.get("input_rows", 0)
+        accepted = stg.get("valid_rows_accepted", 0)
+        rejected = stg.get("quarantined_rows", 0) + stg.get("duplicate_rows_removed", 0)
+        r1, r2, r3 = st.columns(3)
+        r1.metric("Records received", fmt_int(raw_in))
+        r2.metric("Records accepted", fmt_int(accepted), f"{safe_div(accepted, raw_in, 100):.2f}% of received", delta_color="off")
+        r3.metric("Records rejected", fmt_int(rejected),
+                  help="Rejected = unusable timestamps/keys or exact duplicate rows.", delta_color="off")
+        monthly = demand.groupby(demand["date"].dt.to_period("M"))["complaint_count"].sum()
+        hit = monthly[monthly == accepted]
+        if len(hit):
+            st.success(f"✅ Accepted records ({fmt_int(accepted)}) match exactly the {hit.index[0].strftime('%B %Y')} requests in the demand table.")
+        if stg.get("total_lakehouse_records"):
+            ok = int(stg["total_lakehouse_records"]) == total_dem
+            (st.success if ok else st.warning)(
+                f"{'✅' if ok else '⚠️'} Pipeline reports {fmt_int(stg['total_lakehouse_records'])} records in the cleaned data overall; "
+                f"the demand table holds {fmt_int(total_dem)}."
+            )
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("#### How precisely were requests located?")
+            spatial = stg.get("spatial_resolution_breakdown", {})
+            if spatial:
+                names = {"EXACT_COORDINATES": "Exact coordinates", "ZIP_APPROXIMATION": "Placed at ZIP centre",
+                         "BOROUGH_APPROXIMATION": "Placed at borough centre", "UNLOCATED": "No location"}
+                sp = pd.DataFrame({"type": [names.get(k, k) for k in spatial], "n": list(spatial.values())})
+                f = px.pie(sp, names="type", values="n", hole=0.55, color_discrete_sequence=px.colors.qualitative.Safe)
+                f.update_traces(textinfo="percent", hovertemplate="%{label}: %{value:,}<extra></extra>")
+                show(style_fig(f, 340))
+        with c2:
+            st.markdown("#### How did we spot repeat reports?")
+            routes = stg.get("incident_clustering", {}).get("route_breakdown", {})
+            if routes:
+                rt = pd.DataFrame({"how": [k.split(". ", 1)[-1] for k in routes], "n": list(routes.values())})
+                rt = rt.sort_values("n")
+                f = px.bar(rt, x="n", y="how", orientation="h", color_discrete_sequence=[DARK_BLUE],
+                           labels={"n": "Requests", "how": ""})
+                f.update_xaxes(type="log")
+                show(style_fig(f, 340))
+                st.caption("Requests are matched to a place by building, intersection, road segment, etc. (log scale).")
+
+        c3, c4 = st.columns(2)
+        with c3:
+            st.markdown("#### How were tickets closed?")
+            outcome = stg.get("resolution_text_mining", {}).get("outcome_breakdown", {})
+            if outcome:
+                names = {
+                    "ACTION_TAKEN_REMEDIED": "Fixed on site", "OPEN_TICKET": "Still open",
+                    "DUPLICATE_CONSOLIDATED": "Duplicate of another", "ACCESS_DENIED_UNABLE_TO_LOCATE": "Could not access / locate",
+                    "ADMINISTRATIVE_DISMISSAL": "Dismissed administratively", "NO_VIOLATION_FOUND": "No violation found",
+                    "UNCLASSIFIED_OR_GENERIC": "Note too generic to classify", "DEFERRED_PENDING_ACTION": "Deferred / pending action",
+                    "UNSTATED_OR_EMPTY": "No closing note",
+                }
+                oc = pd.DataFrame({"outcome": [names.get(k, k) for k in outcome], "n": list(outcome.values())}).sort_values("n")
+                f = px.bar(oc, x="n", y="outcome", orientation="h", color_discrete_sequence=[BLUE],
+                           labels={"n": "Tickets", "outcome": ""})
+                show(style_fig(f, 380))
+        with c4:
+            st.markdown("#### Were complaint types mapped to a service area?")
+            sem = stg.get("semantic_conformance", {})
+            if sem:
+                st.metric("Mapped to a known service area", f"{sem.get('conformed_rate_pct', 0):.1f}%")
+                st.metric("Fell into 'Other services'", fmt_int(sem.get("unmapped_records", 0)),
+                          help="Complaint types we have not yet assigned to a specific service area.")
+            wx_stage = report["stages"].get("weather_cleaning", {})
+            join_stage = report["stages"].get("unified_join", {})
+            if wx_stage or join_stage:
+                st.markdown("**Weather feed**")
+                st.write(
+                    f"- {fmt_int(wx_stage.get('input_rows', 0))} hourly readings across "
+                    f"{wx_stage.get('distinct_grid_cells', 0)} grid cells\n"
+                    f"- {wx_stage.get('corrupted_fields_masked', 0)} implausible sensor values masked\n"
+                    f"- {join_stage.get('weather_match_rate_pct', 0):.2f}% of requests matched to a weather reading"
+                )
+    else:
+        st.info("No pipeline quality report found yet. Run the Silver pipeline to generate one.")
+
+    st.markdown("#### Items waiting for human review")
+    l1, l2 = st.columns(2)
+    with l1:
+        st.markdown("**Complaint types not yet mapped to a service area**")
+        if taxonomy is not None and len(taxonomy):
+            tx = taxonomy.nlargest(15, "occurrence_count")[["agency", "complaint_type", "occurrence_count", "review_status"]]
+            st.dataframe(tx.rename(columns={"agency": "Agency", "complaint_type": "Complaint type",
+                                            "occurrence_count": "Requests", "review_status": "Status"}),
+                         hide_index=True, width="stretch")
+            st.caption(f"{len(taxonomy)} unmapped types in total; top 15 by volume.")
+        else:
+            st.caption("Nothing pending.")
+    with l2:
+        st.markdown("**Closing notes too generic to classify**")
+        if resolutions is not None and len(resolutions):
+            rs = resolutions.nlargest(10, "occurrence_count")[["agency", "clean_resolution_text", "occurrence_count"]]
+            rs["clean_resolution_text"] = rs["clean_resolution_text"].astype(str).str.slice(0, 110)
+            st.dataframe(rs.rename(columns={"agency": "Agency", "clean_resolution_text": "Closing note (shortened)",
+                                            "occurrence_count": "Tickets"}),
+                         hide_index=True, width="stretch")
+            st.caption(f"{len(resolutions)} distinct generic notes; top 10 by volume.")
+        else:
+            st.caption("Nothing pending.")

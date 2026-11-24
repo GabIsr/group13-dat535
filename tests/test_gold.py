@@ -104,6 +104,12 @@ class TestGoldLayerPipeline(unittest.TestCase):
             self.assertEqual(row_18["total_precipitation_mm"], 6.0)  # 2mm * 3 hours
             self.assertEqual(row_18["hours_of_precipitation"], 3)
             self.assertEqual(row_18["weather_data_coverage_pct"], 100.0)
+            self.assertIn("max_rolling_3h_precip_mm", df_mart.columns)
+            self.assertIn("max_rolling_6h_precip_mm", df_mart.columns)
+            self.assertIn("had_frozen_ground_day", df_mart.columns)
+            self.assertIn("had_saturated_soil_day", df_mart.columns)
+            self.assertIn("max_incident_burst_size", df_mart.columns)
+            self.assertIn("burst_duplicate_rate_pct", df_mart.columns)
 
     def test_agency_resolution_performance_mart_cohorts_and_backlog(self):
         """Verify creation cohort vs closure cohort separation and active backlog calculations."""
@@ -125,6 +131,10 @@ class TestGoldLayerPipeline(unittest.TestCase):
                     "closed_at_utc": "2026-10-12T10:00:00Z",
                     "is_ticket_closed": True,
                     "resolution_duration_hours": 48.0,
+                    "resolution_outcome_category": "ACTION_TAKEN_REMEDIED",
+                    "is_field_verified": True,
+                    "is_phantom_closure": False,
+                    "is_instant_closure": False,
                     "borough": "QUEENS",
                     "agency": "DOT",
                 },
@@ -135,6 +145,10 @@ class TestGoldLayerPipeline(unittest.TestCase):
                     "closed_at_utc": None,
                     "is_ticket_closed": False,
                     "resolution_duration_hours": np.nan,
+                    "resolution_outcome_category": "OPEN_TICKET",
+                    "is_field_verified": False,
+                    "is_phantom_closure": False,
+                    "is_instant_closure": False,
                     "borough": "QUEENS",
                     "agency": "DOT",
                 },
@@ -167,6 +181,9 @@ class TestGoldLayerPipeline(unittest.TestCase):
             self.assertEqual(row_oct12["median_resolution_duration_hours"], 48.0)
             self.assertEqual(row_oct12["active_open_backlog_count"], 1)
             self.assertEqual(row_oct12["long_open_backlog_count"], 1)  # ticket 202 is 2 days old > 1 day
+            self.assertEqual(row_oct12["remedied_closed_today"], 1)
+            self.assertEqual(row_oct12["duplicate_consolidated_closed_today"], 0)
+            self.assertEqual(row_oct12["instant_closed_today"], 0)
 
     def test_zip_infrastructure_vulnerability_mart_and_spatial_scorecard(self):
         """Verify ZIP vulnerability multiplier, <NA> ZIP reconciliation, and spatial precision metrics."""
@@ -196,6 +213,9 @@ class TestGoldLayerPipeline(unittest.TestCase):
                     "is_extreme_weather": False,
                     "is_ticket_closed": True,
                     "is_instant_closure": False,
+                    "is_burst_duplicate": False,
+                    "is_phantom_closure": False,
+                    "is_field_verified": True,
                     "resolution_duration_hours": 10.0,
                 },
                 {
@@ -212,6 +232,9 @@ class TestGoldLayerPipeline(unittest.TestCase):
                     "is_extreme_weather": True,
                     "is_ticket_closed": True,
                     "is_instant_closure": True,
+                    "is_burst_duplicate": True,
+                    "is_phantom_closure": True,
+                    "is_field_verified": False,
                     "resolution_duration_hours": 0.0,
                 },
                 {
@@ -228,6 +251,9 @@ class TestGoldLayerPipeline(unittest.TestCase):
                     "is_extreme_weather": False,
                     "is_ticket_closed": True,
                     "is_instant_closure": False,
+                    "is_burst_duplicate": False,
+                    "is_phantom_closure": False,
+                    "is_field_verified": True,
                     "resolution_duration_hours": 20.0,
                 },
                 {
@@ -244,6 +270,9 @@ class TestGoldLayerPipeline(unittest.TestCase):
                     "is_extreme_weather": False,
                     "is_ticket_closed": False,
                     "is_instant_closure": False,
+                    "is_burst_duplicate": False,
+                    "is_phantom_closure": False,
+                    "is_field_verified": False,
                     "resolution_duration_hours": np.nan,
                 },
             ]
@@ -282,6 +311,13 @@ class TestGoldLayerPipeline(unittest.TestCase):
             self.assertEqual(row_q["dry_weather_complaints"], 1)
             # Wet rate = 2 / 2 = 1.0/hr; Dry rate = 1 / 8 = 0.125/hr -> Multiplier = 8.0x
             self.assertEqual(row_q["storm_sensitivity_multiplier"], 8.0)
+            self.assertEqual(row_q["distinct_incidents_count"], 2)
+            self.assertEqual(row_q["distinct_wet_incidents_count"], 1)
+            self.assertEqual(row_q["distinct_dry_incidents_count"], 1)
+            self.assertEqual(row_q["incident_storm_sensitivity_multiplier"], 4.0)
+            self.assertEqual(row_q["field_verified_closed_complaints"], 2)
+            self.assertEqual(row_q["phantom_closed_complaints"], 1)
+            self.assertEqual(row_q["phantom_closure_rate_pct"], 33.33)
             self.assertEqual(row_q["avg_grid_distance_km"], 4.0)
             self.assertEqual(row_q["exact_gps_share_pct"], 66.7)
             self.assertEqual(row_q["imputed_centroid_share_pct"], 33.3)

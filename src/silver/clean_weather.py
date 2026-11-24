@@ -38,6 +38,7 @@ from pyspark.sql.functions import (
     to_date,
     to_timestamp,
     trim,
+    upper,
     when,
 )
 from pyspark.sql.types import (
@@ -77,34 +78,100 @@ LEDGER_SCHEMA = StructType([
     StructField("masked_at_utc", StringType(), True),
 ])
 
+WEATHER_NUMERIC_DOUBLES = [
+    "temperature_2m",
+    "apparent_temperature",
+    "dew_point_2m",
+    "precipitation",
+    "rain",
+    "snowfall",
+    "snow_depth",
+    "surface_pressure",
+    "wind_speed_10m",
+    "wind_gusts_10m",
+    "soil_temperature_0_to_7cm",
+    "soil_moisture_0_to_7cm",
+    "direct_normal_irradiance",
+    "latitude",
+    "longitude",
+    "grid_lat",
+    "grid_lon",
+]
+
+WEATHER_NUMERIC_SHORTS = [
+    "weather_code",
+    "relative_humidity_2m",
+    "wind_direction_10m",
+    "cloud_cover",
+]
+
+NULL_SENTINELS = ["", "NAN", "NONE", "NULL", "NA", "<NA>"]
+
+
+def conform_and_cast_weather_schema(df_raw: DataFrame) -> DataFrame:
+    """
+    Step 1: Universal Schema Conformance for ERA5 Weather Observations.
+    Enforces strong physical typing, parses UTC timestamps, and purges null sentinels
+    via a single declarative projection before quarantine or deduplication.
+    """
+    cols = set(df_raw.columns)
+    exprs = []
+
+    # 1. Primary spatial key: grid_id (trim & nullify sentinels)
+    if "grid_id" in cols:
+        exprs.append(
+            when(upper(trim(col("grid_id"))).isin(NULL_SENTINELS) | (col("grid_id") == ""), lit(None))
+            .otherwise(trim(col("grid_id")))
+            .alias("grid_id")
+        )
+
+    # 2. Primary temporal key: parse time/date string into standard UTC timestamp
+    time_src = "time" if "time" in cols else ("date" if "date" in cols else ("timestamp_utc" if "timestamp_utc" in cols else None))
+    if time_src:
+        clean_time_str = when(
+            upper(trim(col(time_src))).isin(NULL_SENTINELS) | (col(time_src) == ""), lit(None)
+        ).otherwise(trim(col(time_src)))
+        exprs.append(clean_time_str.alias("time"))
+        exprs.append(to_timestamp(clean_time_str).alias("timestamp_utc"))
+
+    # 3. Numeric floating-point sensor measurements -> DoubleType
+    for c in WEATHER_NUMERIC_DOUBLES:
+        if c in cols:
+            exprs.append(col(c).cast("double").alias(c))
+
+    # 4. Discrete integer meteorological codes/percentages -> ShortType
+    for c in WEATHER_NUMERIC_SHORTS:
+        if c in cols:
+            exprs.append(col(c).cast("short").alias(c))
+
+    # 5. Passthrough metadata and lineage columns
+    conformed_set = set(WEATHER_NUMERIC_DOUBLES) | set(WEATHER_NUMERIC_SHORTS) | {"grid_id", "time", "date", "timestamp_utc"}
+    for c in df_raw.columns:
+        if c not in conformed_set:
+            exprs.append(col(c))
+
+    return df_raw.select(*exprs)
+
 
 def quarantine_unkeyed_weather(
-    df_raw: DataFrame,
-    processed_at_utc: str,
-    quarantine_dir: Path,
+    df_conformed: Optional[DataFrame] = None,
+    processed_at_utc: str = "",
+    quarantine_dir: Path = None,
+    df_raw: Optional[DataFrame] = None,
 ) -> Tuple[DataFrame, int]:
     """
-    Evaluate row-level primary keys (grid_id, time), parse UTC timestamps,
-    and route unkeyed or corrupt observations to the quarantine table via pure PySpark.
+    Step 2: Strict Boundary Quarantining for ERA5 Weather Observations.
+    Evaluates row-level primary keys (grid_id, timestamp_utc) on conformed schema,
+    routing unkeyed or unparseable observations to the quarantine table via pure PySpark.
     """
-    cols = df_raw.columns
+    df = df_conformed if df_conformed is not None else df_raw
+    cols = set(df.columns)
 
-    cond_missing_grid = (
-        col("grid_id").isNull()
-        | trim(col("grid_id")).isin(["", "nan", "None", "NONE", "NAN", "null", "NULL"])
-        if "grid_id" in cols
-        else lit(True)
-    )
-    cond_missing_time = (
-        col("time").isNull()
-        | trim(col("time")).isin(["", "nan", "None", "NONE", "NAN", "null", "NULL"])
-        if "time" in cols
-        else lit(True)
-    )
-    parsed_ts = to_timestamp(col("time")) if "time" in cols else lit(None)
-    cond_invalid_ts = (~cond_missing_time) & parsed_ts.isNull()
+    cond_missing_grid = col("grid_id").isNull() if "grid_id" in cols else lit(True)
+    cond_missing_time = col("time").isNull() if "time" in cols else lit(True)
+    cond_invalid_ts = col("time").isNotNull() & col("timestamp_utc").isNull() if ("time" in cols and "timestamp_utc" in cols) else lit(True)
     cond_corrupt_lineage = (
-        (col("_batch_id").isNull() | trim(col("_batch_id")).isin(["", "nan", "None", "<NA>"]))
+        (col("_batch_id").isNull() | upper(trim(col("_batch_id"))).isin(NULL_SENTINELS))
         if "_batch_id" in cols
         else lit(False)
     )
@@ -121,9 +188,8 @@ def quarantine_unkeyed_weather(
     )
 
     df_evaluated = (
-        df_raw.withColumn("_quarantine_reason", concat_ws("; ", quarantine_reasons))
+        df.withColumn("_quarantine_reason", concat_ws("; ", quarantine_reasons))
         .withColumn("_is_quarantined", quarantine_mask)
-        .withColumn("timestamp_utc", parsed_ts)
     )
 
     df_quarantined = df_evaluated.filter(col("_is_quarantined") == True)
@@ -485,10 +551,6 @@ def enrich_weather_attributes(df: DataFrame, processed_at_utc: str) -> DataFrame
     else:
         df_enriched = df_enriched.withColumn("is_overcast", lit(False))
 
-    for int_col in ["weather_code", "relative_humidity_2m", "wind_direction_10m", "cloud_cover"]:
-        if int_col in df_enriched.columns:
-            df_enriched = df_enriched.withColumn(int_col, col(int_col).cast("short"))
-
     df_enriched = df_enriched.withColumn("_silver_processed_at_utc", to_timestamp(lit(processed_at_utc)))
     df_enriched = df_enriched.withColumn("year", date_format(col("timestamp_utc"), "yyyy"))
     df_enriched = df_enriched.withColumn("month", date_format(col("timestamp_utc"), "MM"))
@@ -525,12 +587,13 @@ def clean_and_validate_weather(
 ) -> Dict[str, Any]:
     """
     Silver Weather pipeline:
-    1. Primary key quarantine & temporal standardization (PySpark).
-    2. Deduplication on (grid_id, timestamp_utc) via PySpark Window.
-    3. Atmospheric physical bounds verification & sensor masking (PySpark).
-    4. Chronological rolling window features (PySpark Window functions).
-    5. Meteorological standard attributes & extreme weather tagging (PySpark).
-    6. Native PySpark partitioned Parquet output.
+    1. Universal schema conformance, strong typing & temporal parsing (PySpark).
+    2. Primary key quarantine & corrupted observation isolation (PySpark).
+    3. Deduplication on (grid_id, timestamp_utc) via PySpark Window.
+    4. Atmospheric physical bounds verification & sensor masking (PySpark).
+    5. Chronological rolling window features (PySpark Window functions).
+    6. Meteorological standard attributes & extreme weather tagging (PySpark).
+    7. Native PySpark partitioned Parquet output.
     """
     start_time = time.time()
     processed_at_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
@@ -588,10 +651,15 @@ def clean_and_validate_weather(
         step_scan.set_output_rows(input_rows)
     logger.info(f"Loaded {input_rows:,} raw weather observations from Bronze.")
 
+    # 1. Universal Schema Conformance & Strong Typing
+    with profiler.measure_step("silver_weather", "schema_conformance_and_casting", input_rows=input_rows) as step_schema:
+        df_conformed = conform_and_cast_weather_schema(df_raw)
+        step_schema.set_output_rows(input_rows)
+
     with profiler.measure_step("silver_weather", "unkeyed_quarantine_and_deduplication", input_rows=input_rows) as step_quar:
-        # 1. Unkeyed & Corrupted Primary Key Quarantine
+        # 2. Unkeyed & Corrupted Primary Key Quarantine
         df_valid, quarantined_weather_rows = quarantine_unkeyed_weather(
-            df_raw=df_raw,
+            df_conformed=df_conformed,
             processed_at_utc=processed_at_utc,
             quarantine_dir=quarantine_dir,
         )

@@ -1,8 +1,6 @@
 name: DAT535 — Production Pipeline
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       lab:

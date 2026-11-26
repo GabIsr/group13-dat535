@@ -43,11 +43,12 @@ jobs:
       id: output-dir
       # Persistent, non-tmp path: survives runner reboots/tmpfiles cleanup, unlike /tmp
       run: |
-        echo "dir=$HOME/spark-lab-data/dev" >> "$GITHUB_OUTPUT"
-        echo "DAT535_OUTPUT_DIR=$HOME/spark-lab-data/dev" >> "$GITHUB_ENV"
+        echo "dir=$HOME/spark-lab-data/prod" >> "$GITHUB_OUTPUT"
+        echo "DAT535_OUTPUT_DIR=$HOME/spark-lab-data/prod" >> "$GITHUB_ENV"
 
     - name: Run Pipeline & Quality Gate
       env:
+        DAT535_ENV: prod
         SOCRATA_APP_TOKEN: ${{ secrets.SOCRATA_APP_TOKEN }}
         PYTHONWARNINGS: "ignore::DeprecationWarning,ignore::FutureWarning,ignore::ResourceWarning"
       run: |
@@ -74,15 +75,15 @@ jobs:
 
         if [ "$MODE" = "backfill" ]; then
           echo "Executing One-Time Historical Backfill..."
-          INGEST_CMD="python $GITHUB_WORKSPACE/run_ingestion.py --dataset all --mode backfill --env dev"
+          INGEST_CMD="python $GITHUB_WORKSPACE/run_ingestion.py --dataset all --mode backfill --env prod"
           if [ -n "$START_DATE" ]; then INGEST_CMD="$INGEST_CMD --start-date $START_DATE"; fi
           if [ -n "$END_DATE" ]; then INGEST_CMD="$INGEST_CMD --end-date $END_DATE"; fi
           eval $INGEST_CMD
-          python $GITHUB_WORKSPACE/run_silver.py --stage all --env dev
-          python $GITHUB_WORKSPACE/run_gold.py --env dev
+          python $GITHUB_WORKSPACE/run_silver.py --stage all --env prod
+          python $GITHUB_WORKSPACE/run_gold.py --env prod
         else
           echo "Executing Automated Incremental CDC Pipeline..."
-          python $GITHUB_WORKSPACE/run_project.py all --env dev
+          python $GITHUB_WORKSPACE/run_project.py all --env prod
         fi
 
         echo "=== Publishing Data Quality Scorecard ==="

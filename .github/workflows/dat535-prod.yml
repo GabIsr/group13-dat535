@@ -1,6 +1,8 @@
 name: DAT535 — Production Pipeline
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       lab:
@@ -19,6 +21,8 @@ jobs:
       DAT535_ENV: prod
       SPARK_HOME: /opt/spark
       JAVA_HOME: /usr/lib/jvm/java-8-openjdk-amd64
+      SOCRATA_APP_TOKEN: ${{ secrets.SOCRATA_APP_TOKEN }}
+      PYTHONWARNINGS: "ignore::DeprecationWarning,ignore::FutureWarning,ignore::ResourceWarning"
 
     steps:
       - name: Checkout code

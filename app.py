@@ -101,7 +101,8 @@ st.markdown(
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-DATA_DIR = PROJECT_ROOT / "data"
+env_output_dir = os.environ.get("DAT535_OUTPUT_DIR")
+DATA_DIR = Path(env_output_dir).resolve() if env_output_dir else (PROJECT_ROOT / "data")
 MARTS_DIR = DATA_DIR / "gold" / "marts"
 QUALITY_DIR = DATA_DIR / "metadata" / "quality"
 REF_DIR = DATA_DIR / "reference"

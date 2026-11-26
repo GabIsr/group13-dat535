@@ -1,0 +1,234 @@
+"""
+DAT535 Course Project End-to-End Orchestrator (Medallion Pipeline).
+Coordinates Bronze Ingestion, Silver Standardization/Joining, and Test Suites.
+Author: Group 13
+"""
+
+import argparse
+import logging
+import os
+import subprocess
+import sys
+import time
+import warnings
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional
+
+# Suppress known external library deprecations (Pandas 2/3 and PySpark 3.5 bridge)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=ResourceWarning)
+warnings.filterwarnings("ignore", message=".*copy keyword is deprecated.*")
+warnings.filterwarnings("ignore", message=".*is_datetime64tz_dtype is deprecated.*")
+warnings.filterwarnings("ignore", message=".*distutils Version classes are deprecated.*")
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+# Ensure Spark environment and paths are initialized before any PySpark imports
+from src.utils.spark import _configure_environment
+_configure_environment()
+
+from src.utils.benchmark import get_profiler
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("run_project")
+
+
+def run_tests():
+    """Run all automated unit and integration tests."""
+    logger.info("=" * 70)
+    logger.info("RUNNING AUTOMATED TEST SUITE (INGESTION & SILVER)")
+    logger.info("=" * 70)
+    start = time.time()
+    test_env = os.environ.copy()
+    test_env.pop("DAT535_BENCHMARK_ID", None)
+    test_env["DAT535_BENCHMARK_DISABLED"] = "true"
+    res = subprocess.run(
+        [sys.executable, "-m", "unittest", "discover", "-s", "tests"],
+        env=test_env,
+    )
+    elapsed = time.time() - start
+    if res.returncode == 0:
+        logger.info(f"All unit tests passed successfully in {elapsed:.2f}s.")
+        return True
+    else:
+        logger.error(f"Test suite failed with returncode {res.returncode}.")
+        return False
+
+
+def run_bronze(
+    env: str = "dev",
+    mode: str = "incremental",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+):
+    """Execute Bronze Landing and Ingestion."""
+    logger.info("=" * 70)
+    logger.info("EXECUTING BRONZE LAYER (LANDING & PRESERVATION)")
+    logger.info("=" * 70)
+    from run_ingestion import main as ingestion_main
+    # Call ingestion
+    cmd = [sys.executable, "run_ingestion.py", "--dataset", "all", "--mode", mode, "--env", env]
+    if start_date:
+        cmd.extend(["--start-date", start_date])
+    if end_date:
+        cmd.extend(["--end-date", end_date])
+    res = subprocess.run(cmd)
+    return res.returncode == 0
+
+
+def run_silver(
+    env: str = "dev",
+    mode: str = "incremental",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+):
+    """Execute Silver Cleaning, Validation, Imputation, and Broadcast Join."""
+    logger.info("=" * 70)
+    logger.info("EXECUTING SILVER LAYER (CLEANING, IMPUTATION & FACT JOIN)")
+    logger.info("=" * 70)
+    cmd = [sys.executable, "run_silver.py", "--stage", "all", "--env", env, "--mode", mode]
+    if start_date:
+        cmd.extend(["--start-date", start_date])
+    if end_date:
+        cmd.extend(["--end-date", end_date])
+    res = subprocess.run(cmd)
+    return res.returncode == 0
+
+
+def run_gold(
+    env: str = "dev",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+):
+    """Execute Gold Business Marts Generation."""
+    logger.info("=" * 70)
+    logger.info("EXECUTING GOLD LAYER (BUSINESS ANALYTICAL MARTS)")
+    logger.info("=" * 70)
+    cmd = [sys.executable, "run_gold.py", "--env", env]
+    if start_date:
+        cmd.extend(["--start-date", start_date])
+    if end_date:
+        cmd.extend(["--end-date", end_date])
+    res = subprocess.run(cmd)
+    return res.returncode == 0
+
+
+def run_compaction(target_dir: str = "data/bronze", target_mb: int = 64):
+    """Execute partition compaction to resolve the Small Files Problem."""
+    logger.info("=" * 70)
+    logger.info(f"EXECUTING PARTITION COMPACTION ({target_dir} -> {target_mb}MB target)")
+    logger.info("=" * 70)
+    from src.utils.compaction import compact_partitions
+    comp_path = PROJECT_ROOT / target_dir
+    res = compact_partitions(comp_path, target_size_mb=target_mb)
+    return res["status"] if "status" in res else True
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="DAT535 Medallion Course Project Orchestrator (Group 13)"
+    )
+    parser.add_argument(
+        "action",
+        choices=["all", "test", "bronze", "silver", "gold", "compact"],
+        default="all",
+        nargs="?",
+        help="Pipeline layer or action to run (default: all)",
+    )
+    parser.add_argument(
+        "--env",
+        choices=["dev", "prod"],
+        default="dev",
+        help="Target execution environment (default: dev)",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["incremental", "backfill"],
+        default="incremental",
+        help="Pipeline execution mode (default: incremental)",
+    )
+    parser.add_argument(
+        "--compact",
+        action="store_true",
+        help="Run partition compaction on Bronze after ingestion",
+    )
+    parser.add_argument(
+        "--start-date",
+        type=str,
+        default=None,
+        help="Optional start date window (YYYY-MM-DD)",
+    )
+    parser.add_argument(
+        "--end-date",
+        type=str,
+        default=None,
+        help="Optional end date window (YYYY-MM-DD)",
+    )
+
+    args = parser.parse_args()
+    total_start = time.time()
+
+    # Initialize unified benchmark session ID for all pipeline subprocesses
+    if "DAT535_BENCHMARK_ID" not in os.environ:
+        now_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        os.environ["DAT535_BENCHMARK_ID"] = f"pipeline_{now_str}"
+
+    profiler = get_profiler(run_id=os.environ["DAT535_BENCHMARK_ID"], mode=args.mode)
+
+    if args.action == "test":
+        success = run_tests()
+        sys.exit(0 if success else 1)
+
+    if args.action == "compact":
+        run_compaction()
+        sys.exit(0)
+
+    if args.action in ["all", "bronze"]:
+        if not run_bronze(
+            env=args.env,
+            mode=args.mode,
+            start_date=args.start_date,
+            end_date=args.end_date,
+        ):
+            logger.error("Bronze layer failed. Halting pipeline.")
+            sys.exit(1)
+
+    if args.compact or (args.action == "all" and args.compact):
+        run_compaction()
+
+    if args.action in ["all", "silver"]:
+        if not run_silver(
+            env=args.env,
+            mode=args.mode,
+            start_date=args.start_date,
+            end_date=args.end_date,
+        ):
+            logger.error("Silver layer failed. Halting pipeline.")
+            sys.exit(1)
+
+    if args.action in ["all", "gold"]:
+        if not run_gold(
+            env=args.env,
+            start_date=args.start_date,
+            end_date=args.end_date,
+        ):
+            logger.error("Gold layer failed. Halting pipeline.")
+            sys.exit(1)
+
+    elapsed = time.time() - total_start
+    logger.info(f"Medallion project run completed successfully in {elapsed:.2f} seconds.")
+
+    # Finalize, save, and print aggregated benchmark JSON and terminal summary table
+    profiler.save_json()
+    profiler.print_summary_table()
+
+
+if __name__ == "__main__":
+    main()

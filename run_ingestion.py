@@ -1,0 +1,233 @@
+"""
+DAT535 Medallion Pipeline Ingestion Runner.
+Coordinates landing and Bronze layer ingestion for NYC 311 and Open-Meteo ERA5-Land weather.
+Supports incremental CDC updates and backfill operations.
+Author: Group 13
+"""
+
+import argparse
+from datetime import datetime, timedelta, timezone
+import logging
+import os
+import sys
+import time
+from pathlib import Path
+
+# Add project root to path for module resolution
+PROJECT_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.ingestion.ingest_311 import run_311_ingestion
+from src.ingestion.ingest_weather import run_weather_ingestion
+from src.utils.config import MANIFESTS_DIR, PROJECT_START_DATE
+from src.utils.benchmark import get_profiler
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("run_ingestion")
+
+
+def print_summary_table(manifests: list):
+    """Print an ASCII summary table of the executed ingestion batches."""
+    if not manifests:
+        print("\n[INFO] No new ingestion batches were executed.\n")
+        return
+
+    print("\n" + "=" * 105)
+    print("DAT535 INGESTION BATCH EXECUTION SUMMARY (MEDALLION BRONZE & LANDING)")
+    print("=" * 105)
+    header = (
+        f"{'Dataset':<14} | {'Batch ID':<18} | {'Mode':<11} | {'Interval':<23} | "
+        f"{'Rows':<9} | {'Files':<5} | {'Sec':<5} | {'Status'}"
+    )
+    print(header)
+    print("-" * 105)
+
+    for m in manifests:
+        start_short = str(m.get("source_data_start", "N/A"))[:10]
+        end_short = str(m.get("source_data_end", "N/A"))[:10]
+        interval = f"{start_short} -> {end_short}"
+        row = (
+            f"{m.get('dataset_name', ''):<14} | "
+            f"{m.get('batch_id', ''):<18} | "
+            f"{m.get('extraction_mode', ''):<11} | "
+            f"{interval:<23} | "
+            f"{m.get('row_count', 0):<9,d} | "
+            f"{len(m.get('files', [])):<5d} | "
+            f"{m.get('duration_seconds', 0.0):<5.1f} | "
+            f"{m.get('status', 'unknown')}"
+        )
+        print(row)
+
+    print("=" * 105)
+    print("Tier 1 Manifest Documents saved to: data/metadata/manifests/")
+    print("=" * 105 + "\n")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="DAT535 Medallion Bronze Ingestion Pipeline (NYC 311 + ERA5-Land Weather)"
+    )
+    parser.add_argument(
+        "--dataset",
+        choices=["all", "311", "weather"],
+        default="all",
+        help="Target dataset to ingest (default: all)",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["incremental", "backfill"],
+        default="incremental",
+        help="Acquisition mode: incremental (CDC via watermark) or backfill (default: incremental)",
+    )
+    parser.add_argument(
+        "--env",
+        choices=["dev", "prod"],
+        default="dev",
+        help="Target execution environment (default: dev)",
+    )
+    parser.add_argument(
+        "--start-date",
+        type=str,
+        help="Start date filter (e.g. 2026-07-15 or 2026-10-14T00:00:00.000)",
+    )
+    parser.add_argument(
+        "--end-date",
+        type=str,
+        help="End date filter (e.g. 2026-10-22 or 2026-10-22T23:59:59.000)",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=50000,
+        help="Page limit per Socrata network request (default: 50,000)",
+    )
+    parser.add_argument(
+        "--max-records",
+        type=int,
+        help="Optional maximum records limit for testing / quick validation runs",
+    )
+    parser.add_argument(
+        "--lookback-days",
+        type=int,
+        default=7,
+        help="Lookback buffer in days when no watermark exists (default: 7)",
+    )
+    parser.add_argument(
+        "--lag-311",
+        type=int,
+        default=1,
+        help="Target ingestion lag buffer for NYC 311 in days (default: 1 day, D-1)",
+    )
+    parser.add_argument(
+        "--lag-weather",
+        type=int,
+        default=5,
+        help="Target ingestion lag buffer for ECMWF Weather in days (default: 5 days, D-5)",
+    )
+    parser.add_argument(
+        "--project-start-date",
+        type=str,
+        default=PROJECT_START_DATE,
+        help="Project study universe start date (default: from .env or 2026-07-15)",
+    )
+    parser.add_argument(
+        "--app-token",
+        type=str,
+        help="Optional Socrata App Token to avoid public rate throttling",
+    )
+    parser.add_argument(
+        "--batch-id",
+        type=str,
+        help="Explicit batch ID to assign or check for idempotency",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Force ingestion even if date range or batch ID already succeeded",
+    )
+
+    args = parser.parse_args()
+    logger.info(
+        f"Starting Pipeline Orchestrator | Dataset: {args.dataset} | Mode: {args.mode} | Env: {args.env}"
+    )
+
+    manifests = []
+    overall_start = time.time()
+    has_error = False
+
+    # Ingestion Latency Decoupling: Calculate independent default ceilings if --end-date is not supplied
+    now_utc = datetime.now(timezone.utc)
+    end_311 = args.end_date or (now_utc - timedelta(days=args.lag_311)).strftime("%Y-%m-%dT23:59:59.000")
+    end_weather = args.end_date or (now_utc - timedelta(days=args.lag_weather)).strftime("%Y-%m-%d")
+
+    # 1. NYC 311 Ingestion
+    if args.dataset in ["all", "311"]:
+        try:
+            logger.info(f"Targeting NYC 311 End Ceiling: {end_311} (Lag: {args.lag_311}d)")
+            m_311 = run_311_ingestion(
+                mode=args.mode,
+                start_date=args.start_date,
+                end_date=end_311,
+                batch_size=args.batch_size,
+                max_records=args.max_records,
+                lookback_days=args.lookback_days,
+                project_start_date=args.project_start_date,
+                app_token=args.app_token or os.environ.get("SOCRATA_APP_TOKEN"),
+                env=args.env,
+                manifests_dir=MANIFESTS_DIR,
+                batch_id=args.batch_id,
+                force=args.force,
+            )
+            if m_311:
+                manifests.append(m_311)
+        except Exception as e:
+            logger.error(f"Failed to execute NYC 311 ingestion: {e}", exc_info=True)
+            has_error = True
+
+    # 2. Open-Meteo ERA5-Land Weather Ingestion
+    if args.dataset in ["all", "weather"]:
+        try:
+            logger.info(f"Targeting Weather End Ceiling: {end_weather} (Lag: {args.lag_weather}d)")
+            weather_mode = "backfill" if args.mode == "backfill" else "incremental"
+            m_wth = run_weather_ingestion(
+                mode=weather_mode,
+                start_date=args.start_date,
+                end_date=end_weather,
+                lookback_days=args.lookback_days,
+                env=args.env,
+                manifests_dir=MANIFESTS_DIR,
+                batch_id=args.batch_id,
+                force=args.force,
+            )
+            if m_wth:
+                manifests.append(m_wth)
+        except Exception as e:
+            logger.error(f"Failed to execute weather ingestion: {e}", exc_info=True)
+            has_error = True
+
+    print_summary_table(manifests)
+    profiler = get_profiler()
+    for m in manifests:
+        profiler.record_step(
+            stage="bronze_ingestion",
+            step_name=f"ingest_{m.get('dataset_name', 'unknown')}",
+            duration_seconds=m.get("duration_seconds", 0.0),
+            input_rows=m.get("row_count", 0),
+            output_rows=m.get("row_count", 0),
+            details={"batch_id": m.get("batch_id"), "mode": m.get("extraction_mode")},
+        )
+    profiler.save_json()
+    total_elapsed = time.time() - overall_start
+    logger.info(f"Pipeline run completed in {total_elapsed:.2f} seconds.")
+
+    if has_error:
+        logger.error("Ingestion pipeline encountered critical errors. Halting execution.")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

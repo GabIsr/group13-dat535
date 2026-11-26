@@ -1,0 +1,41 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data files & Storage Zones (Landing, Bronze, Silver, Gold, Metadata)
+data/*
+!data/reference/
+!data/reference/**
+
+# Parquet & compressed archives (allow reference lookup tables)
+*.parquet
+!data/reference/*.parquet
+!data/reference/**/*.parquet
+*.json.gz
+*.csv.gz
+*.crc
+.*.crc
+
+# Jupyter Notebook Checkpoints
+.ipynb_checkpoints/
+
+# Virtual environments & Secrets
+venv/
+env/
+.env/
+.env
+*.env
+
+# Temporary scratch scripts
+scratch/
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Windows Hadoop local binaries
+hadoop/
+

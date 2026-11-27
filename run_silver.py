@@ -17,6 +17,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.silver.clean_311 import clean_and_validate_311
 from src.silver.clean_weather import clean_and_validate_weather
+from src.silver.config import BRONZE_DIR, METADATA_DIR, SILVER_DIR
 from src.silver.join_silver import join_silver_datasets
 from src.silver.quality_report import generate_quality_reconciliation_report
 from src.utils.benchmark import get_profiler
@@ -72,12 +73,14 @@ def main():
     )
     overall_start = time.time()
 
-    bronze_311_dir = PROJECT_ROOT / "data" / "bronze" / "nyc311"
+    bronze_311_dir = BRONZE_DIR / "nyc311"
+    manifests_dir = METADATA_DIR / "manifests"
     windows = get_monthly_execution_windows(
         start_date=args.start_date,
         end_date=args.end_date,
         bronze_dir=bronze_311_dir,
         mode=args.mode,
+        manifests_dir=manifests_dir,
     )
 
     if not windows:
@@ -135,10 +138,15 @@ def main():
 
         # Stage 3: Unified Fact Join
         if args.stage in ["all", "join"]:
-            if args.stage == "all" and (m_311.get("status") == "skipped" or m_weather.get("status") == "skipped"):
+            if args.stage == "all" and (
+                m_311.get("status") == "skipped"
+                or m_weather.get("status") == "skipped"
+                or m_311.get("valid_rows_accepted", 0) == 0
+                or m_weather.get("clean_rows", 0) == 0
+            ):
                 logger.warning(
-                    f"Skipping Unified Analytical Fact Join because upstream Silver stage was skipped "
-                    f"(311 status: {m_311.get('status', 'unknown')}, weather status: {m_weather.get('status', 'unknown')})."
+                    f"Skipping Unified Analytical Fact Join because upstream Silver stage was skipped or produced 0 rows "
+                    f"(311 valid: {m_311.get('valid_rows_accepted', 0)}, weather clean: {m_weather.get('clean_rows', 0)})."
                 )
             else:
                 logger.info(f"[{w_start} -> {w_end}] Executing Silver Stage: Unified Analytical Fact Join...")
@@ -157,7 +165,7 @@ def main():
         try:
             from src.utils.spark import get_spark_session
             audit_spark = get_spark_session("DAT535-Silver-Audit")
-            total_lakehouse_count = audit_spark.read.parquet(str(PROJECT_ROOT / "data" / "silver" / "nyc311")).count()
+            total_lakehouse_count = audit_spark.read.parquet(str(SILVER_DIR / "nyc311")).count()
             m_311["total_lakehouse_records"] = total_lakehouse_count
         except Exception as e:
             logger.debug(f"Could not compute total on-disk Lakehouse records: {e}")

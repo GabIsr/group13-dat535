@@ -16,6 +16,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.gold.build_gold import run_gold_pipeline
+from src.gold.config import SILVER_311_DIR
 from src.utils.benchmark import get_profiler
 from src.utils.partitioning import get_monthly_execution_windows
 
@@ -55,7 +56,7 @@ def main():
         f"Starting Gold Pipeline Orchestrator | Env: {args.env} | "
         f"Window: [{args.start_date or 'ALL'} -> {args.end_date or 'ALL'}]"
     )
-    silver_311_dir = PROJECT_ROOT / "data" / "silver" / "nyc311"
+    silver_311_dir = SILVER_311_DIR
     if args.start_date or args.end_date:
         windows = get_monthly_execution_windows(
             start_date=args.start_date,

@@ -480,7 +480,7 @@ Continuous integration and automated scheduling are implemented using **GitHub A
   * Triggers automatically on pull requests and pushes to `dev`.
   * Verifies PySpark 3.5.x alignment with Java 8, executes the automated test suite gate, and runs an incremental Dev pipeline into `$HOME/spark-lab-data/dev`.
 * **Production Deployment (`.github/workflows/dat535-prod.yml`)**:
-  * Manual pipeline execution triggered via `workflow_dispatch`, targeting `$HOME/spark-lab-data/prod` with manual reviewer deployment protection gates.
+  * Triggers automatically upon merging pull requests into `main` (or via manual `workflow_dispatch`), targeting `$HOME/spark-lab-data/prod` with manual reviewer deployment protection gates.
 * **Scheduled Daily Incremental CDC (`.github/workflows/pipeline.yml`)**:
   * Runs daily at **14:00 UTC** via cron (`0 14 * * *`).
   * **Publication Lag Alignment**: ECMWF publishes daily ERA5T reanalysis (5-day delay, $D-5$) by 12:00 UTC. The 14:00 UTC schedule provides a 2-hour buffer for Open-Meteo indexing, ensuring complete meteorological coverage before 311 joins and Gold mart aggregations.

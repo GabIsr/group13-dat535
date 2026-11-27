@@ -52,6 +52,7 @@ def run_tests():
     res = subprocess.run(
         [sys.executable, "-m", "unittest", "discover", "-s", "tests"],
         env=test_env,
+        cwd=str(PROJECT_ROOT),
     )
     elapsed = time.time() - start
     if res.returncode == 0:
@@ -79,7 +80,7 @@ def run_bronze(
         cmd.extend(["--start-date", start_date])
     if end_date:
         cmd.extend(["--end-date", end_date])
-    res = subprocess.run(cmd)
+    res = subprocess.run(cmd, cwd=str(PROJECT_ROOT))
     return res.returncode == 0
 
 
@@ -98,7 +99,7 @@ def run_silver(
         cmd.extend(["--start-date", start_date])
     if end_date:
         cmd.extend(["--end-date", end_date])
-    res = subprocess.run(cmd)
+    res = subprocess.run(cmd, cwd=str(PROJECT_ROOT))
     return res.returncode == 0
 
 
@@ -116,7 +117,7 @@ def run_gold(
         cmd.extend(["--start-date", start_date])
     if end_date:
         cmd.extend(["--end-date", end_date])
-    res = subprocess.run(cmd)
+    res = subprocess.run(cmd, cwd=str(PROJECT_ROOT))
     return res.returncode == 0
 
 

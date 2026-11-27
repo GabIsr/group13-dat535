@@ -30,7 +30,9 @@ SENSOR_ANOMALY_LEDGER_PATH = QUALITY_DIR / "sensor_anomaly_ledger.parquet"
 UNCLASSIFIED_RESOLUTIONS_LEDGER_PATH = QUALITY_DIR / "unclassified_resolutions_ledger.parquet"
 
 # Conformed Complaint Taxonomy Reference Table (Schema Drift & Semantic Conformance)
-TAXONOMY_REFERENCE_PATH = REFERENCE_DIR / "dim_complaint_taxonomy.parquet"
+repo_tax_path = PROJECT_ROOT / "data" / "reference" / "dim_complaint_taxonomy.parquet"
+data_tax_path = REFERENCE_DIR / "dim_complaint_taxonomy.parquet"
+TAXONOMY_REFERENCE_PATH = data_tax_path if data_tax_path.exists() else repo_tax_path
 
 # Unmapped Complaint Taxonomy Ledger Path (Lakehouse Schema Observability)
 UNMAPPED_TAXONOMY_LEDGER_PATH = QUALITY_DIR / "unmapped_complaint_taxonomy_ledger.parquet"

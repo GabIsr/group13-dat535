@@ -112,7 +112,16 @@ def main():
             if not m_weather:
                 m_weather = curr_weather.copy()
             else:
-                for k in ["raw_rows", "clean_rows", "anomalies_quarantined"]:
+                for k in [
+                    "input_rows",
+                    "valid_rows",
+                    "dropped_unkeyed_rows",
+                    "quarantined_rows",
+                    "duplicate_rows_dropped",
+                    "corrupted_fields_masked",
+                    "sensor_anomalies_logged",
+                    "extreme_weather_tagged_rows",
+                ]:
                     if k in curr_weather and k in m_weather:
                         m_weather[k] += curr_weather[k]
 
@@ -138,15 +147,16 @@ def main():
 
         # Stage 3: Unified Fact Join
         if args.stage in ["all", "join"]:
+            weather_valid_count = m_weather.get("valid_rows", m_weather.get("clean_rows", 0))
             if args.stage == "all" and (
                 m_311.get("status") == "skipped"
                 or m_weather.get("status") == "skipped"
                 or m_311.get("valid_rows_accepted", 0) == 0
-                or m_weather.get("clean_rows", 0) == 0
+                or weather_valid_count == 0
             ):
                 logger.warning(
                     f"Skipping Unified Analytical Fact Join because upstream Silver stage was skipped or produced 0 rows "
-                    f"(311 valid: {m_311.get('valid_rows_accepted', 0)}, weather clean: {m_weather.get('clean_rows', 0)})."
+                    f"(311 valid: {m_311.get('valid_rows_accepted', 0)}, weather valid: {weather_valid_count})."
                 )
             else:
                 logger.info(f"[{w_start} -> {w_end}] Executing Silver Stage: Unified Analytical Fact Join...")
@@ -154,9 +164,13 @@ def main():
                 if not m_join:
                     m_join = curr_join.copy()
                 else:
-                    for k in ["total_311_input", "matched_weather_rows", "unmatched_historical_rows"]:
+                    for k in ["total_311_records", "matched_weather_records", "unmatched_weather_records"]:
                         if k in curr_join and k in m_join:
                             m_join[k] += curr_join[k]
+                    if m_join.get("total_311_records", 0) > 0:
+                        m_join["weather_match_rate_pct"] = round(
+                            m_join.get("matched_weather_records", 0) / m_join["total_311_records"] * 100.0, 2
+                        )
 
     profiler.set_active_partition(None)
 
